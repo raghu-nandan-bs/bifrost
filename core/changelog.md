@@ -1,3 +1,4 @@
+- feat: token_exchange grant (RFC 8693) for oauth_key_config, so OpenAI keys can use workload identity federation; subject tokens are read only from BIFROST_OIDC_ALLOWED_CREDENTIAL_DIRS and sent only to BIFROST_TOKEN_EXCHANGE_URLS (default https://auth.openai.com/oauth/token)
 - feat: openapi MCP connection type, backed by an in-process server built through the new MCPConfig.InProcessServerFactory hook (#8307)
 - feat: cache_control on chat assistant tool_calls reaches the Anthropic and Bedrock tool_use block (#8494)
 - feat: native decisions on Azure (Microsoft-Decision-1) and Databricks (ai_decide), and Typesafe image assets by reference plus box questions (#8485, #8498, #8571)
