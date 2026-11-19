@@ -335,6 +335,37 @@ func TestTokenExchangeResponseHandling(t *testing.T) {
 		assert.Equal(t, time.Unix(at, 0), e.ExpiresAt)
 	})
 
+	// expires_at is Unix seconds against the local clock, so only a plausible one is used: a
+	// millisecond value would never refresh, and a host clock ahead of the endpoint must not
+	// refuse a token whose expires_in is fine.
+	t.Run("a millisecond expires_at falls back to expires_in", func(t *testing.T) {
+		at := time.Now().Add(10 * time.Minute).UnixMilli()
+		e, bErr := mintOnce(t, http.StatusOK, `{"access_token":"x","token_type":"Bearer","expires_in":3600,"expires_at":`+strconv.FormatInt(at, 10)+`}`)
+		require.Nil(t, bErr)
+		assert.WithinDuration(t, time.Now().Add(time.Hour), e.ExpiresAt, 5*time.Second)
+	})
+
+	t.Run("a millisecond expires_at alone falls back to the default lifetime", func(t *testing.T) {
+		at := time.Now().Add(10 * time.Minute).UnixMilli()
+		e, bErr := mintOnce(t, http.StatusOK, `{"access_token":"x","token_type":"Bearer","expires_at":`+strconv.FormatInt(at, 10)+`}`)
+		require.Nil(t, bErr)
+		assert.WithinDuration(t, time.Now().Add(fallbackTokenLifetime), e.ExpiresAt, 5*time.Second)
+	})
+
+	t.Run("an expires_at too far ahead is ignored", func(t *testing.T) {
+		at := time.Now().Add(30 * 24 * time.Hour).Unix()
+		e, bErr := mintOnce(t, http.StatusOK, `{"access_token":"x","token_type":"Bearer","expires_in":3600,"expires_at":`+strconv.FormatInt(at, 10)+`}`)
+		require.Nil(t, bErr)
+		assert.WithinDuration(t, time.Now().Add(time.Hour), e.ExpiresAt, 5*time.Second)
+	})
+
+	t.Run("an expires_at already past locally yields to a positive expires_in", func(t *testing.T) {
+		at := time.Now().Add(-10 * time.Minute).Unix()
+		e, bErr := mintOnce(t, http.StatusOK, `{"access_token":"x","token_type":"Bearer","expires_in":3600,"expires_at":`+strconv.FormatInt(at, 10)+`}`)
+		require.Nil(t, bErr)
+		assert.WithinDuration(t, time.Now().Add(time.Hour), e.ExpiresAt, 5*time.Second)
+	})
+
 	t.Run("a token that has already expired is refused", func(t *testing.T) {
 		_, bErr := mintOnce(t, http.StatusOK, `{"access_token":"x","token_type":"Bearer","expires_at":1}`)
 		require.NotNil(t, bErr)

@@ -31,6 +31,9 @@ const (
 	assertionIssuedAtSkew = 30 * time.Second
 	// maxTokenResponseBytes caps a token endpoint response; a real one is a few hundred bytes.
 	maxTokenResponseBytes = 64 * 1024
+	// maxExpiresAtAhead bounds how far past the request an endpoint's absolute expires_at may
+	// lie before it is ignored as implausible (milliseconds, or a broken clock).
+	maxExpiresAtAhead = 24 * time.Hour
 )
 
 // JWTBearerConfig is what one RFC 7523 JWT bearer exchange needs: Bifrost signs an assertion
@@ -273,9 +276,17 @@ func postToken(ctx context.Context, hc *http.Client, tokenURL string, body []byt
 	if parsed.ExpiresIn > 0 {
 		expiry = sent.Add(time.Duration(parsed.ExpiresIn) * time.Second)
 	}
-	// An absolute expiry (OpenAI's expires_at) wins when it is earlier.
+	// An absolute expiry (OpenAI's expires_at) wins when it is earlier, but it is Unix seconds
+	// read against the local clock, so it is used only when plausible. One more than
+	// maxExpiresAtAhead past the send (milliseconds, say) would never be refreshed and is
+	// ignored. One already past here while expires_in is positive means the host clock runs
+	// ahead of the endpoint's, so the relative lifetime is kept.
 	if parsed.ExpiresAt > 0 {
-		if at := time.Unix(parsed.ExpiresAt, 0); expiry.IsZero() || at.Before(expiry) {
+		at := time.Unix(parsed.ExpiresAt, 0)
+		switch {
+		case at.After(sent.Add(maxExpiresAtAhead)):
+		case !at.After(time.Now()) && !expiry.IsZero():
+		case expiry.IsZero() || at.Before(expiry):
 			expiry = at
 		}
 	}
