@@ -80,6 +80,59 @@ func TestReadCredentialFileRefusesDotDot(t *testing.T) {
 	require.Contains(t, err.Error(), "..")
 }
 
+// TestReadCredentialFileSearchOnlyDirs pins that a credential file reads when the allowed
+// directory or a directory under it grants search (x) but not read permission, as a 0711 mount
+// does for a non-root Bifrost. os.Root needs read permission on every directory it opens, so
+// such a path falls back to a resolve-and-recheck open; a symlink out of the allowed directory
+// is still refused there, and so is a FIFO.
+func TestReadCredentialFileSearchOnlyDirs(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permission checks")
+	}
+	dir := t.TempDir()
+	t.Setenv(CredentialDirsEnv, dir)
+	idp := filepath.Join(dir, "idp")
+	require.NoError(t, os.Mkdir(idp, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(idp, "token"), []byte("tok\n"), 0o600))
+	outside := filepath.Join(t.TempDir(), "secret")
+	require.NoError(t, os.WriteFile(outside, []byte("outside"), 0o600))
+	require.NoError(t, os.Symlink(outside, filepath.Join(idp, "escape")))
+	require.NoError(t, os.Symlink(filepath.Join("..", "..", filepath.Base(filepath.Dir(outside)), "secret"), filepath.Join(idp, "relescape")))
+	require.NoError(t, syscall.Mkfifo(filepath.Join(idp, "fifo"), 0o600))
+
+	for _, tc := range []struct {
+		name string
+		dir  string
+	}{{"intermediate directory", idp}, {"allowed directory", dir}} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, os.Chmod(tc.dir, 0o100))
+			t.Cleanup(func() { _ = os.Chmod(tc.dir, 0o700) })
+
+			got, err := ReadCredentialFile(filepath.Join(idp, "token"), maxSubjectTokenBytes)
+			require.NoError(t, err)
+			require.Equal(t, "tok", got)
+
+			_, err = ReadCredentialFile(filepath.Join(idp, "escape"), maxSubjectTokenBytes)
+			require.ErrorIs(t, err, ErrCredentialPathNotAllowed)
+			_, err = ReadCredentialFile(filepath.Join(idp, "relescape"), maxSubjectTokenBytes)
+			require.ErrorIs(t, err, ErrCredentialPathNotAllowed)
+
+			done := make(chan error, 1)
+			go func() {
+				_, err := ReadCredentialFile(filepath.Join(idp, "fifo"), maxSubjectTokenBytes)
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "not a regular file")
+			case <-time.After(5 * time.Second):
+				t.Fatal("reading a FIFO blocked")
+			}
+		})
+	}
+}
+
 // TestReadCredentialFileAbsoluteSymlink pins that an absolute symlink is followed when its
 // target is inside an allowed directory and refused when it is not.
 func TestReadCredentialFileAbsoluteSymlink(t *testing.T) {

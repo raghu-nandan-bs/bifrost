@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -124,11 +125,26 @@ func openInRoot(dir, rel string) (*os.File, error) {
 	return f, err
 }
 
+// openResolved opens the real path of path, read only and without blocking on a FIFO, once that
+// real path is known to sit under an allowed directory. A real path outside them is
+// errEscapesRoot.
+func openResolved(path string) (*os.File, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return nil, err
+	}
+	if _, _, ok := rootFor(resolved); !ok {
+		return nil, errEscapesRoot
+	}
+	return os.OpenFile(resolved, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+}
+
 // ReadCredentialFile reads a credential file from an allowed directory, trimmed, refusing an
 // empty file and one larger than maxBytes. The file is opened through an os.Root on the
 // allowed directory, so no path component, symlink included, can lead out of it even if the
-// directory changes between the check and the open. The open does not block on a FIFO, and
-// the opened descriptor must be a regular file.
+// directory changes between the check and the open. A directory that grants search but not read
+// permission falls back to a resolve-and-recheck open (see the comment there). The open does not
+// block on a FIFO, and the opened descriptor must be a regular file.
 func ReadCredentialFile(path string, maxBytes int) (string, error) {
 	if err := checkPath(path); err != nil {
 		return "", err
@@ -151,6 +167,18 @@ func ReadCredentialFile(path string, maxBytes int) (string, error) {
 			return "", notAllowed(path)
 		}
 		f, err = openInRoot(rootDir, rel)
+	}
+	if errors.Is(err, fs.ErrPermission) {
+		// os.Root opens the allowed directory and every directory under it for reading, so a
+		// mount that grants only search permission (0711, read by a non-root Bifrost) is
+		// refused although a plain open, which needs only search, reads the file. Fall back to
+		// resolving the path, re-checking the real path against the allowed directories, and
+		// opening that. This trades os.Root's guarantee for a
+		// narrow window: a directory swapped for a symlink between the resolve and the open can
+		// still redirect the read. Reaching it needs write access inside the allowed directory,
+		// and the old reader had the same window on every read. A file the process cannot read
+		// fails the plain open with the same error.
+		f, err = openResolved(path)
 	}
 	if errors.Is(err, errEscapesRoot) {
 		return "", notAllowed(path)
