@@ -7,6 +7,7 @@ import {
 	stripAnthropicAuthDiscriminator,
 	stripDatabricksAuthDiscriminator,
 	stripOAuthAuthDiscriminator,
+	tokenExchangeEncodingUpdate,
 } from "./providerKeyForm.utils";
 
 const pair = { client_id: { value: "sp-id" }, client_secret: { value: "sp-secret" } };
@@ -362,6 +363,34 @@ describe("applyAuthMethod with anthropic_key_config", () => {
 		).toBeUndefined();
 	});
 });
+// The token URL suggests an encoding only while nobody has chosen one: a stored encoding and an
+// explicit pick both stay, even when the pick equals the form default and so is not dirty.
+describe("tokenExchangeEncodingUpdate", () => {
+	const openai = { value: "https://auth.openai.com/oauth/token" };
+	const base = { tokenURL: openai, tokenURLEdited: true, current: "form" as const, stored: undefined, userChose: false };
+
+	it("follows an edited token URL on a key with no stored encoding", () => {
+		expect(tokenExchangeEncodingUpdate(base)).toBe("json");
+		expect(tokenExchangeEncodingUpdate({ ...base, tokenURL: { value: "https://idp.example/token" }, current: "json" })).toBe("form");
+	});
+
+	it("keeps a stored encoding when the token URL of a saved key is edited", () => {
+		expect(tokenExchangeEncodingUpdate({ ...base, stored: "form" })).toBeUndefined();
+	});
+
+	it("keeps an explicit pick, even one equal to the form default", () => {
+		expect(tokenExchangeEncodingUpdate({ ...base, userChose: true })).toBeUndefined();
+	});
+
+	it("leaves the encoding alone until the token URL is edited", () => {
+		expect(tokenExchangeEncodingUpdate({ ...base, tokenURLEdited: false })).toBeUndefined();
+	});
+
+	it("reports no change when the encoding already matches", () => {
+		expect(tokenExchangeEncodingUpdate({ ...base, current: "json" })).toBeUndefined();
+	});
+});
+
 describe("defaultTokenExchangeEncoding", () => {
 	it.each([
 		[{ value: "https://auth.openai.com/oauth/token" }, "json"],

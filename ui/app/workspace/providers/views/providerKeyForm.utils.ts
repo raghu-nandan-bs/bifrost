@@ -45,6 +45,29 @@ export const OpenAITokenExchangeURL = "https://auth.openai.com/oauth/token";
 export const defaultTokenExchangeEncoding = (tokenURL: { value?: string; ref?: string } | undefined): "form" | "json" =>
 	tokenURL?.value?.trim() === OpenAITokenExchangeURL ? "json" : "form";
 
+// tokenExchangeEncodingUpdate returns the encoding a token exchange key should switch to after
+// its token URL changes, or undefined to leave it. The URL-derived default applies only while
+// nobody has chosen an encoding: not when the stored key carries one (editing a saved key's URL
+// must not reset it), and not after the user picked one, which the caller tracks because a pick
+// equal to the form default leaves the field clean.
+export const tokenExchangeEncodingUpdate = ({
+	tokenURL,
+	tokenURLEdited,
+	current,
+	stored,
+	userChose,
+}: {
+	tokenURL: { value?: string; ref?: string } | undefined;
+	tokenURLEdited: boolean;
+	current: string | undefined;
+	stored: string | undefined;
+	userChose: boolean;
+}): "form" | "json" | undefined => {
+	if (!tokenURLEdited || userChose || stored) return undefined;
+	const encoding = defaultTokenExchangeEncoding(tokenURL);
+	return current === encoding ? undefined : encoding;
+};
+
 // stripOAuthAuthDiscriminator removes the UI-only auth discriminator before the key is sent
 // to the API, and drops the whole block on the API-key path: the form registers it for every
 // openai-based key, and an inert block would be refused by the API as half-configured. A whole

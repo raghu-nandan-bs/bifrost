@@ -15,10 +15,10 @@ import { TagInput } from "@/components/ui/tagInput";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { isRedacted } from "@/lib/utils/validation";
 import { Info } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Control, UseFormReturn } from "react-hook-form";
 import { Trans, useTranslation } from "react-i18next";
-import { defaultTokenExchangeEncoding } from "../views/providerKeyForm.utils";
+import { tokenExchangeEncodingUpdate } from "../views/providerKeyForm.utils";
 import { DeploymentsTable } from "./deploymentsTable";
 import { GithubCopilotSignIn } from "./githubCopilotSignIn";
 
@@ -284,18 +284,25 @@ export function ApiKeyFormFragment({ control, providerName, baseProviderType, fo
 	}, [isOpenAICompatible, form, oauthDefaults]);
 
 	// A token exchange key follows its token URL to a default encoding (JSON for OpenAI's endpoint)
-	// until the user picks one. Only a token URL the user edited moves it, so opening a saved key
-	// never changes its encoding.
+	// until an encoding is chosen: stored on the key, or picked here (tracked in a ref, since a pick
+	// equal to the form default leaves the field clean). Only a token URL the user edited moves it,
+	// so opening a saved key never changes its encoding.
 	const oauthTokenURL = form.watch("key.oauth_key_config.token_url");
+	const encodingChosen = useRef(false);
+	const storedEncoding = oauthDefaults?.request_encoding;
 	useEffect(() => {
 		if (oauthGrantType !== "token_exchange") return;
-		if (!form.getFieldState("key.oauth_key_config.token_url").isDirty) return;
-		if (form.getFieldState("key.oauth_key_config.request_encoding").isDirty) return;
-		const encoding = defaultTokenExchangeEncoding(oauthTokenURL);
-		if (form.getValues("key.oauth_key_config.request_encoding") !== encoding) {
+		const encoding = tokenExchangeEncodingUpdate({
+			tokenURL: oauthTokenURL,
+			tokenURLEdited: form.getFieldState("key.oauth_key_config.token_url").isDirty,
+			current: form.getValues("key.oauth_key_config.request_encoding"),
+			stored: storedEncoding,
+			userChose: encodingChosen.current,
+		});
+		if (encoding) {
 			form.setValue("key.oauth_key_config.request_encoding", encoding);
 		}
-	}, [oauthGrantType, oauthTokenURL, form]);
+	}, [oauthGrantType, oauthTokenURL, storedEncoding, form]);
 
 	const anthropicDefaults = form.formState.defaultValues?.key?.anthropic_key_config;
 	useEffect(() => {
@@ -1559,7 +1566,13 @@ export function ApiKeyFormFragment({ control, providerName, baseProviderType, fo
 										render={({ field }) => (
 											<FormItem>
 												<FormLabel>{t("providers.keys.oauthRequestEncoding")}</FormLabel>
-												<Select value={field.value ?? "form"} onValueChange={field.onChange}>
+												<Select
+													value={field.value ?? "form"}
+													onValueChange={(value) => {
+														encodingChosen.current = true;
+														field.onChange(value);
+													}}
+												>
 													<FormControl>
 														<SelectTrigger className="w-full" data-testid="key-select-oauth-request-encoding">
 															<SelectValue placeholder={t("providers.keys.oauthRequestEncodingForm")} />
