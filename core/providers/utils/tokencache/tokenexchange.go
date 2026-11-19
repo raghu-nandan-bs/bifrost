@@ -35,7 +35,7 @@ type TokenExchangeConfig struct {
 
 // TokenExchangeMinter returns a Minter that reads the subject token from its file and exchanges
 // it on hc. The file is read on every mint, so a token the platform rotates on disk is always
-// current, and only from an allowed credential directory (AllowedCredentialPath). The endpoint
+// current, and only from an allowed credential directory (ReadCredentialFile). The endpoint
 // must be on the operator allowlist (schemas.TokenExchangeURLAllowed), checked here as well as
 // at save time because a token_url reference resolves only now. Redirects are refused, so the
 // subject token is never replayed to a host the allowlist never saw.

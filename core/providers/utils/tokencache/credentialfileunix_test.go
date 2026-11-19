@@ -134,7 +134,9 @@ func TestReadCredentialFileSearchOnlyDirs(t *testing.T) {
 }
 
 // TestReadCredentialFileAbsoluteSymlink pins that an absolute symlink is followed when its
-// target is inside an allowed directory and refused when it is not.
+// target is inside an allowed directory and refused when it is not. The first case also pins
+// the os.Root error text openInRoot matches ("path escapes from parent"): if a toolchain
+// changes it, the in-root link is no longer retried and this test fails.
 func TestReadCredentialFileAbsoluteSymlink(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(CredentialDirsEnv, dir)

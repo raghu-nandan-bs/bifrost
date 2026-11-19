@@ -329,7 +329,8 @@ const identityTokenDirsEnv = tokencache.CredentialDirsEnv
 
 // readIdentityToken returns the identity token from src, re-reading a file source on every call so
 // a token the platform rotates on disk (a Kubernetes projected service account token) is always
-// current. The file is read only from an allowed credential directory (see allowedIdentityTokenPath).
+// current. The file is read only from an allowed credential directory (see
+// tokencache.ReadCredentialFile).
 func readIdentityToken(src *schemas.IdentitySource) (string, *schemas.BifrostError) {
 	if src == nil {
 		return "", workloadIdentityConfigError("anthropic workload identity has no identity_source")
