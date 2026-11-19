@@ -24,6 +24,14 @@ var DefaultCredentialDirs = []string{"/var/run/secrets", "/run/secrets"}
 // ErrCredentialPathNotAllowed is returned for a credential file outside the allowed directories.
 var ErrCredentialPathNotAllowed = errors.New("outside the allowed credential directories")
 
+// ErrCredentialFileNotRegular and ErrCredentialFileTooLarge are returned for a credential file
+// that is not a regular file or exceeds the size limit. Both are faults in the configured path,
+// not a mount that has yet to appear.
+var (
+	ErrCredentialFileNotRegular = errors.New("is not a regular file")
+	ErrCredentialFileTooLarge   = errors.New("exceeds the size limit")
+)
+
 // allowedRoots returns the allowed credential directories, absolute and cleaned, each as
 // written and with its own symlinks resolved, so both the configured path and the real path of
 // a file under it match (/var/run is a link to /run on most distributions).
@@ -190,14 +198,14 @@ func ReadCredentialFile(path string, maxBytes int) (string, error) {
 	if fi, err := f.Stat(); err != nil {
 		return "", err
 	} else if !fi.Mode().IsRegular() {
-		return "", fmt.Errorf("%s is not a regular file", path)
+		return "", fmt.Errorf("%s %w", path, ErrCredentialFileNotRegular)
 	}
 	data, err := io.ReadAll(io.LimitReader(f, int64(maxBytes)+1))
 	if err != nil {
 		return "", err
 	}
 	if len(data) > maxBytes {
-		return "", fmt.Errorf("%s exceeds the %d-byte limit", path, maxBytes)
+		return "", fmt.Errorf("%s %w of %d bytes", path, ErrCredentialFileTooLarge, maxBytes)
 	}
 	token := strings.TrimSpace(string(data))
 	if token == "" {

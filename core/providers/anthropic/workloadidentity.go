@@ -343,7 +343,8 @@ func readIdentityToken(src *schemas.IdentitySource) (string, *schemas.BifrostErr
 		}
 		read, err := tokencache.ReadCredentialFile(path, maxIdentityTokenBytes)
 		if err != nil {
-			if errors.Is(err, tokencache.ErrCredentialPathNotAllowed) || !filepath.IsAbs(path) {
+			if errors.Is(err, tokencache.ErrCredentialPathNotAllowed) || errors.Is(err, tokencache.ErrCredentialFileNotRegular) ||
+				errors.Is(err, tokencache.ErrCredentialFileTooLarge) || !filepath.IsAbs(path) {
 				return "", workloadIdentityConfigError("anthropic workload identity token file " + err.Error())
 			}
 			// Transient: the volume may not be mounted yet.

@@ -437,12 +437,12 @@ func TestReadCredentialFileRefusals(t *testing.T) {
 	big := filepath.Join(dir, "big")
 	require.NoError(t, os.WriteFile(big, []byte(strings.Repeat("a", maxSubjectTokenBytes+1)), 0o600))
 	_, err := ReadCredentialFile(big, maxSubjectTokenBytes)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "byte limit")
+	require.ErrorIs(t, err, ErrCredentialFileTooLarge)
+	assert.Contains(t, err.Error(), "size limit")
 
 	require.NoError(t, os.Mkdir(filepath.Join(dir, "sub"), 0o700))
 	_, err = ReadCredentialFile(filepath.Join(dir, "sub"), maxSubjectTokenBytes)
-	require.Error(t, err)
+	require.ErrorIs(t, err, ErrCredentialFileNotRegular)
 	assert.Contains(t, err.Error(), "not a regular file")
 
 	_, err = ReadCredentialFile(dir, maxSubjectTokenBytes)
