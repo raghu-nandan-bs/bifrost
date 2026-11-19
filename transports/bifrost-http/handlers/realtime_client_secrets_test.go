@@ -4,16 +4,36 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	bifrost "github.com/maximhq/bifrost/core"
+	openaiProvider "github.com/maximhq/bifrost/core/providers/openai"
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/framework/grant"
 	"github.com/maximhq/bifrost/framework/kvstore"
 	"github.com/maximhq/bifrost/plugins/governance"
-	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
+	"github.com/maximhq/bifrost/transports/v2/bifrost-http/lib"
 	"github.com/valyala/fasthttp"
 )
+
+func TestRealtimeSessionRoutesOnlyExposeGAClientSecrets(t *testing.T) {
+	handler := &RealtimeClientSecretsHandler{}
+	routes := handler.realtimeSessionRoutes()
+	want := map[string]bool{
+		"/v1/realtime/client_secrets":        true,
+		"/openai/v1/realtime/client_secrets": true,
+	}
+	if len(routes) != len(want) {
+		t.Fatalf("routes = %v, want exactly %d GA routes", routes, len(want))
+	}
+	for _, route := range routes {
+		if !want[route.Path] {
+			t.Fatalf("unexpected realtime client secret route %q", route.Path)
+		}
+	}
+}
 
 func TestResolveRealtimeClientSecretTarget(t *testing.T) {
 	t.Parallel()
@@ -28,36 +48,36 @@ func TestResolveRealtimeClientSecretTarget(t *testing.T) {
 	}{
 		{
 			name:         "base route with session model",
-			route:        schemas.RealtimeSessionRoute{Path: "/v1/realtime/client_secrets", EndpointType: schemas.RealtimeSessionEndpointClientSecrets},
+			route:        schemas.RealtimeSessionRoute{Path: "/v1/realtime/client_secrets"},
 			body:         []byte(`{"session":{"model":"openai/gpt-4o-realtime-preview"}}`),
 			wantProvider: schemas.OpenAI,
 			wantModel:    "gpt-4o-realtime-preview",
 		},
 		{
-			name:         "base route with top level model",
-			route:        schemas.RealtimeSessionRoute{Path: "/v1/realtime/sessions", EndpointType: schemas.RealtimeSessionEndpointSessions},
-			body:         []byte(`{"model":"openai/gpt-4o-realtime-preview"}`),
-			wantProvider: schemas.OpenAI,
-			wantModel:    "gpt-4o-realtime-preview",
-		},
-		{
 			name:         "openai alias uses bare model",
-			route:        schemas.RealtimeSessionRoute{Path: "/openai/v1/realtime/client_secrets", EndpointType: schemas.RealtimeSessionEndpointClientSecrets, DefaultProvider: schemas.OpenAI},
+			route:        schemas.RealtimeSessionRoute{Path: "/openai/v1/realtime/client_secrets", DefaultProvider: schemas.OpenAI},
 			body:         []byte(`{"session":{"model":"gpt-4o-realtime-preview"}}`),
 			wantProvider: schemas.OpenAI,
 			wantModel:    "gpt-4o-realtime-preview",
 		},
 		{
 			name:    "base route rejects bare model",
-			route:   schemas.RealtimeSessionRoute{Path: "/v1/realtime/client_secrets", EndpointType: schemas.RealtimeSessionEndpointClientSecrets},
+			route:   schemas.RealtimeSessionRoute{Path: "/v1/realtime/client_secrets"},
 			body:    []byte(`{"session":{"model":"gpt-4o-realtime-preview"}}`),
 			wantErr: true,
 		},
 		{
 			name:    "missing model",
-			route:   schemas.RealtimeSessionRoute{Path: "/openai/v1/realtime/client_secrets", EndpointType: schemas.RealtimeSessionEndpointClientSecrets, DefaultProvider: schemas.OpenAI},
+			route:   schemas.RealtimeSessionRoute{Path: "/openai/v1/realtime/client_secrets", DefaultProvider: schemas.OpenAI},
 			body:    []byte(`{"session":{}}`),
 			wantErr: true,
+		},
+		{
+			name:         "GA transcription session resolves model from nested audio path",
+			route:        schemas.RealtimeSessionRoute{Path: "/v1/realtime/client_secrets"},
+			body:         []byte(`{"session":{"type":"transcription","audio":{"input":{"transcription":{"model":"openai/gpt-4o-transcribe"}}}}}`),
+			wantProvider: schemas.OpenAI,
+			wantModel:    "gpt-4o-transcribe",
 		},
 	}
 
@@ -97,19 +117,13 @@ func TestResolveRealtimeClientSecretTarget_NormalizesModel(t *testing.T) {
 	}{
 		{
 			name:      "session.model provider prefix stripped",
-			route:     schemas.RealtimeSessionRoute{Path: "/v1/realtime/client_secrets", EndpointType: schemas.RealtimeSessionEndpointClientSecrets},
+			route:     schemas.RealtimeSessionRoute{Path: "/v1/realtime/client_secrets"},
 			body:      `{"session":{"model":"openai/gpt-4o-realtime-preview","voice":"alloy"}}`,
 			wantModel: "gpt-4o-realtime-preview",
 		},
 		{
-			name:      "top-level model provider prefix stripped",
-			route:     schemas.RealtimeSessionRoute{Path: "/v1/realtime/sessions", EndpointType: schemas.RealtimeSessionEndpointSessions},
-			body:      `{"model":"openai/gpt-4o-realtime-preview"}`,
-			wantModel: "gpt-4o-realtime-preview",
-		},
-		{
 			name:      "bare model unchanged on alias route",
-			route:     schemas.RealtimeSessionRoute{Path: "/openai/v1/realtime/client_secrets", EndpointType: schemas.RealtimeSessionEndpointClientSecrets, DefaultProvider: schemas.OpenAI},
+			route:     schemas.RealtimeSessionRoute{Path: "/openai/v1/realtime/client_secrets", DefaultProvider: schemas.OpenAI},
 			body:      `{"session":{"model":"gpt-4o-realtime-preview"}}`,
 			wantModel: "gpt-4o-realtime-preview",
 		},
@@ -161,15 +175,199 @@ func TestResolveRealtimeClientSecretTarget_NormalizesModel(t *testing.T) {
 	}
 }
 
+// TestGATranscriptionSessionEndToEndThroughFullNormalizationPath drives the
+// full request path: handler-level resolveRealtimeClientSecretTarget, then
+// feeds its output into the OpenAI provider's NormalizeRealtimeClientSecretRequest
+// exactly as CreateRealtimeClientSecret does. Regression test for the bug
+// where GA transcription-shaped sessions (session.type=="transcription",
+// model nested at session.audio.input.transcription.model) 400'd with
+// "session.model or model is required" because extraction only ever checked
+// session.model — confirmed live against real OpenAI before this fix.
+func TestGATranscriptionSessionEndToEndThroughFullNormalizationPath(t *testing.T) {
+	t.Parallel()
+
+	var ctx fasthttp.RequestCtx
+	route := schemas.RealtimeSessionRoute{Path: "/v1/realtime/client_secrets"}
+	body := []byte(`{"session":{"type":"transcription","audio":{"input":{"format":{"type":"audio/pcm","rate":24000},"transcription":{"model":"openai/whisper-1","language":"en"}}}}}`)
+
+	providerKey, model, handlerBody, err := resolveRealtimeClientSecretTarget(&ctx, &lib.Config{}, route, body)
+	if err != nil {
+		t.Fatalf("resolveRealtimeClientSecretTarget() error = %v", err)
+	}
+	if providerKey != schemas.OpenAI || model != "whisper-1" {
+		t.Fatalf("provider/model = %q/%q, want %q/%q", providerKey, model, schemas.OpenAI, "whisper-1")
+	}
+
+	finalBody, finalModel, bifrostErr := openaiProvider.NormalizeRealtimeClientSecretRequest(handlerBody, schemas.OpenAI)
+	if bifrostErr != nil {
+		t.Fatalf("NormalizeRealtimeClientSecretRequest() error = %v", bifrostErr)
+	}
+	if finalModel != "whisper-1" {
+		t.Fatalf("model = %q, want %q", finalModel, "whisper-1")
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(finalBody, &payload); err != nil {
+		t.Fatalf("failed to unmarshal final body: %v", err)
+	}
+	var session map[string]json.RawMessage
+	if err := json.Unmarshal(payload["session"], &session); err != nil {
+		t.Fatalf("failed to unmarshal session: %v", err)
+	}
+	if _, hasModel := session["model"]; hasModel {
+		t.Fatal("transcription-type session must not gain a top-level session.model field")
+	}
+	var audio map[string]json.RawMessage
+	if err := json.Unmarshal(session["audio"], &audio); err != nil {
+		t.Fatalf("failed to unmarshal session.audio: %v", err)
+	}
+	var input map[string]json.RawMessage
+	if err := json.Unmarshal(audio["input"], &input); err != nil {
+		t.Fatalf("failed to unmarshal session.audio.input: %v", err)
+	}
+	var transcription map[string]any
+	if err := json.Unmarshal(input["transcription"], &transcription); err != nil {
+		t.Fatalf("failed to unmarshal session.audio.input.transcription: %v", err)
+	}
+	if transcription["model"] != "whisper-1" {
+		t.Fatalf("session.audio.input.transcription.model = %v, want %q", transcription["model"], "whisper-1")
+	}
+	if transcription["language"] != "en" {
+		t.Fatalf("session.audio.input.transcription.language = %v, want %q (must survive the two-pass normalization)", transcription["language"], "en")
+	}
+	if _, hasFormat := input["format"]; !hasFormat {
+		t.Fatal("session.audio.input.format must survive normalization")
+	}
+}
+
+// TestFullRealtimeSessionWithTranscriptionSiblingEndToEnd is a regression
+// test for a codex-review-caught bug: a full realtime session using the
+// legacy top-level "model" field, with live input-audio transcription
+// enabled as a completely standard sibling feature, was being misclassified
+// as transcription-only by resolveRealtimeClientSecretTarget — the real
+// conversational model was lost entirely. Drives the exact same
+// handler->provider two-pass path as CreateRealtimeClientSecret does.
+func TestFullRealtimeSessionWithTranscriptionSiblingEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	var ctx fasthttp.RequestCtx
+	route := schemas.RealtimeSessionRoute{Path: "/v1/realtime/client_secrets"}
+	body := []byte(`{"model":"openai/gpt-4o-realtime-preview","session":{"audio":{"input":{"transcription":{"model":"openai/whisper-1"}}}}}`)
+
+	providerKey, model, handlerBody, err := resolveRealtimeClientSecretTarget(&ctx, &lib.Config{}, route, body)
+	if err != nil {
+		t.Fatalf("resolveRealtimeClientSecretTarget() error = %v", err)
+	}
+	if providerKey != schemas.OpenAI || model != "gpt-4o-realtime-preview" {
+		t.Fatalf("provider/model = %q/%q, want %q/%q", providerKey, model, schemas.OpenAI, "gpt-4o-realtime-preview")
+	}
+
+	finalBody, finalModel, bifrostErr := openaiProvider.NormalizeRealtimeClientSecretRequest(handlerBody, schemas.OpenAI)
+	if bifrostErr != nil {
+		t.Fatalf("NormalizeRealtimeClientSecretRequest() error = %v", bifrostErr)
+	}
+	if finalModel != "gpt-4o-realtime-preview" {
+		t.Fatalf("final model = %q, want %q", finalModel, "gpt-4o-realtime-preview")
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(finalBody, &payload); err != nil {
+		t.Fatalf("failed to unmarshal final body: %v", err)
+	}
+	var session map[string]json.RawMessage
+	if err := json.Unmarshal(payload["session"], &session); err != nil {
+		t.Fatalf("failed to unmarshal session: %v", err)
+	}
+	var sessionModel string
+	if err := json.Unmarshal(session["model"], &sessionModel); err != nil || sessionModel != "gpt-4o-realtime-preview" {
+		t.Fatalf("session.model = %v, want %q", session["model"], "gpt-4o-realtime-preview")
+	}
+	var sessionType string
+	if err := json.Unmarshal(session["type"], &sessionType); err != nil || sessionType != "realtime" {
+		t.Fatalf("session.type = %v, want %q (must not be reclassified as transcription-only)", session["type"], "realtime")
+	}
+}
+
+// TestRewriteGASessionTranscriptionModelAppliesAliasResolution covers the
+// alias-resolution rewrite path (handleRequest calls this after key selection
+// when key.Aliases.Resolve changes the model) for a GA transcription session,
+// which has no top-level session.model for the generic rewrite to target.
+func TestRewriteGASessionTranscriptionModelAppliesAliasResolution(t *testing.T) {
+	t.Parallel()
+
+	session := map[string]json.RawMessage{
+		"type":  json.RawMessage(`"transcription"`),
+		"audio": json.RawMessage(`{"input":{"transcription":{"model":"whisper-1","language":"en"}}}`),
+	}
+	normalizedModel, err := json.Marshal("gpt-4o-transcribe")
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	rewritten, changed, bifrostErr := rewriteGASessionTranscriptionModel(session, normalizedModel)
+	if bifrostErr != nil {
+		t.Fatalf("rewriteGASessionTranscriptionModel() error = %v", bifrostErr)
+	}
+	if !changed {
+		t.Fatal("expected changed=true for a GA transcription session")
+	}
+
+	var rewrittenSession map[string]json.RawMessage
+	if err := json.Unmarshal(rewritten, &rewrittenSession); err != nil {
+		t.Fatalf("failed to unmarshal rewritten session: %v", err)
+	}
+	var audio map[string]json.RawMessage
+	if err := json.Unmarshal(rewrittenSession["audio"], &audio); err != nil {
+		t.Fatalf("failed to unmarshal audio: %v", err)
+	}
+	var input map[string]json.RawMessage
+	if err := json.Unmarshal(audio["input"], &input); err != nil {
+		t.Fatalf("failed to unmarshal input: %v", err)
+	}
+	var transcription map[string]any
+	if err := json.Unmarshal(input["transcription"], &transcription); err != nil {
+		t.Fatalf("failed to unmarshal transcription: %v", err)
+	}
+	if transcription["model"] != "gpt-4o-transcribe" {
+		t.Fatalf("model = %v, want %q (alias resolution must reach the nested field)", transcription["model"], "gpt-4o-transcribe")
+	}
+	if transcription["language"] != "en" {
+		t.Fatalf("language = %v, want %q", transcription["language"], "en")
+	}
+}
+
+func TestRewriteGASessionTranscriptionModelNoOpForFullRealtimeSession(t *testing.T) {
+	t.Parallel()
+
+	// A full realtime session with no audio.input.transcription at all should
+	// be left untouched (changed=false) — the caller's own session.model path
+	// handles that case.
+	session := map[string]json.RawMessage{
+		"instructions": json.RawMessage(`"be helpful"`),
+	}
+	normalizedModel, _ := json.Marshal("gpt-realtime")
+
+	_, changed, bifrostErr := rewriteGASessionTranscriptionModel(session, normalizedModel)
+	if bifrostErr != nil {
+		t.Fatalf("rewriteGASessionTranscriptionModel() error = %v", bifrostErr)
+	}
+	if changed {
+		t.Fatal("expected changed=false when session has no audio.input.transcription")
+	}
+}
+
 func TestParseRealtimeEphemeralKeyMapping(t *testing.T) {
 	t.Parallel()
 
-	token, ttl, ok := parseRealtimeEphemeralKeyMapping([]byte(`{
+	token, ttl, nested, ok := parseRealtimeEphemeralKeyMapping([]byte(`{
 		"value": "ek_test_123",
 		"expires_at": 4102444800
 	}`))
 	if !ok {
 		t.Fatal("expected ephemeral mapping to be parsed")
+	}
+	if nested {
+		t.Fatal("expected top-level secret shape")
 	}
 	if token != "ek_test_123" {
 		t.Fatalf("token = %q, want %q", token, "ek_test_123")
@@ -182,7 +380,7 @@ func TestParseRealtimeEphemeralKeyMapping(t *testing.T) {
 func TestParseRealtimeEphemeralKeyMapping_NestedFallback(t *testing.T) {
 	t.Parallel()
 
-	token, ttl, ok := parseRealtimeEphemeralKeyMapping([]byte(`{
+	token, ttl, nested, ok := parseRealtimeEphemeralKeyMapping([]byte(`{
 		"client_secret": {
 			"value": "ek_test_nested",
 			"expires_at": 4102444800
@@ -190,6 +388,9 @@ func TestParseRealtimeEphemeralKeyMapping_NestedFallback(t *testing.T) {
 	}`))
 	if !ok {
 		t.Fatal("expected nested ephemeral mapping to be parsed")
+	}
+	if !nested {
+		t.Fatal("expected nested secret shape")
 	}
 	if token != "ek_test_nested" {
 		t.Fatalf("token = %q, want %q", token, "ek_test_nested")
@@ -199,7 +400,68 @@ func TestParseRealtimeEphemeralKeyMapping_NestedFallback(t *testing.T) {
 	}
 }
 
-func TestCacheRealtimeEphemeralKeyMappingStoresKeyID(t *testing.T) {
+// TestParseRealtimeEphemeralKeyMapping_RejectsCompositeShapes is a regression
+// test for a coderabbit-caught bug: json.Unmarshal preserves fields absent from
+// the new JSON, so a top-level field left over from the failed first parse could
+// combine with a nested field into a token/expiry pair no single shape carried.
+func TestParseRealtimeEphemeralKeyMapping_RejectsCompositeShapes(t *testing.T) {
+	t.Parallel()
+
+	// Top-level value + nested expiry: neither shape is complete on its own.
+	if _, _, _, ok := parseRealtimeEphemeralKeyMapping([]byte(`{
+		"value": "ek_top_only",
+		"client_secret": {
+			"expires_at": 4102444800
+		}
+	}`)); ok {
+		t.Fatal("top-level value must not combine with nested expires_at")
+	}
+
+	// Top-level expiry + nested value: the mirror composite.
+	if _, _, _, ok := parseRealtimeEphemeralKeyMapping([]byte(`{
+		"expires_at": 4102444800,
+		"client_secret": {
+			"value": "ek_nested_only"
+		}
+	}`)); ok {
+		t.Fatal("nested value must not combine with top-level expires_at")
+	}
+}
+
+func TestRealtimeMappingVirtualKeyUsesRequestHeader(t *testing.T) {
+	t.Parallel()
+
+	var ctx fasthttp.RequestCtx
+	ctx.Request.Header.Set("Authorization", "Bearer sk-bf-header")
+
+	if got := governance.ParseVirtualKeyFromFastHTTPRequest(&ctx); got == nil || *got != "sk-bf-header" {
+		t.Fatalf("ParseVirtualKeyFromFastHTTPRequest() = %v, want request virtual key", got)
+	}
+}
+
+func TestRealtimeMappingVirtualKeyUsesSettledBearerCredential(t *testing.T) {
+	t.Parallel()
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	lib.RecordCredential(ctx, grant.NewCredential(grant.CredentialVirtualKey, "sk-bf-bearer"))
+
+	if got := realtimeMappingVirtualKey(ctx); got != "sk-bf-bearer" {
+		t.Fatalf("realtimeMappingVirtualKey() = %q, want settled bearer virtual key", got)
+	}
+}
+
+func TestRealtimeMappingVirtualKeyFallsBackToContextValue(t *testing.T) {
+	t.Parallel()
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyVirtualKey, "sk-bf-context")
+
+	if got := realtimeMappingVirtualKey(ctx); got != "sk-bf-context" {
+		t.Fatalf("realtimeMappingVirtualKey() = %q, want context virtual key", got)
+	}
+}
+
+func TestReplaceAndCacheRealtimeEphemeralToken(t *testing.T) {
 	t.Parallel()
 
 	store, err := kvstore.New(kvstore.Config{})
@@ -208,33 +470,41 @@ func TestCacheRealtimeEphemeralKeyMappingStoresKeyID(t *testing.T) {
 	}
 	defer store.Close()
 
-	body := []byte(`{
-		"value": "ek_test_456",
-		"expires_at": ` + "4102444800" + `
-	}`)
-	cacheRealtimeEphemeralKeyMapping(store, body, "key_123", "sk-bf-test")
+	resp := &schemas.BifrostPassthroughResponse{Body: []byte(`{
+		"value": "ek_provider_456",
+		"expires_at": 4102444800
+	}`)}
+	if bifrostErr := replaceAndCacheRealtimeEphemeralToken(store, resp, "key_123", "sk-bf-test"); bifrostErr != nil {
+		t.Fatalf("replaceAndCacheRealtimeEphemeralToken() error = %v", bifrostErr)
+	}
 
-	raw, err := store.Get(buildRealtimeEphemeralKeyMappingKey("ek_test_456"))
+	var rewritten struct {
+		Value string `json:"value"`
+	}
+	if err := json.Unmarshal(resp.Body, &rewritten); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if !strings.HasPrefix(rewritten.Value, "ek_bf_") {
+		t.Fatalf("returned token = %q, want Bifrost token", rewritten.Value)
+	}
+	if rewritten.Value == "ek_provider_456" {
+		t.Fatal("returned provider token unchanged")
+	}
+
+	raw, err := store.Get(buildRealtimeEphemeralKeyMappingKey(rewritten.Value))
 	if err != nil {
 		t.Fatalf("store.Get() error = %v", err)
 	}
-	value, ok := raw.([]byte)
+	mapping, ok := raw.(realtimeEphemeralKeyMapping)
 	if !ok {
-		t.Fatalf("cached value type = %T, want []byte", raw)
+		t.Fatalf("cached value type = %T, want realtimeEphemeralKeyMapping", raw)
 	}
-	var mapping realtimeEphemeralKeyMapping
-	if err := json.Unmarshal(value, &mapping); err != nil {
-		t.Fatalf("json.Unmarshal() error = %v", err)
-	}
-	if mapping.KeyID != "key_123" {
-		t.Fatalf("mapping.KeyID = %q, want %q", mapping.KeyID, "key_123")
-	}
-	if mapping.VirtualKey != "sk-bf-test" {
-		t.Fatalf("mapping.VirtualKey = %q, want %q", mapping.VirtualKey, "sk-bf-test")
+	if mapping.KeyID != "key_123" || mapping.VirtualKey != "sk-bf-test" || mapping.ProviderToken != "ek_provider_456" {
+		t.Fatalf("mapping = %#v, want key, virtual key, and provider token", mapping)
 	}
 }
 
-func TestCacheRealtimeEphemeralKeyMappingSkipsExpiredSecrets(t *testing.T) {
+func TestReplaceAndCacheRealtimeEphemeralTokenRejectsExpiredSecret(t *testing.T) {
 	t.Parallel()
 
 	store, err := kvstore.New(kvstore.Config{})
@@ -244,14 +514,12 @@ func TestCacheRealtimeEphemeralKeyMappingSkipsExpiredSecrets(t *testing.T) {
 	defer store.Close()
 
 	expired := time.Now().Add(-time.Minute).Unix()
-	body := fmt.Appendf(nil, `{
+	resp := &schemas.BifrostPassthroughResponse{Body: fmt.Appendf(nil, `{
 		"value": "ek_expired",
 		"expires_at": %d
-	}`, expired)
-	cacheRealtimeEphemeralKeyMapping(store, body, "key_123", "")
-
-	if _, err := store.Get(buildRealtimeEphemeralKeyMappingKey("ek_expired")); err == nil {
-		t.Fatal("expected no cached mapping for expired token")
+	}`, expired)}
+	if bifrostErr := replaceAndCacheRealtimeEphemeralToken(store, resp, "key_123", ""); bifrostErr == nil {
+		t.Fatal("expected expired provider secret to be rejected")
 	}
 }
 
@@ -269,6 +537,14 @@ func TestIsJSONContentType(t *testing.T) {
 	}
 }
 
+// The handler finds the governance plugin by type-asserting each base plugin
+// against governance.BaseGovernancePlugin, so a mock that falls behind the
+// interface stops being found — silently, and without a build failure. Minting
+// then skips governance entirely and every assertion below still reads as a
+// passing "no governance configured" path. This line turns that drift into a
+// compile error at the point the interface grows.
+var _ governance.BaseGovernancePlugin = (*mockRealtimeMintingGovernancePlugin)(nil)
+
 type mockRealtimeMintingGovernancePlugin struct {
 	err            *schemas.BifrostError
 	seenUserID     string
@@ -282,20 +558,21 @@ func (m *mockRealtimeMintingGovernancePlugin) GetName() string {
 	return governance.PluginName
 }
 
-func (m *mockRealtimeMintingGovernancePlugin) EvaluateGovernanceRequest(ctx *schemas.BifrostContext, evaluationRequest *governance.EvaluationRequest, _ schemas.RequestType) (*governance.EvaluationResult, *schemas.BifrostError) {
+func (m *mockRealtimeMintingGovernancePlugin) Evaluate(ctx *schemas.BifrostContext, evaluationRequest *governance.EvaluationRequest) (*governance.EvaluationResult, *schemas.BifrostError) {
 	m.evaluateCalls++
 	m.seenUserID = ""
 	m.seenVirtualKey = ""
 	m.seenProvider = ""
 	m.seenModel = ""
 	if evaluationRequest != nil {
-		m.seenUserID = evaluationRequest.UserID
-		m.seenVirtualKey = evaluationRequest.VirtualKey
 		m.seenProvider = evaluationRequest.Provider
 		m.seenModel = evaluationRequest.Model
 	}
-	if ctx != nil && m.seenVirtualKey == "" {
+	// The credential and the user are the request's, carried on its context: the handler no longer
+	// restates them, so this is where they are observed.
+	if ctx != nil {
 		m.seenVirtualKey = bifrost.GetStringFromContext(ctx, schemas.BifrostContextKeyVirtualKey)
+		m.seenUserID = bifrost.GetStringFromContext(ctx, schemas.BifrostContextKeyUserID)
 	}
 	if m.err != nil {
 		return nil, m.err
@@ -303,11 +580,19 @@ func (m *mockRealtimeMintingGovernancePlugin) EvaluateGovernanceRequest(ctx *sch
 	return &governance.EvaluationResult{Decision: governance.DecisionAllow}, nil
 }
 
+func (m *mockRealtimeMintingGovernancePlugin) HTTPTransportPreAuthHook(_ *schemas.BifrostContext, _ *schemas.HTTPRequest) (*schemas.HTTPResponse, error) {
+	return nil, nil
+}
+
 func (m *mockRealtimeMintingGovernancePlugin) HTTPTransportPreHook(_ *schemas.BifrostContext, _ *schemas.HTTPRequest) (*schemas.HTTPResponse, error) {
 	return nil, nil
 }
 
 func (m *mockRealtimeMintingGovernancePlugin) HTTPTransportPostHook(_ *schemas.BifrostContext, _ *schemas.HTTPRequest, _ *schemas.HTTPResponse) error {
+	return nil
+}
+
+func (m *mockRealtimeMintingGovernancePlugin) PreRequestHook(_ *schemas.BifrostContext, _ *schemas.BifrostRequest) error {
 	return nil
 }
 
@@ -332,6 +617,21 @@ func (m *mockRealtimeMintingGovernancePlugin) Cleanup() error {
 }
 
 func (m *mockRealtimeMintingGovernancePlugin) GetGovernanceStore() governance.GovernanceStore {
+	return nil
+}
+
+func (m *mockRealtimeMintingGovernancePlugin) GetBudgetAndRateLimitStatus(_ *schemas.BifrostContext, _ schemas.ModelProvider, _ string, _ map[string]float64, _ map[string]int64, _ map[string]int64) *governance.BudgetAndRateLimitStatus {
+	return nil
+}
+
+func (m *mockRealtimeMintingGovernancePlugin) PublishRoutingAllowlist(_ *schemas.BifrostContext, _ string) {
+}
+
+func (m *mockRealtimeMintingGovernancePlugin) ResolveAccess(_ *schemas.BifrostContext) (schemas.Access, error) {
+	return nil, nil
+}
+
+func (m *mockRealtimeMintingGovernancePlugin) LoadBalanceProvider(_ *schemas.BifrostContext, _ *schemas.BifrostRequest) error {
 	return nil
 }
 

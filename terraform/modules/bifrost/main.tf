@@ -20,10 +20,15 @@ locals {
     {}
   )
 
+  # Schema precedence: explicit schema_url var > $schema already in base config > public default.
+  # Only fall through to the public URL when the base config has no $schema, so a mirrored-schema
+  # setup provided via config_json/config_json_file is never silently rewritten.
+  schema_url = coalesce(var.schema_url, try(local.base_config["$schema"], null), "https://www.getbifrost.ai/schema")
+
   # Terraform variable overrides (non-null values only)
   overrides = {
     for k, v in {
-      "$schema"            = "https://www.getbifrost.ai/schema"
+      "$schema"            = local.schema_url
       encryption_key       = var.encryption_key
       auth_config          = var.auth_config
       client               = var.client
@@ -41,6 +46,7 @@ locals {
       plugins              = var.plugins
       audit_logs           = var.audit_logs
       websocket            = var.websocket
+      server               = var.server
     } : k => v if v != null
   }
 
@@ -80,6 +86,7 @@ module "aws" {
   image                        = local.image
   container_port               = local.container_port
   health_check_path            = local.health_check_path
+  ingress_path                 = var.ingress_path
   region                       = var.region
   name_prefix                  = var.name_prefix
   tags                         = var.tags
@@ -116,6 +123,7 @@ module "gcp" {
   image                        = local.image
   container_port               = local.container_port
   health_check_path            = local.health_check_path
+  ingress_path                 = var.ingress_path
   project_id                   = var.gcp_project_id
   region                       = var.region
   name_prefix                  = var.name_prefix
@@ -150,6 +158,7 @@ module "azure" {
   image                        = local.image
   container_port               = local.container_port
   health_check_path            = local.health_check_path
+  ingress_path                 = var.ingress_path
   region                       = var.region
   name_prefix                  = var.name_prefix
   tags                         = var.tags
@@ -184,6 +193,7 @@ module "kubernetes" {
   image                        = local.image
   container_port               = local.container_port
   health_check_path            = local.health_check_path
+  ingress_path                 = var.ingress_path
   name_prefix                  = var.name_prefix
   tags                         = var.tags
   desired_count                = var.desired_count

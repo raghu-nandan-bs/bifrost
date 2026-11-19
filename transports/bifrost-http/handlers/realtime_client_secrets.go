@@ -8,11 +8,13 @@ import (
 	"time"
 
 	"github.com/fasthttp/router"
+	"github.com/google/uuid"
 	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/plugins/governance"
-	"github.com/maximhq/bifrost/transports/bifrost-http/integrations"
-	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
+	"github.com/maximhq/bifrost/plugins/modelcatalogresolver"
+	"github.com/maximhq/bifrost/transports/v2/bifrost-http/integrations"
+	"github.com/maximhq/bifrost/transports/v2/bifrost-http/lib"
 	"github.com/valyala/fasthttp"
 )
 
@@ -86,8 +88,8 @@ func (h *RealtimeClientSecretsHandler) handleRequest(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	logger.Info("[realtime-client-secrets] request: path=%s provider=%s model=%s endpoint_type=%s",
-		string(ctx.Path()), providerKey, model, route.EndpointType)
+	logger.Info("[realtime-client-secrets] request: path=%s provider=%s model=%s",
+		string(ctx.Path()), providerKey, model)
 
 	bifrostCtx, cancel := lib.ConvertToBifrostContext(ctx, h.handlerStore)
 	defer cancel()
@@ -100,6 +102,9 @@ func (h *RealtimeClientSecretsHandler) handleRequest(ctx *fasthttp.RequestCtx) {
 	}
 	if userName, ok := ctx.UserValue(schemas.BifrostContextKeyUserName).(string); ok && userName != "" {
 		bifrostCtx.SetValue(schemas.BifrostContextKeyUserName, userName)
+	}
+	if userEmail, ok := ctx.UserValue(schemas.BifrostContextKeyUserEmail).(string); ok && userEmail != "" {
+		bifrostCtx.SetValue(schemas.BifrostContextKeyUserEmail, userEmail)
 	}
 	if bifrostErr := h.evaluateMintingGovernance(bifrostCtx, providerKey, model); bifrostErr != nil {
 		SendBifrostError(ctx, bifrostErr)
@@ -130,6 +135,9 @@ func (h *RealtimeClientSecretsHandler) handleRequest(ctx *fasthttp.RequestCtx) {
 
 	// Resolve model aliases now that the key is selected so the forwarded body
 	// carries the provider's canonical model, matching wsrealtime/webrtc flows.
+	if aliasConfig := key.Aliases.ResolveConfig(model); aliasConfig != nil {
+		bifrostCtx.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{Key: model, Config: aliasConfig})
+	}
 	if resolved := key.Aliases.Resolve(model); resolved != "" && resolved != model {
 		model = resolved
 		reparsed, parseErr := schemas.ParseRealtimeClientSecretBody(normalizedBody)
@@ -151,7 +159,7 @@ func (h *RealtimeClientSecretsHandler) handleRequest(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	resp, bifrostErr := sessionProvider.CreateRealtimeClientSecret(bifrostCtx, key, route.EndpointType, normalizedBody)
+	resp, bifrostErr := sessionProvider.CreateRealtimeClientSecret(bifrostCtx, key, normalizedBody)
 	if bifrostErr != nil {
 		logger.Error("[realtime-client-secrets] upstream error: provider=%s model=%s error=%s",
 			providerKey, model, bifrostErr.Error)
@@ -161,12 +169,26 @@ func (h *RealtimeClientSecretsHandler) handleRequest(ctx *fasthttp.RequestCtx) {
 
 	logger.Info("[realtime-client-secrets] upstream success: provider=%s model=%s status=%d",
 		providerKey, model, resp.StatusCode)
-	cacheRealtimeEphemeralKeyMapping(
+	// Prefer the settled identity: it is what minting governance evaluated, so the
+	// mapping cannot attribute later turns to a different key than the one that was
+	// authorized here. The raw-header parse is only a fallback for routes where the
+	// settled context does not retain the virtual key at mapping time (observed live
+	// for bearer-based mints).
+	virtualKey := realtimeMappingVirtualKey(bifrostCtx)
+	if virtualKey == "" {
+		if presented := governance.ParseVirtualKeyFromFastHTTPRequest(ctx); presented != nil {
+			virtualKey = *presented
+		}
+	}
+	if bifrostErr := replaceAndCacheRealtimeEphemeralToken(
 		h.handlerStore.GetKVStore(),
-		resp.Body,
+		resp,
 		key.ID,
-		bifrost.GetStringFromContext(bifrostCtx, schemas.BifrostContextKeyVirtualKey),
-	)
+		virtualKey,
+	); bifrostErr != nil {
+		SendBifrostError(ctx, bifrostErr)
+		return
+	}
 
 	writeRealtimeClientSecretResponse(ctx, resp)
 }
@@ -181,35 +203,24 @@ func (h *RealtimeClientSecretsHandler) evaluateMintingGovernance(
 		return nil
 	}
 
-	_, bifrostErr := governancePlugin.EvaluateGovernanceRequest(bifrostCtx, &governance.EvaluationRequest{
-		VirtualKey: bifrost.GetStringFromContext(bifrostCtx, schemas.BifrostContextKeyVirtualKey),
-		Provider:   providerKey,
-		Model:      model,
-		UserID:     bifrost.GetStringFromContext(bifrostCtx, schemas.BifrostContextKeyUserID),
-	}, schemas.RealtimeRequest)
+	// The credential and the user the request was made as travel on the context, which is where
+	// evaluation reads them from, so naming them here would only be a second copy to keep in step.
+	_, bifrostErr := governancePlugin.Evaluate(bifrostCtx, &governance.EvaluationRequest{
+		RequestType: schemas.RealtimeRequest,
+		Provider:    providerKey,
+		Model:       model,
+	})
 	return bifrostErr
 }
 
 func (h *RealtimeClientSecretsHandler) realtimeSessionRoutes() []schemas.RealtimeSessionRoute {
 	routes := []schemas.RealtimeSessionRoute{
-		{
-			Path:         "/v1/realtime/client_secrets",
-			EndpointType: schemas.RealtimeSessionEndpointClientSecrets,
-		},
-		{
-			Path:         "/v1/realtime/sessions",
-			EndpointType: schemas.RealtimeSessionEndpointSessions,
-		},
+		{Path: "/v1/realtime/client_secrets"},
 	}
 
 	for _, path := range integrations.OpenAIRealtimeClientSecretPaths("/openai") {
-		endpointType := schemas.RealtimeSessionEndpointClientSecrets
-		if strings.HasSuffix(path, "/realtime/sessions") {
-			endpointType = schemas.RealtimeSessionEndpointSessions
-		}
 		routes = append(routes, schemas.RealtimeSessionRoute{
 			Path:            path,
-			EndpointType:    endpointType,
 			DefaultProvider: schemas.OpenAI,
 		})
 	}
@@ -231,14 +242,14 @@ func resolveRealtimeClientSecretTarget(ctx *fasthttp.RequestCtx, config *lib.Con
 	providerKey, model := schemas.ParseModelString(rawModel, defaultProvider)
 	// Model catalog auto-resolution for bare model names on /v1 client secret routes
 	if defaultProvider == "" && providerKey == "" && model != "" {
-		providers := config.GetProvidersForModel(model)
-		if len(providers) > 0 {
+		selected, candidates := modelcatalogresolver.ResolveProviderFromCatalog(nil, config.ModelCatalog, model)
+		if selected != "" {
 			ctx.SetUserValue(lib.FastHTTPUserValueModelCatalogResolution, &lib.ModelCatalogResolution{
 				Model:            model,
-				ResolvedProvider: providers[0],
-				AllProviders:     providers,
+				ResolvedProvider: selected,
+				AllProviders:     candidates,
 			})
-			providerKey = providers[0]
+			providerKey = selected
 		}
 	}
 	if defaultProvider == "" && providerKey == "" {
@@ -274,11 +285,26 @@ func normalizeRealtimeClientSecretBody(root map[string]json.RawMessage, bareMode
 		return nil, newRealtimeClientSecretHandlerError(fasthttp.StatusInternalServerError, "server_error", "failed to encode normalized model", marshalErr)
 	}
 
+	// Classify once, via the same canonical classifier extraction and the
+	// provider-layer normalizer use (schemas.IsGATranscriptionSessionBody),
+	// so this pass can't disagree with them about which shape a body is —
+	// a full realtime session must never take the GA-transcription rewrite
+	// branch just because it also enables live input-audio transcription as
+	// a sibling feature (checked via root.model/session.model presence, not
+	// just whether session.model happens to be set).
+	isGATranscription := schemas.IsGATranscriptionSessionBody(root)
+
 	// Normalize session.model if present
 	if sessionJSON, ok := root["session"]; ok && len(sessionJSON) > 0 {
 		var session map[string]json.RawMessage
 		if err := json.Unmarshal(sessionJSON, &session); err == nil {
-			if _, hasModel := session["model"]; hasModel {
+			if isGATranscription {
+				if rewritten, changed, err := rewriteGASessionTranscriptionModel(session, normalizedModel); err != nil {
+					return nil, err
+				} else if changed {
+					root["session"] = rewritten
+				}
+			} else if _, hasModel := session["model"]; hasModel {
 				session["model"] = normalizedModel
 				rewritten, err := json.Marshal(session)
 				if err != nil {
@@ -300,41 +326,149 @@ func normalizeRealtimeClientSecretBody(root map[string]json.RawMessage, bareMode
 	return normalized, nil
 }
 
+// rewriteGASessionTranscriptionModel updates session.audio.input.transcription.model
+// in place for a GA transcription-shaped session (RealtimeTranscriptionSessionCreateRequestGA,
+// which has no top-level session.model — the field this function's caller
+// already checked is absent). Needed so that alias resolution (which changes
+// the routing model after key selection) actually reaches the field the
+// provider layer reads, instead of silently leaving the pre-alias model in
+// the body. Returns changed=false when the session isn't transcription-shaped
+// (e.g. a full realtime session with no model set yet, which the caller
+// should leave untouched).
+func rewriteGASessionTranscriptionModel(session map[string]json.RawMessage, normalizedModel json.RawMessage) ([]byte, bool, *schemas.BifrostError) {
+	audioJSON, ok := session["audio"]
+	if !ok || len(audioJSON) == 0 || string(audioJSON) == "null" {
+		return nil, false, nil
+	}
+	var audio map[string]json.RawMessage
+	if err := json.Unmarshal(audioJSON, &audio); err != nil {
+		return nil, false, newRealtimeClientSecretHandlerError(fasthttp.StatusBadRequest, "invalid_request_error", "session.audio must be an object", err)
+	}
+	inputJSON, ok := audio["input"]
+	if !ok || len(inputJSON) == 0 || string(inputJSON) == "null" {
+		return nil, false, nil
+	}
+	var input map[string]json.RawMessage
+	if err := json.Unmarshal(inputJSON, &input); err != nil {
+		return nil, false, newRealtimeClientSecretHandlerError(fasthttp.StatusBadRequest, "invalid_request_error", "session.audio.input must be an object", err)
+	}
+	transJSON, ok := input["transcription"]
+	if !ok || len(transJSON) == 0 || string(transJSON) == "null" {
+		return nil, false, nil
+	}
+	var transcription map[string]json.RawMessage
+	if err := json.Unmarshal(transJSON, &transcription); err != nil {
+		return nil, false, newRealtimeClientSecretHandlerError(fasthttp.StatusBadRequest, "invalid_request_error", "session.audio.input.transcription must be an object", err)
+	}
+	transcription["model"] = normalizedModel
+	transcriptionJSON, err := json.Marshal(transcription)
+	if err != nil {
+		return nil, false, newRealtimeClientSecretHandlerError(fasthttp.StatusInternalServerError, "server_error", "failed to re-encode session.audio.input.transcription", err)
+	}
+	input["transcription"] = transcriptionJSON
+	inputJSON, err = json.Marshal(input)
+	if err != nil {
+		return nil, false, newRealtimeClientSecretHandlerError(fasthttp.StatusInternalServerError, "server_error", "failed to re-encode session.audio.input", err)
+	}
+	audio["input"] = inputJSON
+	audioJSON, err = json.Marshal(audio)
+	if err != nil {
+		return nil, false, newRealtimeClientSecretHandlerError(fasthttp.StatusInternalServerError, "server_error", "failed to re-encode session.audio", err)
+	}
+	session["audio"] = audioJSON
+	rewritten, err := json.Marshal(session)
+	if err != nil {
+		return nil, false, newRealtimeClientSecretHandlerError(fasthttp.StatusInternalServerError, "server_error", "failed to re-encode session", err)
+	}
+	return rewritten, true, nil
+}
+
 const realtimeEphemeralKeyMappingPrefix = "realtime:ephemeral-key:"
 
 type realtimeEphemeralKeyMapping struct {
-	KeyID      string `json:"key_id,omitempty"`
-	VirtualKey string `json:"virtual_key,omitempty"`
+	KeyID         string `json:"key_id,omitempty"`
+	VirtualKey    string `json:"virtual_key,omitempty"`
+	ProviderToken string `json:"provider_token,omitempty"`
 }
 
-func cacheRealtimeEphemeralKeyMapping(kv schemas.KVStore, body []byte, keyID string, virtualKey string) {
-	if kv == nil || len(body) == 0 || strings.TrimSpace(keyID) == "" {
-		return
+func realtimeMappingVirtualKey(ctx *schemas.BifrostContext) string {
+	if ctx == nil {
+		return ""
+	}
+	if ctx.Grant() != nil {
+		if virtualKey := governance.PresentedVirtualKey(ctx); virtualKey != "" {
+			return virtualKey
+		}
+	}
+	return bifrost.GetStringFromContext(ctx, schemas.BifrostContextKeyVirtualKey)
+}
+
+func replaceAndCacheRealtimeEphemeralToken(kv schemas.KVStore, resp *schemas.BifrostPassthroughResponse, keyID string, virtualKey string) *schemas.BifrostError {
+	if kv == nil || resp == nil || len(resp.Body) == 0 || strings.TrimSpace(keyID) == "" {
+		return newRealtimeClientSecretHandlerError(fasthttp.StatusInternalServerError, "server_error", "failed to secure realtime client secret", nil)
 	}
 
-	token, ttl, ok := parseRealtimeEphemeralKeyMapping(body)
-	if !ok || strings.TrimSpace(token) == "" || ttl <= 0 {
-		return
+	providerToken, ttl, nested, ok := parseRealtimeEphemeralKeyMapping(resp.Body)
+	if !ok || strings.TrimSpace(providerToken) == "" || ttl <= 0 {
+		return newRealtimeClientSecretHandlerError(fasthttp.StatusBadGateway, "server_error", "provider returned an invalid realtime client secret", nil)
 	}
 
-	payload, err := json.Marshal(realtimeEphemeralKeyMapping{
-		KeyID:      strings.TrimSpace(keyID),
-		VirtualKey: strings.TrimSpace(virtualKey),
-	})
+	bifrostToken := "ek_bf_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	body, err := replaceRealtimeEphemeralToken(resp.Body, bifrostToken, nested)
 	if err != nil {
-		logger.Warn("failed to encode realtime ephemeral key mapping for key_id=%s: %v", keyID, err)
-		return
+		return newRealtimeClientSecretHandlerError(fasthttp.StatusInternalServerError, "server_error", "failed to secure realtime client secret", err)
 	}
 
-	if err := kv.SetWithTTL(buildRealtimeEphemeralKeyMappingKey(token), payload, ttl); err != nil {
-		logger.Warn("failed to cache realtime ephemeral key mapping for key_id=%s: %v", keyID, err)
+	mapping := realtimeEphemeralKeyMapping{
+		KeyID:         strings.TrimSpace(keyID),
+		VirtualKey:    strings.TrimSpace(virtualKey),
+		ProviderToken: strings.TrimSpace(providerToken),
 	}
+	if err := kv.SetWithTTL(buildRealtimeEphemeralKeyMappingKey(bifrostToken), mapping, ttl); err != nil {
+		logger.Error("failed to cache realtime ephemeral key mapping for key_id=%s: %v", keyID, err)
+		return newRealtimeClientSecretHandlerError(fasthttp.StatusInternalServerError, "server_error", "failed to secure realtime client secret", err)
+	}
+
+	resp.Body = body
+	return nil
 }
 
-func parseRealtimeEphemeralKeyMapping(body []byte) (string, time.Duration, bool) {
+func replaceRealtimeEphemeralToken(body []byte, token string, nested bool) ([]byte, error) {
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(body, &root); err != nil {
-		return "", 0, false
+		return nil, err
+	}
+
+	if nested {
+		var clientSecret map[string]json.RawMessage
+		if err := json.Unmarshal(root["client_secret"], &clientSecret); err != nil {
+			return nil, err
+		}
+		value, err := json.Marshal(token)
+		if err != nil {
+			return nil, err
+		}
+		clientSecret["value"] = value
+		rewritten, err := json.Marshal(clientSecret)
+		if err != nil {
+			return nil, err
+		}
+		root["client_secret"] = rewritten
+	} else {
+		value, err := json.Marshal(token)
+		if err != nil {
+			return nil, err
+		}
+		root["value"] = value
+	}
+
+	return json.Marshal(root)
+}
+
+func parseRealtimeEphemeralKeyMapping(body []byte) (string, time.Duration, bool, bool) {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(body, &root); err != nil {
+		return "", 0, false, false
 	}
 
 	var clientSecret struct {
@@ -345,25 +479,33 @@ func parseRealtimeEphemeralKeyMapping(body []byte) (string, time.Duration, bool)
 	// OpenAI client_secrets responses expose the ephemeral token at the top level.
 	// Keep accepting the nested shape too so the mapping logic stays compatible
 	// with any provider/session endpoint variants that wrap the secret object.
+	nested := false
 	if err := json.Unmarshal(body, &clientSecret); err != nil || strings.TrimSpace(clientSecret.Value) == "" || clientSecret.ExpiresAt <= 0 {
 		clientSecretRaw, ok := root["client_secret"]
 		if !ok || len(clientSecretRaw) == 0 || string(clientSecretRaw) == "null" {
-			return "", 0, false
+			return "", 0, false, false
 		}
+		// Reset before reparsing: Unmarshal preserves fields absent from the new
+		// JSON, so leftovers from the failed top-level attempt could otherwise
+		// combine with nested fields into a token/expiry pair no single shape
+		// actually carried — and misreport which shape holds the secret.
+		clientSecret.Value = ""
+		clientSecret.ExpiresAt = 0
 		if err := json.Unmarshal(clientSecretRaw, &clientSecret); err != nil {
-			return "", 0, false
+			return "", 0, false, false
 		}
+		nested = true
 	}
 	if strings.TrimSpace(clientSecret.Value) == "" || clientSecret.ExpiresAt <= 0 {
-		return "", 0, false
+		return "", 0, false, false
 	}
 
 	ttl := time.Until(time.Unix(clientSecret.ExpiresAt, 0))
 	if ttl <= 0 {
-		return "", 0, false
+		return "", 0, false, false
 	}
 
-	return clientSecret.Value, ttl, true
+	return clientSecret.Value, ttl, nested, true
 }
 
 func buildRealtimeEphemeralKeyMappingKey(token string) string {
@@ -414,9 +556,7 @@ func writeRealtimeClientSecretResponse(ctx *fasthttp.RequestCtx, resp *schemas.B
 		return
 	}
 
-	for key, value := range resp.Headers {
-		ctx.Response.Header.Set(key, value)
-	}
+	lib.ForwardProviderResponseHeaders(ctx, resp.Headers)
 	if len(ctx.Response.Header.ContentType()) == 0 {
 		ctx.SetContentType("application/json")
 	}

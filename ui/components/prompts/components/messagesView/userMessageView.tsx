@@ -1,14 +1,21 @@
 import { CodeEditor } from "@/components/ui/codeEditor";
 import { RichTextarea } from "@/components/ui/custom/richTextarea";
-import { Markdown } from "@/components/ui/markdown";
 import { Message, SerializedMessage, type MessageContent } from "@/lib/message";
 import { JINJA_VAR_HIGHLIGHT_PATTERNS, JINJA_VAR_REGEX } from "@/lib/message/constant";
 import { isJson } from "@/lib/utils/validation";
 import { Paperclip, PencilIcon, XIcon } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
+import { useTranslation } from "react-i18next";
 import { fileToAttachment } from "../../utils/attachment";
 import { AttachmentDisplay } from "./attachmentViews";
 import MessageRoleSwitcher from "./messageRoleSwitcher";
+
+const LazyMarkdown = lazy(() => import("@/components/ui/markdown").then((m) => ({ default: m.Markdown })));
+const Markdown = (props: ComponentProps<typeof LazyMarkdown>) => (
+	<Suspense fallback={null}>
+		<LazyMarkdown {...props} />
+	</Suspense>
+);
 
 /**
  * Render an interactive user message block that supports viewing and editing content, role switching, file attachments (via picker or drag-and-drop), and special handling for JSON and Jinja-variable content.
@@ -33,6 +40,7 @@ export function UserMessageView({
 	onChange: (serialized: SerializedMessage) => void;
 	onRemove?: () => void;
 }) {
+	const { t } = useTranslation("config");
 	const [editMode, setEditMode] = useState(false);
 	const containerRef = useRef<HTMLDivElement>(null);
 	const fileInputRef = useRef<HTMLInputElement>(null);
@@ -201,7 +209,7 @@ export function UserMessageView({
 				<div className="bg-background/80 border-primary absolute inset-0 z-50 flex items-center justify-center rounded-sm border-2 border-dashed backdrop-blur-sm">
 					<div className="text-primary flex flex-col items-center gap-1">
 						<Paperclip className="h-5 w-5" />
-						<span className="text-xs font-medium">Drop files to attach</span>
+						<span className="text-xs font-medium">{t("promptRepo.dropFilesToAttach")}</span>
 					</div>
 				</div>
 			)}
@@ -220,7 +228,7 @@ export function UserMessageView({
 							/>
 							<button
 								type="button"
-								aria-label="Attach file"
+								aria-label={t("promptRepo.attachFileAria")}
 								data-testid="user-msg-attach"
 								onClick={() => fileInputRef.current?.click()}
 								className="hover:bg-muted focus:bg-muted rounded-sm p-1 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100 focus:opacity-100"
@@ -232,7 +240,7 @@ export function UserMessageView({
 					{!disabled && (
 						<button
 							type="button"
-							aria-label="Edit message"
+							aria-label={t("promptRepo.editMessageAria")}
 							data-testid="user-msg-edit"
 							onClick={() => setEditMode(true)}
 							className="hover:bg-muted focus:bg-muted rounded-sm p-1 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100 focus:opacity-100"
@@ -243,7 +251,7 @@ export function UserMessageView({
 					{!disabled && onRemove && (
 						<button
 							type="button"
-							aria-label="Delete message"
+							aria-label={t("promptRepo.deleteMessageAria")}
 							data-testid="user-msg-delete"
 							onClick={onRemove}
 							className="hover:bg-muted focus:bg-muted rounded-sm p-1 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100 focus:opacity-100"
@@ -274,7 +282,7 @@ export function UserMessageView({
 						highlightPatterns={JINJA_VAR_HIGHLIGHT_PATTERNS}
 					/>
 				) : isEmpty && messageAttachments.length === 0 ? (
-					<div className="text-muted-foreground min-h-[20px] text-sm italic">Enter user message...</div>
+					<div className="text-muted-foreground min-h-[20px] text-sm italic">{t("promptRepo.enterUserMessage")}</div>
 				) : contentIsJson ? (
 					<CodeEditor
 						wrap
@@ -303,6 +311,7 @@ export function UserMessageView({
 					/>
 				) : (
 					<div
+						role="presentation"
 						className={!disabled ? "cursor-text" : undefined}
 						onClick={(e) => {
 							if (disabled || editMode) return;

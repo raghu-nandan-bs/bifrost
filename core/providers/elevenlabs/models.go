@@ -7,7 +7,7 @@ import (
 	"github.com/maximhq/bifrost/core/schemas"
 )
 
-func (response *ElevenlabsListModelsResponse) ToBifrostListModelsResponse(providerKey schemas.ModelProvider, allowedModels schemas.WhiteList, blacklistedModels schemas.BlackList, aliases map[string]string, unfiltered bool) *schemas.BifrostListModelsResponse {
+func (response *ElevenlabsListModelsResponse) ToBifrostListModelsResponse(providerKey schemas.ModelProvider, allowedModels schemas.WhiteList, blacklistedModels schemas.BlackList, aliases schemas.KeyAliases, unfiltered bool) *schemas.BifrostListModelsResponse {
 	if response == nil {
 		return nil
 	}
@@ -48,4 +48,22 @@ func (response *ElevenlabsListModelsResponse) ToBifrostListModelsResponse(provid
 		pipeline.BackfillModels(included)...)
 
 	return bifrostResponse
+}
+
+// ToElevenlabsListModelsResponse is the Bifrost model list in ElevenLabs' schema, each model under the id a client
+// sends, with the name Bifrost has of it.
+func ToElevenlabsListModelsResponse(resp *schemas.BifrostListModelsResponse) ElevenlabsListModelsResponse {
+	if resp == nil {
+		return nil
+	}
+	list := make(ElevenlabsListModelsResponse, 0, len(resp.Data))
+	for _, model := range resp.Data {
+		_, modelID := schemas.ParseModelString(model.ID, schemas.Elevenlabs)
+		entry := ElevenlabsModel{ModelID: modelID}
+		if model.Name != nil {
+			entry.Name = *model.Name
+		}
+		list = append(list, entry)
+	}
+	return list
 }

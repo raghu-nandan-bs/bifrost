@@ -5,12 +5,7 @@
 // (see CreateMCPClientRequest.user_headers); this module only carries the
 // end-user submission types.
 import { MCPHeadersUserCredentialStatus } from "./mcp";
-import {
-	AuthMode,
-	MCPClientSummary,
-	UserSummary,
-	VirtualKeySummary,
-} from "./mcpSessions";
+import { AuthMode, MCPClientSummary, UserSummary, VirtualKeySummary } from "./mcpSessions";
 
 // MCPHeadersUserCredentialStatus is exported from mcp.ts so the sessions
 // table can switch on it. Re-exported here for clarity from the headers-
@@ -30,6 +25,9 @@ export interface MCPPerUserHeadersSubmitResponse {
 	status: "success";
 	credential_id: string;
 	updated_at: string;
+	// Set when the credential was stored but the client's tools could not be
+	// loaded with it; connecting to the client again retries.
+	discovery_error?: string;
 }
 
 // Flow detail for GET /api/mcp/per-user-headers/flows/{id}. Mirrors

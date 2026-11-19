@@ -5,6 +5,8 @@
  * for `buildCSV()`.
  */
 
+import type { ParseKeys } from "i18next";
+import i18n from "@/lib/i18n";
 import type {
 	CostHistogramResponse,
 	DimensionRankingsResponse,
@@ -24,8 +26,8 @@ import type {
 type CSVData = { headers: string[]; rows: unknown[][] };
 
 export function overviewVolumeToCSV(data: LogsHistogramResponse | null): CSVData {
-	const headers = ["Timestamp", "Total Requests", "Success", "Error"];
-	const rows = (data?.buckets ?? []).map((b) => [b.timestamp, b.count, b.success, b.error]);
+	const headers = ["Timestamp", "Total Requests", "Success", "Error", "Cancelled"];
+	const rows = (data?.buckets ?? []).map((b) => [b.timestamp, b.count, b.success, b.error, b.cancelled ?? 0]);
 	return { headers, rows };
 }
 
@@ -44,13 +46,13 @@ export function overviewCostToCSV(data: CostHistogramResponse | null): CSVData {
 
 export function overviewModelUsageToCSV(data: ModelHistogramResponse | null): CSVData {
 	const models = data?.models ?? [];
-	const modelHeaders = models.flatMap((m) => [`${m} Total`, `${m} Success`, `${m} Error`]);
+	const modelHeaders = models.flatMap((m) => [`${m} Total`, `${m} Success`, `${m} Error`, `${m} Cancelled`]);
 	const headers = ["Timestamp", ...modelHeaders];
 	const rows = (data?.buckets ?? []).map((b) => [
 		b.timestamp,
 		...models.flatMap((m) => {
 			const stats = b.by_model?.[m];
-			return [stats?.total ?? 0, stats?.success ?? 0, stats?.error ?? 0];
+			return [stats?.total ?? 0, stats?.success ?? 0, stats?.error ?? 0, stats?.cancelled ?? 0];
 		}),
 	]);
 	return { headers, rows };
@@ -107,6 +109,7 @@ export function providerLatencyToCSV(data: ProviderLatencyHistogramResponse | nu
 export function modelRankingsToCSV(data: ModelRankingsResponse | null): CSVData {
 	const headers = [
 		"Model",
+		"Canonical Model",
 		"Provider",
 		"Total Requests",
 		"Success Count",
@@ -114,13 +117,16 @@ export function modelRankingsToCSV(data: ModelRankingsResponse | null): CSVData 
 		"Total Tokens",
 		"Total Cost ($)",
 		"Avg Latency (ms)",
+		"Throughput (tok/s)",
 		"Requests Trend (%)",
 		"Tokens Trend (%)",
 		"Cost Trend (%)",
 		"Latency Trend (%)",
+		"Throughput Trend (%)",
 	];
 	const rows = (data?.rankings ?? []).map((r) => [
 		r.model,
+		r.canonical_model_name ?? "",
 		r.provider,
 		r.total_requests,
 		r.success_count,
@@ -128,10 +134,12 @@ export function modelRankingsToCSV(data: ModelRankingsResponse | null): CSVData 
 		r.total_tokens,
 		r.total_cost,
 		r.avg_latency,
+		r.throughput,
 		r.trend.has_previous_period ? r.trend.requests_trend : "N/A",
-		r.trend.has_previous_period ? r.trend.tokens_trend : "N/A",
-		r.trend.has_previous_period ? r.trend.cost_trend : "N/A",
+		r.trend.has_previous_period ? (r.trend.tokens_trend ?? "N/A") : "N/A",
+		r.trend.has_previous_period ? (r.trend.cost_trend ?? "N/A") : "N/A",
 		r.trend.has_previous_period ? r.trend.latency_trend : "N/A",
+		r.trend.has_previous_period ? r.trend.throughput_trend : "N/A",
 	]);
 	return { headers, rows };
 }
@@ -154,8 +162,8 @@ export function dimensionRankingsToCSV(data: DimensionRankingsResponse | null, d
 		r.total_tokens,
 		r.total_cost,
 		r.trend.has_previous_period ? r.trend.requests_trend : "N/A",
-		r.trend.has_previous_period ? r.trend.tokens_trend : "N/A",
-		r.trend.has_previous_period ? r.trend.cost_trend : "N/A",
+		r.trend.has_previous_period ? (r.trend.tokens_trend ?? "N/A") : "N/A",
+		r.trend.has_previous_period ? (r.trend.cost_trend ?? "N/A") : "N/A",
 	]);
 	return { headers, rows };
 }
@@ -194,14 +202,60 @@ export interface DashboardData {
 	teamRankingsData: DimensionRankingsResponse | null;
 	customerRankingsData: DimensionRankingsResponse | null;
 	buRankingsData: DimensionRankingsResponse | null;
+	projectRankingsData: DimensionRankingsResponse | null;
 	userRankingsData: DimensionRankingsResponse | null;
+	virtualKeyRankingsData: DimensionRankingsResponse | null;
+	appRankingsData: DimensionRankingsResponse | null;
 	// MCP
 	mcpHistogramData: MCPHistogramResponse | null;
 	mcpCostData: MCPCostHistogramResponse | null;
 	mcpTopToolsData: MCPTopToolsResponse | null;
 }
 
-export type ExportTab = "all" | "overview" | "provider-usage" | "rankings" | "team-rankings" | "customer-rankings" | "bu-rankings" | "user-rankings" | "mcp";
+export type DashboardTab =
+	| "overview"
+	| "provider-usage"
+	| "rankings"
+	| "team-rankings"
+	| "customer-rankings"
+	| "bu-rankings"
+	| "project-rankings"
+	| "user-rankings"
+	| "virtual-key-rankings"
+	| "app-rankings"
+	| "mcp";
+
+export type ExportTab = DashboardTab | "all";
+
+/**
+ * Every exportable tab, in the order sections appear in a full export.
+ * Single source of truth for the tab labels shown in the export menu and as
+ * PDF section headings, and for the DOM ids the PDF capture reads.
+ */
+const DASHBOARD_EXPORT_TAB_DEFS: { value: DashboardTab; labelKey: ParseKeys<"observability">; sectionId: string }[] = [
+	{ value: "overview", labelKey: "dashboard.tabs.overview", sectionId: "dashboard-section-overview" },
+	{ value: "provider-usage", labelKey: "dashboard.tabs.providerUsage", sectionId: "dashboard-section-provider-usage" },
+	{ value: "rankings", labelKey: "dashboard.tabs.modelRankings", sectionId: "dashboard-section-rankings" },
+	{ value: "mcp", labelKey: "dashboard.export.mcpUsage", sectionId: "dashboard-section-mcp" },
+	{ value: "team-rankings", labelKey: "dashboard.tabs.teamRankings", sectionId: "dashboard-section-team-rankings" },
+	{ value: "customer-rankings", labelKey: "dashboard.tabs.customerRankings", sectionId: "dashboard-section-customer-rankings" },
+	{ value: "bu-rankings", labelKey: "dashboard.tabs.buRankings", sectionId: "dashboard-section-bu-rankings" },
+	{ value: "project-rankings", labelKey: "dashboard.tabs.projectRankings", sectionId: "dashboard-section-project-rankings" },
+	{ value: "user-rankings", labelKey: "dashboard.tabs.userRankings", sectionId: "dashboard-section-user-rankings" },
+	{ value: "virtual-key-rankings", labelKey: "dashboard.tabs.virtualKeyRankings", sectionId: "dashboard-section-virtual-key-rankings" },
+	{ value: "app-rankings", labelKey: "dashboard.tabs.appRankings", sectionId: "dashboard-section-app-rankings" },
+];
+
+export const DASHBOARD_EXPORT_TABS: { value: DashboardTab; label: string; sectionId: string }[] = DASHBOARD_EXPORT_TAB_DEFS.map((tab) => ({
+	value: tab.value,
+	get label() {
+		return i18n.t(tab.labelKey, { ns: "observability" });
+	},
+	sectionId: tab.sectionId,
+}));
+
+export const getExportTabLabel = (tab: DashboardTab): string =>
+	DASHBOARD_EXPORT_TABS.find((t) => t.value === tab)?.label ?? i18n.t("dashboard.export.currentTab", { ns: "observability" });
 
 /** Return all CSV sections for the selected scope. Each entry becomes its own sheet / file section. */
 export function getCSVSections(data: DashboardData, tab: ExportTab): { name: string; csv: CSVData }[] {
@@ -240,9 +294,20 @@ export function getCSVSections(data: DashboardData, tab: ExportTab): { name: str
 	if (tab === "all" || tab === "bu-rankings") {
 		sections.push({ name: "bu-rankings", csv: dimensionRankingsToCSV(data.buRankingsData, "Business Unit") });
 	}
+	if (tab === "all" || tab === "project-rankings") {
+		sections.push({ name: "project-rankings", csv: dimensionRankingsToCSV(data.projectRankingsData, "Project") });
+	}
 
 	if (tab === "all" || tab === "user-rankings") {
 		sections.push({ name: "user-rankings", csv: dimensionRankingsToCSV(data.userRankingsData, "User") });
+	}
+
+	if (tab === "all" || tab === "virtual-key-rankings") {
+		sections.push({ name: "virtual-key-rankings", csv: dimensionRankingsToCSV(data.virtualKeyRankingsData, "Virtual Key") });
+	}
+
+	if (tab === "all" || tab === "app-rankings") {
+		sections.push({ name: "app-rankings", csv: dimensionRankingsToCSV(data.appRankingsData, "App") });
 	}
 
 	if (tab === "all" || tab === "mcp") {

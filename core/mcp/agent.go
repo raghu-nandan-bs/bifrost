@@ -165,6 +165,14 @@ func (a *AgentModeExecutor) executeAgent(
 		ctx.SetValue(schemas.BifrostMCPAgentOriginalRequestID, originalRequestID)
 	}
 
+	// Every later turn continues the conversation turn 1 started, on the route that served
+	// it: the caller's request was routed once, and re-running routing per turn would
+	// re-stamp the requested route with the already-rewritten model and send turn 2 back to
+	// a primary that turn 1 fell back from. Core reads this to pin continuation turns.
+	servedRoute := adapter.routingInfo(currentResponse)
+	ctx.SetValue(schemas.BifrostContextKeyMCPAgentServedRoute, &servedRoute)
+	defer ctx.ClearValue(schemas.BifrostContextKeyMCPAgentServedRoute)
+
 	for depth < maxAgentDepth {
 		depth++
 		toolCalls := adapter.extractToolCalls(currentResponse)
@@ -184,8 +192,14 @@ func (a *AgentModeExecutor) executeAgent(
 			}
 
 			toolName := *toolCall.Function.Name
-			client := clientManager.GetClientForTool(toolName)
+			client, _ := clientManager.GetClientForTool(ctx, toolName)
 			if client == nil {
+				// A connect call reaches no upstream tool: it hands back a
+				// sign-in link or connects, so the model gets either inline.
+				if clientManager.ConnectToolClient(ctx, toolName) != nil {
+					autoExecutableTools = append(autoExecutableTools, toolCall)
+					continue
+				}
 				// Allow code mode list, read, and docs tools (all read-only operations)
 				if toolName == ToolTypeListToolFiles || toolName == ToolTypeReadToolFile || toolName == ToolTypeGetToolDocs {
 					autoExecutableTools = append(autoExecutableTools, toolCall)
@@ -264,7 +278,7 @@ func (a *AgentModeExecutor) executeAgent(
 			}
 
 			// Check if tool can be auto-executed
-			if canAutoExecuteTool(toolName, client.ExecutionConfig) {
+			if CanAutoExecuteTool(toolName, client.ExecutionConfig) {
 				autoExecutableTools = append(autoExecutableTools, toolCall)
 				a.logger.Debug("Tool %s can be auto-executed", toolName)
 			} else {
@@ -295,6 +309,9 @@ func (a *AgentModeExecutor) executeAgent(
 					// plugin can create separate log entries for each parallel tool call.
 					toolCtx := schemas.NewBifrostContext(ctx, schemas.NoDeadline)
 					toolCtx.SetValue(schemas.BifrostContextKeyMCPLogID, uuid.New().String())
+					// No human approved this call, so Code Mode must hold every nested
+					// tool invocation to tools_to_auto_execute (see AuthorizeCodeModeToolCall).
+					toolCtx.SetValue(schemas.BifrostContextKeyMCPUnattendedExecution, true)
 
 					// Create MCP request for this tool call
 					mcpRequest := &schemas.BifrostMCPRequest{
@@ -367,9 +384,16 @@ func (a *AgentModeExecutor) executeAgent(
 			}
 			// Apply accumulated usage before building the final response
 			adapter.applyUsage(currentResponse, accumulatedUsage)
+			// The synthesized response replaces this turn too, so its text and reasoning are carried.
+			adapter.carryForward(currentResponse, autoExecutableTools)
 			// Create response with all executed tool results from all iterations, and non-auto-executable tool calls
-			return adapter.createResponseWithExecutedTools(currentResponse, allExecutedToolResults, allExecutedToolCalls, nonAutoExecutableTools), nil
+			finalResponse := adapter.createResponseWithExecutedTools(currentResponse, allExecutedToolResults, allExecutedToolCalls, nonAutoExecutableTools)
+			adapter.applyCarriedContent(finalResponse)
+			return finalResponse, nil
 		}
+
+		// This turn is about to be superseded by the next one; keep what it said and thought.
+		adapter.carryForward(currentResponse, autoExecutableTools)
 
 		// Create new request with updated conversation history
 		newReq := adapter.createNewRequest(conversationHistory)
@@ -389,125 +413,14 @@ func (a *AgentModeExecutor) executeAgent(
 		}
 
 		currentResponse = response
-		accumulatedUsage = mergeUsage(accumulatedUsage, adapter.extractUsage(currentResponse))
+		accumulatedUsage = schemas.MergeBifrostLLMUsage(accumulatedUsage, adapter.extractUsage(currentResponse))
 	}
 
 	adapter.applyUsage(currentResponse, accumulatedUsage)
+	// Usage covers every turn, so the content must too: earlier turns' text and reasoning
+	// come first, ahead of the last turn's own.
+	adapter.applyCarriedContent(currentResponse)
 	return currentResponse, nil
-}
-
-// mergeUsage sums token counts and costs from two BifrostLLMUsage values.
-// Detail sub-fields are summed when both are present; if only one is non-nil it is kept as-is.
-func mergeUsage(base, add *schemas.BifrostLLMUsage) *schemas.BifrostLLMUsage {
-	if add == nil {
-		return base
-	}
-	if base == nil {
-		return add
-	}
-
-	merged := &schemas.BifrostLLMUsage{
-		PromptTokens:     base.PromptTokens + add.PromptTokens,
-		CompletionTokens: base.CompletionTokens + add.CompletionTokens,
-		TotalTokens:      base.TotalTokens + add.TotalTokens,
-	}
-
-	// Merge prompt token details
-	if base.PromptTokensDetails != nil || add.PromptTokensDetails != nil {
-		bd := base.PromptTokensDetails
-		ad := add.PromptTokensDetails
-		if bd == nil {
-			bd = &schemas.ChatPromptTokensDetails{}
-		}
-		if ad == nil {
-			ad = &schemas.ChatPromptTokensDetails{}
-		}
-		merged.PromptTokensDetails = &schemas.ChatPromptTokensDetails{
-			TextTokens:        bd.TextTokens + ad.TextTokens,
-			AudioTokens:       bd.AudioTokens + ad.AudioTokens,
-			ImageTokens:       bd.ImageTokens + ad.ImageTokens,
-			CachedReadTokens:  bd.CachedReadTokens + ad.CachedReadTokens,
-			CachedWriteTokens: bd.CachedWriteTokens + ad.CachedWriteTokens,
-		}
-	}
-
-	// Merge completion token details
-	if base.CompletionTokensDetails != nil || add.CompletionTokensDetails != nil {
-		bd := base.CompletionTokensDetails
-		ad := add.CompletionTokensDetails
-		if bd == nil {
-			bd = &schemas.ChatCompletionTokensDetails{}
-		}
-		if ad == nil {
-			ad = &schemas.ChatCompletionTokensDetails{}
-		}
-		merged.CompletionTokensDetails = &schemas.ChatCompletionTokensDetails{
-			TextTokens:               bd.TextTokens + ad.TextTokens,
-			AcceptedPredictionTokens: bd.AcceptedPredictionTokens + ad.AcceptedPredictionTokens,
-			AudioTokens:              bd.AudioTokens + ad.AudioTokens,
-			ReasoningTokens:          bd.ReasoningTokens + ad.ReasoningTokens,
-			RejectedPredictionTokens: bd.RejectedPredictionTokens + ad.RejectedPredictionTokens,
-		}
-		if bd.CitationTokens != nil || ad.CitationTokens != nil {
-			bct := 0
-			act := 0
-			if bd.CitationTokens != nil {
-				bct = *bd.CitationTokens
-			}
-			if ad.CitationTokens != nil {
-				act = *ad.CitationTokens
-			}
-			sum := bct + act
-			merged.CompletionTokensDetails.CitationTokens = &sum
-		}
-		if bd.NumSearchQueries != nil || ad.NumSearchQueries != nil {
-			bnsq := 0
-			ansq := 0
-			if bd.NumSearchQueries != nil {
-				bnsq = *bd.NumSearchQueries
-			}
-			if ad.NumSearchQueries != nil {
-				ansq = *ad.NumSearchQueries
-			}
-			sum := bnsq + ansq
-			merged.CompletionTokensDetails.NumSearchQueries = &sum
-		}
-		if bd.ImageTokens != nil || ad.ImageTokens != nil {
-			bit := 0
-			ait := 0
-			if bd.ImageTokens != nil {
-				bit = *bd.ImageTokens
-			}
-			if ad.ImageTokens != nil {
-				ait = *ad.ImageTokens
-			}
-			sum := bit + ait
-			merged.CompletionTokensDetails.ImageTokens = &sum
-		}
-	}
-
-	// Merge cost
-	if base.Cost != nil || add.Cost != nil {
-		bc := base.Cost
-		ac := add.Cost
-		if bc == nil {
-			bc = &schemas.BifrostCost{}
-		}
-		if ac == nil {
-			ac = &schemas.BifrostCost{}
-		}
-		merged.Cost = &schemas.BifrostCost{
-			InputTokensCost:     bc.InputTokensCost + ac.InputTokensCost,
-			OutputTokensCost:    bc.OutputTokensCost + ac.OutputTokensCost,
-			ReasoningTokensCost: bc.ReasoningTokensCost + ac.ReasoningTokensCost,
-			CitationTokensCost:  bc.CitationTokensCost + ac.CitationTokensCost,
-			SearchQueriesCost:   bc.SearchQueriesCost + ac.SearchQueriesCost,
-			RequestCost:         bc.RequestCost + ac.RequestCost,
-			TotalCost:           bc.TotalCost + ac.TotalCost,
-		}
-	}
-
-	return merged
 }
 
 // extractToolCalls extracts all tool calls from a chat response.
@@ -560,14 +473,23 @@ func createToolResultMessage(toolCall schemas.ChatAssistantMessageToolCall, resu
 		content = result
 	}
 
+	toolMsg := &schemas.ChatToolMessage{
+		ToolCallID: toolCall.ID,
+	}
+	// The error text alone reads as an ordinary result to the model. Mark the
+	// result failed so providers whose wire carries the marker (Anthropic
+	// tool_result.is_error, Bedrock toolResult.status) can trigger the repair
+	// behaviour they document for it.
+	if err != nil {
+		toolMsg.IsError = schemas.Ptr(true)
+	}
+
 	return &schemas.ChatMessage{
 		Role: schemas.ChatMessageRoleTool,
 		Content: &schemas.ChatMessageContent{
 			ContentStr: &content,
 		},
-		ChatToolMessage: &schemas.ChatToolMessage{
-			ToolCallID: toolCall.ID,
-		},
+		ChatToolMessage: toolMsg,
 	}
 }
 
@@ -595,7 +517,7 @@ func buildAllowedAutoExecutionTools(ctx *schemas.BifrostContext, clientManager C
 		allClientNames = append(allClientNames, clientName)
 
 		// Only include code mode clients
-		if !client.ExecutionConfig.IsCodeModeClient {
+		if !client.ExecutionConfig.CodeModeFor(ctx) {
 			continue
 		}
 

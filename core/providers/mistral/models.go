@@ -7,7 +7,7 @@ import (
 	"github.com/maximhq/bifrost/core/schemas"
 )
 
-func (response *MistralListModelsResponse) ToBifrostListModelsResponse(allowedModels schemas.WhiteList, blacklistedModels schemas.BlackList, aliases map[string]string, unfiltered bool) *schemas.BifrostListModelsResponse {
+func (response *MistralListModelsResponse) ToBifrostListModelsResponse(allowedModels schemas.WhiteList, blacklistedModels schemas.BlackList, aliases schemas.KeyAliases, unfiltered bool) *schemas.BifrostListModelsResponse {
 	if response == nil {
 		return nil
 	}
@@ -52,4 +52,22 @@ func (response *MistralListModelsResponse) ToBifrostListModelsResponse(allowedMo
 		pipeline.BackfillModels(included)...)
 
 	return bifrostResponse
+}
+
+// ToBifrostModelRetrieveResponse converts a Mistral model card to a Bifrost model retrieve response
+func (model *MistralModel) ToBifrostModelRetrieveResponse() *schemas.BifrostModelRetrieveResponse {
+	if model == nil {
+		return nil
+	}
+
+	return &schemas.BifrostModelRetrieveResponse{
+		Model: schemas.Model{
+			ID:            string(schemas.Mistral) + "/" + model.ID,
+			Name:          schemas.Ptr(model.Name),
+			Description:   schemas.Ptr(model.Description),
+			Created:       schemas.Ptr(model.Created),
+			ContextLength: schemas.Ptr(model.MaxContextLength),
+			OwnedBy:       schemas.Ptr(model.OwnedBy),
+		},
+	}
 }

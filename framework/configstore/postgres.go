@@ -5,71 +5,13 @@ import (
 	"fmt"
 
 	"github.com/maximhq/bifrost/core/schemas"
-	"gorm.io/driver/postgres"
+	"github.com/maximhq/bifrost/framework/logstore"
+	"github.com/maximhq/bifrost/framework/postgresconn"
+	"github.com/maximhq/bifrost/framework/storehooks"
 	"gorm.io/gorm"
 )
 
-// PostgresConfig represents the configuration for a Postgres database.
-type PostgresConfig struct {
-	Host         *schemas.EnvVar `json:"host"`
-	Port         *schemas.EnvVar `json:"port"`
-	User         *schemas.EnvVar `json:"user"`
-	Password     *schemas.EnvVar `json:"password"`
-	DBName       *schemas.EnvVar `json:"db_name"`
-	SSLMode      *schemas.EnvVar `json:"ssl_mode"`
-	MaxIdleConns int             `json:"max_idle_conns"`
-	MaxOpenConns int             `json:"max_open_conns"`
-}
-
-// buildPostgresDSN assembles a libpq-style DSN from the validated config.
-func buildPostgresDSN(config *PostgresConfig) string {
-	return fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
-		config.Host.GetValue(), config.Port.GetValue(), config.User.GetValue(),
-		config.Password.GetValue(), config.DBName.GetValue(), config.SSLMode.GetValue())
-}
-
-// openPostresConnection opens a *gorm.DB against the configured Postgres instance
-// using the shared bifrost logger. Used for both the throwaway migration pool
-// and the runtime pool.
-func openPostresConnection(dsn string, logger schemas.Logger) (*gorm.DB, error) {
-	return gorm.Open(postgres.New(postgres.Config{DSN: dsn}), &gorm.Config{
-		Logger: newGormLogger(logger),
-	})
-}
-
-// closeDbConn closes the *sql.DB backing a *gorm.DB, logging any error.
-// Used in error paths and for the throwaway migration pool.
-func closeDbConn(db *gorm.DB, logger schemas.Logger) {
-	sqlDB, err := db.DB()
-	if err != nil {
-		logger.Error("failed to resolve *sql.DB for close: %v", err)
-		return
-	}
-	if err := sqlDB.Close(); err != nil {
-		logger.Error("failed to close DB connection: %v", err)
-	}
-}
-
-// applyPostgresPoolTuning applies MaxIdleConns / MaxOpenConns from config to
-// the supplied *gorm.DB, falling back to defaults when the config leaves the
-// field at zero.
-func applyPostgresPoolTuning(db *gorm.DB, config *PostgresConfig) error {
-	sqlDB, err := db.DB()
-	if err != nil {
-		return err
-	}
-	maxIdleConns := config.MaxIdleConns
-	if maxIdleConns == 0 {
-		maxIdleConns = 5
-	}
-	sqlDB.SetMaxIdleConns(maxIdleConns)
-	maxOpenConns := config.MaxOpenConns
-	if maxOpenConns == 0 {
-		maxOpenConns = 50
-	}
-	sqlDB.SetMaxOpenConns(maxOpenConns)
-	return nil
-}
+type PostgresConfig = postgresconn.Config
 
 // newPostgresConfigStore creates a new Postgres config store.
 //
@@ -78,58 +20,68 @@ func applyPostgresPoolTuning(db *gorm.DB, config *PostgresConfig) error {
 // immediately, then a fresh runtime pool is opened. The runtime pool's
 // connections never see pre-migration schema, so their cached prepared-plans
 // stay valid for the life of the process.
-func newPostgresConfigStore(ctx context.Context, config *PostgresConfig, logger schemas.Logger) (ConfigStore, error) {
-	if config == nil {
-		return nil, fmt.Errorf("config is required")
+func newPostgresConfigStore(ctx context.Context, config *PostgresConfig, logger schemas.Logger, migrationPause *logstore.MatViewPauseOptions) (ConfigStore, error) {
+	if err := postgresconn.Validate(config, false); err != nil {
+		return nil, err
 	}
-	if config.Host == nil || config.Host.GetValue() == "" {
-		return nil, fmt.Errorf("postgres host is required")
-	}
-	if config.Port == nil || config.Port.GetValue() == "" {
-		return nil, fmt.Errorf("postgres port is required")
-	}
-	if config.User == nil || config.User.GetValue() == "" {
-		return nil, fmt.Errorf("postgres user is required")
-	}
-	if config.Password == nil {
-		return nil, fmt.Errorf("postgres password is required")
-	}
-	if config.DBName == nil || config.DBName.GetValue() == "" {
-		return nil, fmt.Errorf("postgres db name is required")
-	}
-	if config.SSLMode == nil || config.SSLMode.GetValue() == "" {
-		return nil, fmt.Errorf("postgres ssl mode is required")
-	}
-	dsn := buildPostgresDSN(config)
+	dsn := postgresconn.WithApplicationName(postgresconn.BuildDSN(config), string(storehooks.RoleConfig))
+	logger.Debug("configstore: postgres target host=%s port=%s db=%s sslmode=%s",
+		config.Host.GetValue(), config.Port.GetValue(), config.DBName.GetValue(), config.SSLMode.GetValue())
 
 	// Migration-only DSN. Forces pgx into simple-query protocol on the migration
 	// pool so no statement plan is ever cached server-side; that makes SQLSTATE
 	// 0A000 ("cached plan must not change result type") structurally impossible
 	// when a migration mixes DDL with subsequent SELECTs against the same table.
 	// Runtime pools keep the default cache-statement mode for performance.
-	migrationDSN := dsn + " default_query_exec_mode=simple_protocol"
+	migrationDSN := postgresconn.MigrationDSN(dsn)
 
 	// Throwaway pool for schema migrations. Closing it before the runtime pool
 	// opens guarantees no cached prepared-plan survives the DDL.
-	mDb, err := openPostresConnection(migrationDSN, logger)
+	logger.Info("configstore: opening migration connection pool (if this step hangs, the database host/port is likely unreachable)")
+	mDb, err := postgresconn.Open(migrationDSN, config, newGormLogger(logger))
 	if err != nil {
+		logger.Error("configstore: failed to open migration connection pool: %v", err)
 		return nil, err
 	}
-	if err := triggerMigrations(ctx, mDb); err != nil {
-		closeDbConn(mDb, logger)
+	// Pin the throwaway pool small: migrations are serial DDL, and an untuned pool
+	// inherits database/sql's unlimited MaxOpenConns.
+	if err := postgresconn.ApplyMigrationPoolTuning(mDb); err != nil {
+		logger.Error("configstore: failed to tune migration connection pool: %v", err)
+		postgresconn.Close(mDb, logger)
 		return nil, err
 	}
-	closeDbConn(mDb, logger)
+	logger.Info("configstore: migration pool opened; running schema migrations (may block on a cross-node advisory lock if another pod is migrating)")
+	pause := migrationMatViewPause
+	if migrationPause != nil {
+		pause = *migrationPause
+	}
+	retry := postgresconn.MigrationLockRetryOptions(config, logger)
+	if err := triggerMigrationsWithOptions(ctx, mDb, logger, pause, retry); err != nil {
+		logger.Error("configstore: schema migrations failed: %v", err)
+		postgresconn.Close(mDb, logger)
+		return nil, err
+	}
+	logger.Info("configstore: schema migrations complete; closing migration pool")
+	postgresconn.Close(mDb, logger)
 
 	// Runtime pool. Opens against post-migration schema.
-	db, err := openPostresConnection(dsn, logger)
+	logger.Info("configstore: opening runtime connection pool")
+	db, err := postgresconn.Open(dsn, config, newGormLogger(logger))
 	if err != nil {
+		logger.Error("configstore: failed to open runtime connection pool: %v", err)
 		return nil, err
 	}
-	if err := applyPostgresPoolTuning(db, config); err != nil {
-		closeDbConn(db, logger)
+	if err := postgresconn.ApplyPoolTuning(db, config, logger); err != nil {
+		logger.Error("configstore: failed to apply connection pool tuning: %v", err)
+		postgresconn.Close(db, logger)
 		return nil, err
 	}
+	// Install the global vault store/remove callbacks on the runtime pool so
+	// plaintext SecretVar fields are rewritten to vault refs before persistence
+	// and owned vault secrets are cleaned up on delete.
+	RegisterVaultCallbacks(db)
+	storehooks.PoolOpened(storehooks.RoleConfig, db)
+	logger.Info("configstore: runtime connection pool ready")
 
 	d := &RDBConfigStore{logger: logger}
 	d.db.Store(db)
@@ -137,11 +89,16 @@ func newPostgresConfigStore(ctx context.Context, config *PostgresConfig, logger 
 	// migrateOnFreshFn: downstream consumers (e.g. bifrost-enterprise) run
 	// their migrations via this hook on a throwaway pool that closes after fn.
 	d.migrateOnFreshFn = func(ctx context.Context, fn func(context.Context, *gorm.DB) error) error {
-		tempDB, err := openPostresConnection(migrationDSN, logger)
+		tempDB, err := postgresconn.Open(migrationDSN, config, newGormLogger(logger))
 		if err != nil {
 			return err
 		}
-		defer closeDbConn(tempDB, logger)
+		defer postgresconn.Close(tempDB, logger)
+		// fn is supplied by downstream consumers, so bound the pool rather than
+		// leaving it on database/sql's unlimited default.
+		if err := postgresconn.ApplyMigrationPoolTuning(tempDB); err != nil {
+			return err
+		}
 		return fn(ctx, tempDB)
 	}
 
@@ -150,17 +107,19 @@ func newPostgresConfigStore(ctx context.Context, config *PostgresConfig, logger 
 	// sql.DB.Close blocks until in-flight queries finish, so callers already
 	// using the old pool complete safely.
 	d.refreshPoolFn = func(ctx context.Context) error {
-		newDB, err := openPostresConnection(dsn, logger)
+		newDB, err := postgresconn.Open(dsn, config, newGormLogger(logger))
 		if err != nil {
 			return fmt.Errorf("failed to open fresh runtime pool: %w", err)
 		}
-		if err := applyPostgresPoolTuning(newDB, config); err != nil {
-			closeDbConn(newDB, logger)
+		if err := postgresconn.ApplyPoolTuning(newDB, config, logger); err != nil {
+			postgresconn.Close(newDB, logger)
 			return fmt.Errorf("failed to tune fresh runtime pool: %w", err)
 		}
+		RegisterVaultCallbacks(newDB)
+		storehooks.PoolOpened(storehooks.RoleConfig, newDB)
 		oldDB := d.db.Swap(newDB)
 		if oldDB != nil {
-			closeDbConn(oldDB, logger)
+			postgresconn.Close(oldDB, logger)
 		}
 		return nil
 	}
@@ -168,9 +127,12 @@ func newPostgresConfigStore(ctx context.Context, config *PostgresConfig, logger 
 	// Encrypt any plaintext rows if encryption is enabled. Runs on the
 	// runtime pool — pure DML (SELECT + UPDATE), no DDL, so cached plans it
 	// installs remain valid until the next external migration batch.
+	logger.Info("configstore: encrypting plaintext rows if encryption is enabled")
 	if err := d.EncryptPlaintextRows(ctx); err != nil {
-		closeDbConn(db, logger)
+		logger.Error("configstore: failed to encrypt plaintext rows: %v", err)
+		postgresconn.Close(db, logger)
 		return nil, fmt.Errorf("failed to encrypt plaintext rows: %w", err)
 	}
+	logger.Info("configstore: postgres config store ready")
 	return d, nil
 }

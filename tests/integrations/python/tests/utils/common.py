@@ -1861,6 +1861,7 @@ def get_api_key(integration: str) -> str:
         "cohere": "COHERE_API_KEY",
         "vertex": "VERTEX_API_KEY",
         "xai": "XAI_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
         "nebius": "NEBIUS_API_KEY",
         "huggingface": "HUGGING_FACE_API_KEY",
         "azure": "AZURE_API_KEY",
@@ -2533,6 +2534,168 @@ def skip_if_no_bedrock_s3():
 
     if not is_bedrock_s3_configured():
         pytest.skip("Bedrock S3 tests require AWS_S3_BUCKET environment variable")
+
+
+def get_vertex_gcs_config() -> Dict[str, Optional[str]]:
+    """
+    Get Vertex AI batch GCS configuration from environment variables.
+
+    Vertex batch prediction reads inputs from / writes outputs to Google Cloud Storage,
+    so a bucket must be provided to exercise the batch API end-to-end.
+
+    Returns:
+        Dictionary with GCS configuration:
+        - bucket: GCS bucket name (from VERTEX_GCS_BUCKET)
+        - prefix: Output object prefix (from VERTEX_GCS_PREFIX or a default)
+    """
+    return {
+        "bucket": os.environ.get("VERTEX_GCS_BUCKET"),
+        "prefix": os.environ.get("VERTEX_GCS_PREFIX", "bifrost-batch-tests/"),
+    }
+
+
+def is_vertex_gcs_configured() -> bool:
+    """
+    Check if Vertex AI batch GCS configuration is available.
+
+    Returns:
+        True if VERTEX_GCS_BUCKET is set, False otherwise
+    """
+    config = get_vertex_gcs_config()
+    return config["bucket"] is not None and len(config["bucket"]) > 0
+
+
+def get_vertex_batch_dest_uri() -> str:
+    """
+    Build the GCS output destination URI (gs:// prefix) for a Vertex batch job.
+
+    Returns:
+        GCS URI string (e.g., gs://bucket/bifrost-batch-tests/output)
+
+    Raises:
+        ValueError if VERTEX_GCS_BUCKET is not configured
+    """
+    config = get_vertex_gcs_config()
+    if not config["bucket"]:
+        raise ValueError(
+            "VERTEX_GCS_BUCKET environment variable is required for Vertex batch API"
+        )
+    prefix = (config["prefix"] or "").strip("/")
+    base = f"gs://{config['bucket']}"
+    if prefix:
+        base = f"{base}/{prefix}"
+    return f"{base}/output"
+
+
+def skip_if_no_vertex_gcs():
+    """
+    Pytest skip helper for tests requiring Vertex GCS configuration.
+    Call skip_if_no_vertex_gcs() at the start of a test.
+    """
+    import pytest
+
+    if not is_vertex_gcs_configured():
+        pytest.skip("Vertex batch tests require VERTEX_GCS_BUCKET environment variable")
+
+
+def get_vertex_project() -> Optional[str]:
+    """Vertex project id for native batch prediction (from VERTEX_PROJECT_ID)."""
+    return os.environ.get("VERTEX_PROJECT_ID")
+
+
+def get_vertex_location() -> str:
+    """Vertex regional location for native batch prediction (from GOOGLE_LOCATION)."""
+    return os.environ.get("GOOGLE_LOCATION", "us-central1")
+
+
+def get_bifrost_base_url() -> str:
+    """Base URL of the Bifrost gateway (from BIFROST_BASE_URL)."""
+    return os.environ.get("BIFROST_BASE_URL", "http://localhost:8080")
+
+
+def skip_if_no_vertex_native_batch():
+    """
+    Pytest skip helper for native Vertex batch tests (aiplatform JobServiceClient).
+    Requires both a project id and a GCS bucket.
+    """
+    import pytest
+
+    if not get_vertex_project():
+        pytest.skip("Vertex native batch tests require VERTEX_PROJECT_ID environment variable")
+    if not is_vertex_gcs_configured():
+        pytest.skip("Vertex native batch tests require VERTEX_GCS_BUCKET environment variable")
+
+
+def get_vertex_google_credentials(scopes: Optional[List[str]] = None):
+    """
+    Build google-auth credentials for direct GCS/Vertex calls in tests.
+
+    The Vertex service-account key is provided to Bifrost via VERTEX_CREDENTIALS, which
+    may hold either the service-account JSON *content* or a path to a JSON file. ADC
+    (GOOGLE_APPLICATION_CREDENTIALS) only accepts a file path, so when the content is
+    inlined we must construct credentials explicitly instead of relying on ADC.
+
+    Returns None if no usable credentials are found (caller falls back to ADC).
+    """
+    import json
+
+    from google.oauth2 import service_account
+
+    raw = os.environ.get("VERTEX_CREDENTIALS") or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if not raw:
+        return None
+    raw = raw.strip()
+
+    if os.path.isfile(raw):
+        creds = service_account.Credentials.from_service_account_file(raw)
+    else:
+        try:
+            info = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+        creds = service_account.Credentials.from_service_account_info(info)
+
+    if scopes:
+        creds = creds.with_scopes(scopes)
+    return creds
+
+
+def stage_vertex_batch_input(content: str, filename: str | None = None) -> str:
+    """
+    Upload JSONL batch input to GCS and return its gs:// URI.
+
+    Vertex batch prediction reads inputs from Cloud Storage, so the input file must
+    exist in GCS before creating the job (the native API has no inline mode).
+
+    Args:
+        content: Newline-delimited JSON batch input
+        filename: Optional object filename (auto-generated if not provided)
+
+    Returns:
+        gs:// URI of the uploaded input object
+    """
+    import time
+
+    from google.cloud import storage
+
+    cfg = get_vertex_gcs_config()
+    if not cfg["bucket"]:
+        raise ValueError("VERTEX_GCS_BUCKET environment variable is required for Vertex batch API")
+
+    if filename is None:
+        filename = f"batch-input-{int(time.time())}.jsonl"
+    prefix = (cfg["prefix"] or "").strip("/")
+    blob_name = f"{prefix}/input/{filename}" if prefix else f"input/{filename}"
+
+    # Build credentials from VERTEX_CREDENTIALS (JSON content or path); fall back to ADC.
+    creds = get_vertex_google_credentials(
+        scopes=["https://www.googleapis.com/auth/cloud-platform"]
+    )
+    client = storage.Client(project=get_vertex_project(), credentials=creds)
+    bucket = client.bucket(cfg["bucket"])
+    blob = bucket.blob(blob_name)
+    blob.upload_from_string(content, content_type="application/jsonl")
+    return f"gs://{cfg['bucket']}/{blob_name}"
 
 
 def get_content_string_with_summary(response: Any) -> tuple[str, bool]:
@@ -3388,6 +3551,8 @@ def get_realtime_test_model(provider: str) -> str:
     env_var = f"{provider.upper()}_REALTIME_MODEL"
     if provider == "openai":
         return os.getenv(env_var, "gpt-realtime")
+    if provider == "gemini":
+        return os.getenv(env_var, "gemini-3.8-live")
     return os.getenv(env_var, "")
 
 
@@ -3593,3 +3758,87 @@ def run_openai_base_url_client_secret_request(
         }
     finally:
         client.close()
+
+
+# ============================================================================
+# Rerank helpers
+# ============================================================================
+
+# A rerank call takes a query plus documents and returns them ordered by relevance.
+# The corpus is deliberately unambiguous so the expected ordering is stable across
+# providers and model versions: only one document answers the query.
+RERANK_QUERY = "What is the capital of France?"
+
+RERANK_DOCUMENTS = [
+    "Paris is the capital and most populous city of France.",
+    "Carrots are orange root vegetables rich in beta carotene.",
+    "Berlin is the capital of Germany and its largest city.",
+]
+
+# Index into RERANK_DOCUMENTS that any working reranker must rank first.
+RERANK_RELEVANT_INDEX = 0
+
+# Index of the document with no relationship to the query at all.
+RERANK_IRRELEVANT_INDEX = 1
+
+
+def assert_valid_rerank_results(
+    pairs: List[tuple],
+    expected_count: Optional[int] = None,
+    expected_top_index: int = RERANK_RELEVANT_INDEX,
+):
+    """Assert a reranking is well-formed and actually ranked.
+
+    Args:
+        pairs: (index, score) tuples normalized from a provider's wire shape, in
+            the order the provider returned them.
+        expected_count: number of results expected, when top_n was supplied.
+        expected_top_index: index into RERANK_DOCUMENTS that must rank first.
+
+    Checking only that a call returned 200 would pass even if every score were
+    zero, so this also asserts the ordering carries real signal.
+    """
+    assert pairs, "rerank returned no results"
+
+    if expected_count is not None:
+        assert len(pairs) == expected_count, (
+            f"expected {expected_count} results, got {len(pairs)}"
+        )
+
+    for index, score in pairs:
+        assert isinstance(index, int), f"result index must be an int, got {type(index)}"
+        assert 0 <= index < len(RERANK_DOCUMENTS), f"result index {index} out of range"
+        assert isinstance(score, (int, float)), (
+            f"relevance score must be numeric, got {type(score)}"
+        )
+
+    indices = [index for index, _ in pairs]
+    assert len(indices) == len(set(indices)), f"duplicate indices in results: {indices}"
+
+    scores = [score for _, score in pairs]
+    assert scores == sorted(scores, reverse=True), (
+        f"results are not ordered by descending relevance: {scores}"
+    )
+
+    # A provider that dropped the document content still returns 200 with all-zero
+    # scores, so assert the ranking separated the relevant document from the rest.
+    assert indices[0] == expected_top_index, (
+        f"expected document {expected_top_index} to rank first, got {indices[0]} "
+        f"(scores: {scores})"
+    )
+    if len(scores) > 1:
+        assert scores[0] > scores[-1], (
+            f"top and bottom scores are indistinguishable: {scores}"
+        )
+
+
+def rerank_documents_as_objects() -> List[Dict[str, Any]]:
+    """RERANK_DOCUMENTS in Cohere's object form, carrying id and metadata.
+
+    Cohere ranks only the ``text`` field; every other key rides along and is
+    echoed back untouched, which is what lets Bifrost round-trip document ids.
+    """
+    return [
+        {"text": text, "id": f"doc-{i}", "metadata": {"position": i}}
+        for i, text in enumerate(RERANK_DOCUMENTS)
+    ]

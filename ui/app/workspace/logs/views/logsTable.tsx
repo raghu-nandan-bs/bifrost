@@ -8,14 +8,24 @@ import {
 	usePinOffsets,
 } from "@/components/table";
 import { Button } from "@/components/ui/button";
+import { ComboboxSelect, type ComboboxSelectOption } from "@/components/ui/combobox";
 import { Table, TableBody, TableCell, TableRow } from "@/components/ui/table";
-import { useTablePageSize } from "@/hooks/useTablePageSize";
-import type { LogEntry, Pagination } from "@/lib/types/logs";
+import { DEFAULT_PAGE_SIZE_OPTIONS, useTablePageSizePreference } from "@/lib/hooks/useTablePageSizePreference";
+import { getLocale } from "@/lib/i18n";
+import type { DisplayLogEntry, LogEntry, Pagination } from "@/lib/types/logs";
 import { cn } from "@/lib/utils";
-import type { ColumnOrderState, ColumnPinningState, VisibilityState } from "@tanstack/react-table";
+import type { ColumnOrderState, ColumnPinningState, TableMeta, VisibilityState } from "@tanstack/react-table";
 import { ColumnDef, flexRender, getCoreRowModel, SortingState, useReactTable } from "@tanstack/react-table";
 import { ChevronLeft, ChevronRight, Loader2, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+
+// Fixed content height for every body cell: 32px here plus the cell's py-1.5
+// makes every body row exactly 44px, whatever it holds. It is a single-column
+// grid rather than a flex row so cells lay out horizontally exactly as they did
+// when they were direct children of the cell — the column track is
+// minmax(0,1fr), so truncation still kicks in at the same width.
+const ROW_CONTENT_HEIGHT = "h-[32px]";
 
 interface DataTableProps {
 	columns: ColumnDef<LogEntry>[];
@@ -35,6 +45,8 @@ interface DataTableProps {
 	onToggleColumnVisibility: (id: string) => void;
 	onTogglePin: (id: string, side: "left" | "right") => void;
 	onReorderColumns: (entries: ColumnConfigEntry[]) => void;
+	/** Table meta consumed by the expand column in grouped view */
+	tableMeta?: TableMeta<LogEntry>;
 }
 
 export function LogsDataTable({
@@ -54,12 +66,13 @@ export function LogsDataTable({
 	onToggleColumnVisibility,
 	onTogglePin,
 	onReorderColumns,
+	tableMeta,
 }: DataTableProps) {
+	const { t } = useTranslation("observability");
 	const [sorting, setSorting] = useState<SortingState>([{ id: pagination.sort_by, desc: pagination.order === "desc" }]);
-	const tableContainerRef = useRef<HTMLDivElement>(null);
-	const calculatedPageSize = useTablePageSize(tableContainerRef);
+	const [pageSizePref, setPageSizePref, pageSizeHydrated] = useTablePageSizePreference("bifrost.logs.pageSize");
 
-	const fixedColumnIds = useMemo(() => new Set<string>(["actions"]), []);
+	const fixedColumnIds = useMemo(() => new Set<string>(["expand", "actions"]), []);
 
 	// Measure actual header cell widths for pixel-perfect pin offsets
 	const { headerCellRefs, setHeaderCellRef } = useHeaderCellRefs();
@@ -89,15 +102,35 @@ export function LogsDataTable({
 	paginationRef.current = pagination;
 	onPaginationChangeRef.current = onPaginationChange;
 
+	// Apply the page-size preference as the `limit` query param. Wait until the
+	// localStorage value has hydrated — writing the pre-hydration default would
+	// clobber an explicit `limit` already present in the URL (nuqs clears the
+	// default from the URL), causing the param to flip-flop across refreshes.
 	useEffect(() => {
-		if (calculatedPageSize && calculatedPageSize > paginationRef.current.limit) {
+		if (!pageSizeHydrated) return;
+		if (paginationRef.current.limit !== pageSizePref) {
 			onPaginationChangeRef.current({
 				...paginationRef.current,
-				limit: calculatedPageSize,
+				limit: pageSizePref,
 				offset: 0,
 			});
 		}
-	}, [calculatedPageSize]);
+	}, [pageSizePref, pageSizeHydrated]);
+
+	const pageSizeOptions = useMemo<ComboboxSelectOption[]>(
+		() => DEFAULT_PAGE_SIZE_OPTIONS.map((size) => ({ label: String(size), value: String(size) })),
+		[],
+	);
+
+	const handlePageSizeChange = useCallback(
+		(value: string | null) => {
+			if (!value) return;
+			const next = Number(value);
+			setPageSizePref(next);
+			onPaginationChange({ ...pagination, limit: next, offset: 0 });
+		},
+		[onPaginationChange, pagination, setPageSizePref],
+	);
 
 	const handleSortingChange = (updaterOrValue: SortingState | ((old: SortingState) => SortingState)) => {
 		const newSorting = typeof updaterOrValue === "function" ? updaterOrValue(sorting) : updaterOrValue;
@@ -127,6 +160,7 @@ export function LogsDataTable({
 			columnPinning,
 		},
 		onSortingChange: handleSortingChange,
+		meta: tableMeta,
 	});
 
 	const hasItems = totalItems > 0;
@@ -145,8 +179,8 @@ export function LogsDataTable({
 
 	return (
 		<div className="flex h-full flex-col gap-2">
-			<div ref={tableContainerRef} className="min-h-0 flex-1 overflow-hidden rounded-sm border">
-				<Table containerClassName="h-full overflow-auto">
+			<div className="min-h-0 flex-1 overflow-hidden rounded-sm border">
+				<Table containerClassName="@container/logs-table h-full overflow-auto" data-testid="logs-table">
 					<thead className={cn("[&_tr]:border-b px-2 sticky top-0 z-10 bg-[#f9f9f9] dark:bg-[#27272a]")}>
 						{table.getHeaderGroups().map((headerGroup) => (
 							<tr
@@ -176,16 +210,21 @@ export function LogsDataTable({
 					<TableBody>
 						<TableRow className="hover:bg-transparent">
 							<TableCell colSpan={columns.length} className="h-12 text-center">
-								<div className="text-muted-foreground flex items-center justify-center gap-2 text-sm">
+								{/* The row spans the whole scrollable table, so centring within it lands
+								    off to the right; sticking to the visible width keeps it in view. */}
+								<div
+									className="text-muted-foreground sticky left-4 flex w-[calc(100cqw-2rem)] items-center justify-center gap-2 text-sm"
+									data-testid="logs-table-status-row"
+								>
 									{loading ? (
 										<>
 											<RefreshCw className="h-4 w-4 animate-spin" />
-											Loading logs...
+											{t("logs.loading")}
 										</>
 									) : polling ? (
 										<>
 											<RefreshCw className="h-4 w-4 animate-spin" />
-											Waiting for new logs...
+											{t("logs.waitingForNew")}
 										</>
 									) : (
 										<Button
@@ -196,7 +235,7 @@ export function LogsDataTable({
 											variant={"ghost"}
 										>
 											{loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-											Refresh
+											{t("labels.refresh")}
 										</Button>
 									)}
 								</div>
@@ -204,10 +243,31 @@ export function LogsDataTable({
 						</TableRow>
 						{table.getRowModel().rows.length ? (
 							table.getRowModel().rows.map((row) => (
-								<TableRow key={row.id} className="hover:bg-muted/50 group/table-row min-h-[40px] cursor-pointer">
-									{row.getVisibleCells().map((cell) => {
+								<TableRow
+									key={row.id}
+									className={cn(
+										"hover:bg-muted/50 group/table-row min-h-[40px] cursor-pointer",
+										(row.original as DisplayLogEntry).__chainChild && "bg-muted/30",
+									)}
+								>
+									{row.getVisibleCells().map((cell, cellIndex) => {
 										const pinned = cell.column.getIsPinned();
 										const size = cell.column.getSize();
+										const display = row.original as DisplayLogEntry;
+										// The nesting marker on a child row is an inset shadow on the
+										// leading cell rather than a border on the row: a real border
+										// takes width from the first cell and shifts the whole row's
+										// content sideways as it expands. Session members are blue and
+										// chain rows grey, so the kind reads even with the expand
+										// column scrolled away; a chain under a session member is wider.
+										const nestingMarker =
+											display.__chainChild && cellIndex === 0
+												? display.__rowKind === "session-member"
+													? "shadow-[inset_2px_0_0_0_#93c5fd] dark:shadow-[inset_2px_0_0_0_#1d4ed8]"
+													: display.__depth === 2
+														? "shadow-[inset_4px_0_0_0_#a1a1aa] dark:shadow-[inset_4px_0_0_0_#71717a]"
+														: "shadow-[inset_2px_0_0_0_#d4d4d8] dark:shadow-[inset_2px_0_0_0_#52525b]"
+												: undefined;
 										return (
 											<TableCell
 												onClick={() => onRowClick?.(row.original, cell.column.id)}
@@ -220,13 +280,30 @@ export function LogsDataTable({
 												}}
 												className={cn(
 													"py-1.5 align-middle",
+													// The expander's control fills its cell and lays out its own
+													// padding, and the tree lines it draws are positioned against
+													// the cell's full height so they meet across rows.
+													cell.column.id === "expand" ? "relative px-0 py-0" : undefined,
 													pinned && "bg-card",
 													cell.column.id === lastLeftPinId && PIN_SHADOW_LEFT,
 													cell.column.id === firstRightPinId && PIN_SHADOW_RIGHT,
 													"group-hover/table-row:bg-[#f7f7f7] dark:group-hover/table-row:bg-[#232327]",
+													nestingMarker,
 												)}
 											>
-												{flexRender(cell.column.columnDef.cell, cell.getContext())}
+												{/* The status bar draws itself against the cell box and
+												    deliberately overflows the cell's padding, so it keeps
+												    rendering unwrapped. Everything else goes in a
+												    fixed-height box, so a row is the same height whatever
+												    it holds and expanding a group never pushes the table
+												    around. */}
+												{cell.column.id === "status" ? (
+													flexRender(cell.column.columnDef.cell, cell.getContext())
+												) : (
+													<div className={cn("relative grid grid-cols-[minmax(0,1fr)] items-center overflow-hidden", ROW_CONTENT_HEIGHT)}>
+														{flexRender(cell.column.columnDef.cell, cell.getContext())}
+													</div>
+												)}
 											</TableCell>
 										);
 									})}
@@ -235,7 +312,7 @@ export function LogsDataTable({
 						) : loading ? null : (
 							<TableRow>
 								<TableCell colSpan={columns.length} className="h-24 text-center">
-									No results found. Try adjusting your filters and/or time range.
+									{t("mcpLogs.noResults")}
 								</TableCell>
 							</TableRow>
 						)}
@@ -246,37 +323,55 @@ export function LogsDataTable({
 			{/* Pagination Footer */}
 			<div className="flex shrink-0 items-center justify-between text-xs" data-testid="pagination">
 				<div className="text-muted-foreground flex items-center gap-2">
-					{startItem.toLocaleString()}-{endItem.toLocaleString()} of {totalItems.toLocaleString()} entries
+					{t("logs.entryRange", {
+						start: startItem.toLocaleString(getLocale()),
+						end: endItem.toLocaleString(getLocale()),
+						total: totalItems.toLocaleString(getLocale()),
+					})}
 				</div>
 
-				<div className="flex items-center gap-2">
-					<Button
-						variant="ghost"
-						size="sm"
-						onClick={() => goToPage(currentPage - 1)}
-						disabled={currentPage <= 1}
-						data-testid="prev-page"
-						aria-label="Previous page"
-					>
-						<ChevronLeft className="size-3" />
-					</Button>
-
-					<div className="flex items-center gap-1">
-						<span>Page</span>
-						<span>{currentPage}</span>
-						<span>of {totalPages}</span>
+				<div className="flex items-center gap-3">
+					<div className="flex items-center gap-1.5">
+						<span className="text-muted-foreground">{t("logs.rowsPerPage")}</span>
+						<ComboboxSelect
+							options={pageSizeOptions}
+							value={String(pageSizePref)}
+							onValueChange={handlePageSizeChange}
+							disableSearch
+							hideClear
+							className="h-7 w-fit gap-1 text-xs"
+							aria-label={t("logs.rowsPerPage")}
+							data-testid="page-size-select"
+						/>
 					</div>
 
-					<Button
-						variant="ghost"
-						size="sm"
-						onClick={() => goToPage(currentPage + 1)}
-						disabled={totalPages === 0 || currentPage >= totalPages}
-						data-testid="next-page"
-						aria-label="Next page"
-					>
-						<ChevronRight className="size-3" />
-					</Button>
+					<div className="flex items-center gap-2">
+						<Button
+							variant="ghost"
+							size="sm"
+							onClick={() => goToPage(currentPage - 1)}
+							disabled={currentPage <= 1}
+							data-testid="prev-page"
+							aria-label={t("labels.previousPage")}
+						>
+							<ChevronLeft className="size-3" />
+						</Button>
+
+						<div className="flex items-center gap-1">
+							<span>{t("logs.pageRange", { page: currentPage, total: totalPages })}</span>
+						</div>
+
+						<Button
+							variant="ghost"
+							size="sm"
+							onClick={() => goToPage(currentPage + 1)}
+							disabled={totalPages === 0 || currentPage >= totalPages}
+							data-testid="next-page"
+							aria-label={t("labels.nextPage")}
+						>
+							<ChevronRight className="size-3" />
+						</Button>
+					</div>
 				</div>
 			</div>
 		</div>

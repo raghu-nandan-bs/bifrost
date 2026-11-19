@@ -74,25 +74,7 @@ Configure Groq as a provider.
 
 </Tab>
 <Tab title="API">
-
-```bash
-curl --location 'http://localhost:8080/api/providers' \
---header 'Content-Type: application/json' \
---data '{
-  "provider": "groq",
-  "keys": [
-    {
-      "name": "groq-key-1",
-      "value": "env.GROQ_API_KEY",
-      "models": [
-        "*"
-      ],
-      "weight": 1.0
-    }
-  ]
-}'
-```
-
+Refer to the API documentation for [Provider Keys Management](https://docs.getbifrost.ai/api-reference/providers/create-a-key-for-a-provider).
 </Tab>
 <Tab title="Go SDK">
 
@@ -100,7 +82,7 @@ curl --location 'http://localhost:8080/api/providers' \
 case schemas.Groq:
     return []schemas.Key{{
         Name:   "groq-key-1",
-        Value:  *schemas.NewEnvVar("env.GROQ_API_KEY"),
+        Value:  *schemas.NewSecretVar("env.GROQ_API_KEY"),
         Models: []string{"*"},
         Weight: 1.0,
     }}, nil

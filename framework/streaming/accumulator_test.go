@@ -2,7 +2,10 @@ package streaming
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -39,7 +42,7 @@ func TestChatStreamingFinalChunkNoDeadlock(t *testing.T) {
 				TotalTokens:      150,
 			}
 		}
-		err := accumulator.addChatStreamChunk(requestID, chunk, i == 9)
+		err := accumulator.addChatStreamChunk(requestID, StreamTypeChat, chunk, i == 9)
 		if err != nil {
 			t.Fatalf("Failed to add chunk %d: %v", i, err)
 		}
@@ -91,6 +94,69 @@ func TestChatStreamingFinalChunkNoDeadlock(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Deadlock detected: processChatStreamingResponse took too long (>5s)")
+	}
+}
+
+func TestAccumulatedChatStreamPreservesServiceTierBeforeUsageOnlyChunk(t *testing.T) {
+	accumulator := NewAccumulator(nil, bifrost.NewDefaultLogger(schemas.LogLevelError))
+	t.Cleanup(accumulator.Cleanup)
+
+	requestID := "chat-service-tier"
+	priority := schemas.BifrostServiceTierPriority
+	requireNoError := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	requireNoError(accumulator.addChatStreamChunk(requestID, StreamTypeChat, &ChatStreamChunk{
+		ChunkIndex:  1,
+		Timestamp:   time.Now(),
+		ServiceTier: &priority,
+	}, false))
+	requireNoError(accumulator.addChatStreamChunk(requestID, StreamTypeChat, &ChatStreamChunk{
+		ChunkIndex: 2,
+		Timestamp:  time.Now(),
+		TokenUsage: &schemas.BifrostLLMUsage{TotalTokens: 1},
+	}, true))
+
+	data, err := accumulator.processAccumulatedChatStreamingChunks(requestID, nil, true)
+	requireNoError(err)
+	if data.ServiceTier == nil || *data.ServiceTier != schemas.BifrostServiceTierPriority {
+		t.Fatalf("expected priority service tier, got %v", data.ServiceTier)
+	}
+}
+
+// TestAccumulatedChatStreamKeepsRawResponseFormat verifies the joined raw keeps the format its chunks declared, so a
+// chunk without a declaration (a synthetic tail) does not clear it.
+func TestAccumulatedChatStreamKeepsRawResponseFormat(t *testing.T) {
+	accumulator := NewAccumulator(nil, bifrost.NewDefaultLogger(schemas.LogLevelError))
+	t.Cleanup(accumulator.Cleanup)
+	ctx := schemas.NewBifrostContext(context.Background(), time.Time{})
+	ctx.SetValue(schemas.BifrostContextKeyAccumulatorID, "chat-raw-format")
+
+	declared := newChatChunkResponse(0, "Hello", nil, nil)
+	declared.ChatResponse.ExtraFields.RawResponse = `{"choices":[{"index":0,"delta":{"content":"Hello"}}]}`
+	declared.ChatResponse.ExtraFields.RawResponseFormat = schemas.RawResponseFormatOpenAIChatCompletionChunk
+	if _, err := accumulator.processChatStreamingResponse(ctx, declared, nil); err != nil {
+		t.Fatalf("declared chunk: %v", err)
+	}
+	tail := newChatChunkResponse(1, "", bifrost.Ptr("stop"), nil)
+	tail.ChatResponse.ExtraFields.RawResponse = `{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`
+	ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
+	processed, err := accumulator.processChatStreamingResponse(ctx, tail, nil)
+	if err != nil {
+		t.Fatalf("tail chunk: %v", err)
+	}
+
+	if processed == nil || processed.Data == nil || processed.Data.RawResponse == nil {
+		t.Fatal("expected accumulated raw response on final chunk")
+	}
+	if want := `{"choices":[{"index":0,"delta":{"content":"Hello"}}]}` + "\n\n" + `{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`; *processed.Data.RawResponse != want {
+		t.Fatalf("accumulated raw = %q, want %q", *processed.Data.RawResponse, want)
+	}
+	if processed.Data.RawResponseFormat != schemas.RawResponseFormatOpenAIChatCompletionChunk {
+		t.Fatalf("accumulated raw format = %q, want %q", processed.Data.RawResponseFormat, schemas.RawResponseFormatOpenAIChatCompletionChunk)
 	}
 }
 
@@ -192,7 +258,7 @@ func TestConcurrentChunkAddition(t *testing.T) {
 						Content: bifrost.Ptr(fmt.Sprintf("g%d-c%d", goroutineID, i)),
 					},
 				}
-				err := accumulator.addChatStreamChunk(requestID, chunk, false)
+				err := accumulator.addChatStreamChunk(requestID, StreamTypeChat, chunk, false)
 				if err != nil {
 					errors <- err
 					return
@@ -245,7 +311,7 @@ func TestGetLastChunkMethodsSafe(t *testing.T) {
 			TotalTokens:      150,
 		},
 	}
-	err := accumulator.addChatStreamChunk(requestID, chunk, false)
+	err := accumulator.addChatStreamChunk(requestID, StreamTypeChat, chunk, false)
 	if err != nil {
 		t.Fatalf("Failed to add chunk: %v", err)
 	}
@@ -660,6 +726,192 @@ func TestGetLastAudioAndTranscriptionChunksSafe(t *testing.T) {
 	}
 }
 
+func TestProcessStreamingResponsePreservesTerminalResponsesUsageWhenChunkIndexIsReused(t *testing.T) {
+	logger := bifrost.NewDefaultLogger(schemas.LogLevelDebug)
+	accumulator := NewAccumulator(nil, logger)
+
+	requestID := "test-responses-terminal-usage-reused-index"
+	ctx := schemas.NewBifrostContext(context.Background(), time.Time{})
+	ctx.SetValue(schemas.BifrostContextKeyAccumulatorID, requestID)
+
+	priorChunks := []*ResponsesStreamChunk{
+		{
+			ChunkIndex: 0,
+			Timestamp:  time.Now(),
+			StreamResponse: &schemas.BifrostResponsesStreamResponse{
+				Type: schemas.ResponsesStreamResponseTypeCreated,
+				Response: &schemas.BifrostResponsesResponse{
+					ID: bifrost.Ptr("resp_terminal_usage"),
+				},
+			},
+		},
+		{
+			ChunkIndex: 7,
+			Timestamp:  time.Now(),
+			StreamResponse: &schemas.BifrostResponsesStreamResponse{
+				Type:  schemas.ResponsesStreamResponseTypeOutputTextDelta,
+				Delta: bifrost.Ptr("partial"),
+			},
+		},
+		{
+			ChunkIndex: 7,
+			Timestamp:  time.Now(),
+			StreamResponse: &schemas.BifrostResponsesStreamResponse{
+				Type:  schemas.ResponsesStreamResponseTypeOutputTextDelta,
+				Delta: bifrost.Ptr("duplicate index ignored"),
+			},
+		},
+	}
+	for _, chunk := range priorChunks {
+		if err := accumulator.addResponsesStreamChunk(requestID, chunk, false); err != nil {
+			t.Fatalf("addResponsesStreamChunk() error = %v", err)
+		}
+	}
+
+	response := &schemas.BifrostResponse{
+		ResponsesStreamResponse: &schemas.BifrostResponsesStreamResponse{
+			Type:           schemas.ResponsesStreamResponseTypeCompleted,
+			SequenceNumber: 0,
+			Response: &schemas.BifrostResponsesResponse{
+				ID: bifrost.Ptr("resp_terminal_usage"),
+				Usage: &schemas.ResponsesResponseUsage{
+					InputTokens:  31,
+					OutputTokens: 17,
+					TotalTokens:  48,
+				},
+			},
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				RequestType:            schemas.ResponsesStreamRequest,
+				Provider:               schemas.OpenAI,
+				OriginalModelRequested: "gpt-4o-mini",
+				ChunkIndex:             0,
+			},
+		},
+	}
+
+	ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
+
+	processed, err := accumulator.ProcessStreamingResponse(ctx, response, nil)
+	if err != nil {
+		t.Fatalf("ProcessStreamingResponse() error = %v", err)
+	}
+	assertTokenUsage := func(t *testing.T, processed *ProcessedStreamResponse) {
+		t.Helper()
+		if processed == nil {
+			t.Fatal("expected processed response, got nil")
+		}
+		if processed.Data == nil || processed.Data.TokenUsage == nil {
+			t.Fatal("expected terminal response.completed usage to be accumulated")
+		}
+		if processed.Data.TokenUsage.PromptTokens != 31 {
+			t.Fatalf("expected prompt tokens 31, got %d", processed.Data.TokenUsage.PromptTokens)
+		}
+		if processed.Data.TokenUsage.CompletionTokens != 17 {
+			t.Fatalf("expected completion tokens 17, got %d", processed.Data.TokenUsage.CompletionTokens)
+		}
+		if processed.Data.TokenUsage.TotalTokens != 48 {
+			t.Fatalf("expected total tokens 48, got %d", processed.Data.TokenUsage.TotalTokens)
+		}
+	}
+	assertTokenUsage(t, processed)
+
+	processedAgain, err := accumulator.ProcessStreamingResponse(ctx, response, nil)
+	if err != nil {
+		t.Fatalf("second ProcessStreamingResponse() error = %v", err)
+	}
+	assertTokenUsage(t, processedAgain)
+
+	streamAccumulator := accumulator.getOrCreateStreamAccumulator(requestID)
+	streamAccumulator.mu.Lock()
+	defer streamAccumulator.mu.Unlock()
+	completedChunks := 0
+	for _, chunk := range streamAccumulator.ResponsesStreamChunks {
+		if chunk.StreamResponse != nil && chunk.StreamResponse.Type == schemas.ResponsesStreamResponseTypeCompleted {
+			completedChunks++
+		}
+	}
+	if completedChunks != 1 {
+		t.Fatalf("expected exactly one terminal response.completed chunk after duplicate processing, got %d", completedChunks)
+	}
+}
+
+// On a monotonic stream the terminal chunk arrives with a unique highest index, so
+// the first delivery is stored as-is — the reservation must still be seeded then,
+// or a second plugin delivering the same terminal chunk (logging + maxim both call
+// ProcessStreamingChunk with the final result) mints a fresh index and the chunk is
+// double-appended into the persisted raw log.
+func TestProcessStreamingResponseDedupesDuplicateTerminalChunkWithUniqueIndex(t *testing.T) {
+	logger := bifrost.NewDefaultLogger(schemas.LogLevelDebug)
+	accumulator := NewAccumulator(nil, logger)
+
+	requestID := "test-responses-terminal-monotonic-duplicate"
+	ctx := schemas.NewBifrostContext(context.Background(), time.Time{})
+	ctx.SetValue(schemas.BifrostContextKeyAccumulatorID, requestID)
+
+	for i := 0; i < 3; i++ {
+		chunk := &ResponsesStreamChunk{
+			ChunkIndex: i,
+			Timestamp:  time.Now(),
+			StreamResponse: &schemas.BifrostResponsesStreamResponse{
+				Type:  schemas.ResponsesStreamResponseTypeOutputTextDelta,
+				Delta: bifrost.Ptr("chunk"),
+			},
+		}
+		if err := accumulator.addResponsesStreamChunk(requestID, chunk, false); err != nil {
+			t.Fatalf("addResponsesStreamChunk() error = %v", err)
+		}
+	}
+
+	response := &schemas.BifrostResponse{
+		ResponsesStreamResponse: &schemas.BifrostResponsesStreamResponse{
+			Type:           schemas.ResponsesStreamResponseTypeCompleted,
+			SequenceNumber: 3,
+			Response: &schemas.BifrostResponsesResponse{
+				ID: bifrost.Ptr("resp_monotonic_terminal"),
+				Usage: &schemas.ResponsesResponseUsage{
+					InputTokens:  11,
+					OutputTokens: 7,
+					TotalTokens:  18,
+				},
+			},
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				RequestType:            schemas.ResponsesStreamRequest,
+				Provider:               schemas.OpenAI,
+				OriginalModelRequested: "gpt-4o-mini",
+				ChunkIndex:             3,
+			},
+		},
+	}
+
+	ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
+
+	for call := 1; call <= 2; call++ {
+		processed, err := accumulator.ProcessStreamingResponse(ctx, response, nil)
+		if err != nil {
+			t.Fatalf("ProcessStreamingResponse() call %d error = %v", call, err)
+		}
+		if processed == nil || processed.Data == nil || processed.Data.TokenUsage == nil || processed.Data.TokenUsage.TotalTokens != 18 {
+			t.Fatalf("call %d: expected terminal usage 18 total tokens, got %+v", call, processed)
+		}
+	}
+
+	streamAccumulator := accumulator.getOrCreateStreamAccumulator(requestID)
+	streamAccumulator.mu.Lock()
+	defer streamAccumulator.mu.Unlock()
+	completedChunks := 0
+	for _, chunk := range streamAccumulator.ResponsesStreamChunks {
+		if chunk.StreamResponse != nil && chunk.StreamResponse.Type == schemas.ResponsesStreamResponseTypeCompleted {
+			completedChunks++
+		}
+	}
+	if completedChunks != 1 {
+		t.Fatalf("expected exactly one terminal chunk after duplicate delivery of a unique-index final chunk, got %d", completedChunks)
+	}
+	if got := len(streamAccumulator.ResponsesStreamChunks); got != 4 {
+		t.Fatalf("expected 4 stored chunks (3 deltas + 1 terminal), got %d", got)
+	}
+}
+
 func TestProcessStreamingResponseSupportsWebSocketResponsesRequest(t *testing.T) {
 	logger := bifrost.NewDefaultLogger(schemas.LogLevelDebug)
 	accumulator := NewAccumulator(nil, logger)
@@ -722,5 +974,315 @@ func TestProcessStreamingResponseSupportsWebSocketResponsesRequest(t *testing.T)
 	}
 	if processed.Data.TokenUsage.TotalTokens != 19 {
 		t.Fatalf("expected total tokens 19, got %d", processed.Data.TokenUsage.TotalTokens)
+	}
+}
+
+// newChatChunkResponse builds a chat streaming chunk mirroring what the
+// OpenAI-compatible provider handler emits (content in the delta, an optional
+// finish_reason on the choice, an optional usage block, and a chunk index).
+func newChatChunkResponse(idx int, content string, finishReason *string, usage *schemas.BifrostLLMUsage) *schemas.BifrostResponse {
+	delta := &schemas.ChatStreamResponseChoiceDelta{}
+	if content != "" {
+		delta.Content = bifrost.Ptr(content)
+	}
+	return &schemas.BifrostResponse{
+		ChatResponse: &schemas.BifrostChatResponse{
+			ID:     "msg_finish",
+			Object: "chat.completion.chunk",
+			Choices: []schemas.BifrostResponseChoice{{
+				ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{Delta: delta},
+				FinishReason:             finishReason,
+			}},
+			Usage: usage,
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				RequestType: schemas.ChatCompletionStreamRequest,
+				Provider:    schemas.OpenAI,
+				ChunkIndex:  idx,
+			},
+		},
+	}
+}
+
+// TestChatStreamingFinishReasonForwardedOnContentChunk covers providers that
+// send finish_reason together with the final content delta. The provider
+// forwards that terminal chunk as-is and then appends a synthetic tail chunk
+// (higher index) whose finish_reason is nil to avoid a duplicate client-facing
+// emission. The accumulated response must still keep the finish_reason rather
+// than reading nil from the max-index tail chunk.
+func TestChatStreamingFinishReasonForwardedOnContentChunk(t *testing.T) {
+	logger := bifrost.NewDefaultLogger(schemas.LogLevelError)
+	accumulator := NewAccumulator(nil, logger)
+
+	requestID := "finish-glued-request"
+	ctx := schemas.NewBifrostContext(context.Background(), time.Time{})
+	ctx.SetValue(schemas.BifrostContextKeyAccumulatorID, requestID)
+
+	stop := "stop"
+	usage := &schemas.BifrostLLMUsage{PromptTokens: 10, CompletionTokens: 2, TotalTokens: 12}
+
+	if _, err := accumulator.processChatStreamingResponse(ctx, newChatChunkResponse(0, "Hello", nil, nil), nil); err != nil {
+		t.Fatalf("chunk 0: %v", err)
+	}
+	// Terminal content chunk carries the finish_reason.
+	if _, err := accumulator.processChatStreamingResponse(ctx, newChatChunkResponse(1, " world", &stop, nil), nil); err != nil {
+		t.Fatalf("chunk 1: %v", err)
+	}
+	// Synthetic tail chunk: empty delta, nil finish_reason, usage, final chunk.
+	ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
+	processed, err := accumulator.processChatStreamingResponse(ctx, newChatChunkResponse(2, "", nil, usage), nil)
+	if err != nil {
+		t.Fatalf("final chunk: %v", err)
+	}
+	if processed == nil || processed.Data == nil {
+		t.Fatal("expected accumulated data on final chunk")
+	}
+	if processed.Data.FinishReason == nil {
+		t.Fatal("finish_reason was dropped from the accumulated response")
+	}
+	if *processed.Data.FinishReason != "stop" {
+		t.Fatalf("accumulated finish_reason = %q, want %q", *processed.Data.FinishReason, "stop")
+	}
+}
+
+// TestChatStreamingFinishReasonOnTerminalChunk is the standard OpenAI shape: the
+// finish_reason arrives on the terminal (highest-index) chunk. This guards
+// against the fallback over-reaching and changing the common path.
+func TestChatStreamingFinishReasonOnTerminalChunk(t *testing.T) {
+	logger := bifrost.NewDefaultLogger(schemas.LogLevelError)
+	accumulator := NewAccumulator(nil, logger)
+
+	requestID := "finish-tail-request"
+	ctx := schemas.NewBifrostContext(context.Background(), time.Time{})
+	ctx.SetValue(schemas.BifrostContextKeyAccumulatorID, requestID)
+
+	stop := "stop"
+	usage := &schemas.BifrostLLMUsage{PromptTokens: 10, CompletionTokens: 2, TotalTokens: 12}
+
+	if _, err := accumulator.processChatStreamingResponse(ctx, newChatChunkResponse(0, "Hello", nil, nil), nil); err != nil {
+		t.Fatalf("chunk 0: %v", err)
+	}
+	if _, err := accumulator.processChatStreamingResponse(ctx, newChatChunkResponse(1, " world", nil, nil), nil); err != nil {
+		t.Fatalf("chunk 1: %v", err)
+	}
+	// Terminal chunk carries the finish_reason and usage.
+	ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
+	processed, err := accumulator.processChatStreamingResponse(ctx, newChatChunkResponse(2, "", &stop, usage), nil)
+	if err != nil {
+		t.Fatalf("final chunk: %v", err)
+	}
+	if processed == nil || processed.Data == nil || processed.Data.FinishReason == nil {
+		t.Fatal("expected finish_reason on the accumulated response")
+	}
+	if *processed.Data.FinishReason != "stop" {
+		t.Fatalf("accumulated finish_reason = %q, want %q", *processed.Data.FinishReason, "stop")
+	}
+}
+
+// A retried stream attempt reuses its request's accumulator, and its chunk indexes
+// restart at 0. Reset must drop the failed attempt's chunks so the retry's are not
+// discarded as duplicates, and keep the accumulator alive for the plugins that own it.
+func TestResetStreamAccumulatorKeepsRetryChunks(t *testing.T) {
+	accumulator := NewAccumulator(nil, bifrost.NewDefaultLogger(schemas.LogLevelError))
+	requestID := "retried-request"
+	acc := accumulator.CreateStreamAccumulator(requestID, time.Now())
+	add := func(index int, content string) {
+		t.Helper()
+		chunk := &ChatStreamChunk{
+			ChunkIndex: index,
+			Timestamp:  time.Now(),
+			Delta:      &schemas.ChatStreamResponseChoiceDelta{Content: new(content)},
+		}
+		if err := accumulator.addChatStreamChunk(requestID, StreamTypeChat, chunk, false); err != nil {
+			t.Fatalf("failed to add chunk %d: %v", index, err)
+		}
+	}
+
+	add(0, "failed-attempt")
+	accumulator.ResetStreamAccumulator(requestID)
+	add(0, "he")
+	add(1, "llo")
+
+	if current, _ := accumulator.streamAccumulators.Load(requestID); current != acc {
+		t.Fatal("reset replaced the accumulator instead of clearing it")
+	}
+	if got := acc.refCount.Load(); got != 1 {
+		t.Fatalf("refCount = %d, want 1: reset must keep the owners' references", got)
+	}
+	var content []string
+	for _, chunk := range acc.ChatStreamChunks {
+		content = append(content, *chunk.Delta.Content)
+	}
+	if len(content) != 2 || content[0] != "he" || content[1] != "llo" {
+		t.Fatalf("accumulated chunks = %q, want the retry's [he llo]", content)
+	}
+}
+
+// TestBuildChatMessageFromChunksWithoutAccumulator pins the exported builder used to rebuild
+// recorded streams outside a live Accumulator: out-of-order chunks are sorted and content, reasoning
+// and role are assembled exactly as the Accumulator method does.
+func TestBuildChatMessageFromChunksWithoutAccumulator(t *testing.T) {
+	makeChunks := func() []*ChatStreamChunk {
+		return []*ChatStreamChunk{
+			{ChunkIndex: 2, Delta: &schemas.ChatStreamResponseChoiceDelta{Content: schemas.Ptr("there")}},
+			{ChunkIndex: 0, Delta: &schemas.ChatStreamResponseChoiceDelta{Role: schemas.Ptr(string(schemas.ChatMessageRoleAssistant)), Reasoning: schemas.Ptr("think")}},
+			{ChunkIndex: 1, Delta: &schemas.ChatStreamResponseChoiceDelta{Content: schemas.Ptr("hi ")}},
+		}
+	}
+
+	message := BuildChatMessageFromChunks(makeChunks())
+	if message.Content == nil || message.Content.ContentStr == nil || *message.Content.ContentStr != "hi there" {
+		t.Fatalf("unexpected content: %+v", message.Content)
+	}
+	if message.Role != schemas.ChatMessageRoleAssistant {
+		t.Fatalf("unexpected role %q", message.Role)
+	}
+	if message.ChatAssistantMessage == nil || message.ChatAssistantMessage.Reasoning == nil || *message.ChatAssistantMessage.Reasoning != "think" {
+		t.Fatalf("unexpected reasoning: %+v", message.ChatAssistantMessage)
+	}
+
+	accumulator := NewAccumulator(nil, bifrost.NewDefaultLogger(schemas.LogLevelError))
+	if viaAccumulator := accumulator.buildCompleteMessageFromChatStreamChunks(makeChunks()); !reflect.DeepEqual(viaAccumulator, message) {
+		t.Fatalf("exported builder diverged from Accumulator method:\n got %+v\nwant %+v", message, viaAccumulator)
+	}
+}
+
+// Streamed delta.images (OpenRouter image models) must survive the delta copy and
+// land on the accumulated message that logging and post-hooks read.
+func TestBuildChatMessageFromChunksKeepsGeneratedImages(t *testing.T) {
+	const imageURL = "data:image/png;base64,iVBORw0KGgo="
+	frames := []string{
+		`{"role":"assistant","content":"Here is a cat. "}`,
+		`{"role":"assistant","content":"","images":[{"type":"image_url","image_url":{"url":"` + imageURL + `"}}]}`,
+		`{"role":"assistant","content":"Enjoy!"}`,
+	}
+	chunks := make([]*ChatStreamChunk, 0, len(frames))
+	for i, frame := range frames {
+		var delta schemas.ChatStreamResponseChoiceDelta
+		if err := schemas.Unmarshal([]byte(frame), &delta); err != nil {
+			t.Fatalf("decode frame %d: %v", i, err)
+		}
+		chunks = append(chunks, &ChatStreamChunk{ChunkIndex: i, Delta: deepCopyChatStreamDelta(&delta)})
+	}
+
+	encoded, err := json.Marshal(BuildChatMessageFromChunks(chunks))
+	if err != nil {
+		t.Fatalf("encode message: %v", err)
+	}
+	var got struct {
+		Content *string `json:"content"`
+		Images  []struct {
+			ImageURL struct {
+				URL string `json:"url"`
+			} `json:"image_url"`
+		} `json:"images"`
+	}
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatalf("re-decode %s: %v", encoded, err)
+	}
+	if got.Content == nil || *got.Content != "Here is a cat. Enjoy!" {
+		t.Fatalf("unexpected content: %s", encoded)
+	}
+	if len(got.Images) != 1 || got.Images[0].ImageURL.URL != imageURL {
+		t.Fatalf("streamed image missing from accumulated message: %s", encoded)
+	}
+}
+
+// passthroughStreamChunk returns a passthrough stream chunk carrying body at chunkIndex.
+func passthroughStreamChunk(chunkIndex int, body string) *schemas.BifrostResponse {
+	return &schemas.BifrostResponse{PassthroughResponse: &schemas.BifrostPassthroughResponse{
+		StatusCode:  200,
+		Body:        []byte(body),
+		ExtraFields: schemas.BifrostResponseExtraFields{RequestType: schemas.PassthroughStreamRequest, ChunkIndex: chunkIndex},
+	}}
+}
+
+// TestPassthroughStreamKeepsEachChunkOnceInOrder verifies a passthrough body fed by several plugins, out of order, is
+// accumulated once per chunk in ChunkIndex order, in the snapshot and on the final chunk, and that a reset lets a
+// retried attempt start again from index 0.
+func TestPassthroughStreamKeepsEachChunkOnceInOrder(t *testing.T) {
+	accumulator := NewAccumulator(nil, bifrost.NewDefaultLogger(schemas.LogLevelError))
+	t.Cleanup(accumulator.Cleanup)
+	ctx := schemas.NewBifrostContext(context.Background(), time.Time{})
+	ctx.SetValue(schemas.BifrostContextKeyAccumulatorID, "passthrough-dedupe")
+	feed := func(result *schemas.BifrostResponse) *ProcessedStreamResponse {
+		t.Helper()
+		processed, err := accumulator.processPassthroughStreamingResponse(ctx, result, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return processed
+	}
+
+	for _, chunk := range []*schemas.BifrostResponse{passthroughStreamChunk(1, "b"), passthroughStreamChunk(0, "a"), passthroughStreamChunk(1, "b"), passthroughStreamChunk(0, "a"), passthroughStreamChunk(2, "c")} {
+		feed(chunk)
+	}
+	snapshot := accumulator.GetAccumulatedResponse("passthrough-dedupe")
+	if snapshot == nil || snapshot.PassthroughResponse == nil || string(snapshot.PassthroughResponse.Body) != "abc" {
+		t.Fatalf("snapshot = %+v, want body %q", snapshot, "abc")
+	}
+	if snapshot.PassthroughResponse.ExtraFields.RequestType != schemas.PassthroughStreamRequest {
+		t.Fatalf("snapshot request type = %q", snapshot.PassthroughResponse.ExtraFields.RequestType)
+	}
+
+	accumulator.ResetStreamAccumulator("passthrough-dedupe")
+	feed(passthroughStreamChunk(0, "x"))
+	feed(passthroughStreamChunk(1, "y"))
+	ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
+	processed := feed(passthroughStreamChunk(2, ""))
+	if processed.Data == nil || string(processed.Data.PassthroughOutput.Body) != "xy" {
+		t.Fatalf("final body = %+v, want %q", processed.Data, "xy")
+	}
+}
+
+// BenchmarkPassthroughStreamAccumulate measures accumulating a 1 MB passthrough stream (256 chunks of 4 KB, each fed by
+// two plugins) and assembling its body on the final chunk.
+func BenchmarkPassthroughStreamAccumulate(b *testing.B) {
+	accumulator := NewAccumulator(nil, bifrost.NewDefaultLogger(schemas.LogLevelError))
+	b.Cleanup(accumulator.Cleanup)
+	chunks := make([]*schemas.BifrostResponse, 256)
+	for index := range chunks {
+		chunks[index] = passthroughStreamChunk(index, strings.Repeat("x", 4096))
+	}
+	final := passthroughStreamChunk(len(chunks), "")
+	b.SetBytes(256 * 4096)
+	b.ReportAllocs()
+	for b.Loop() {
+		ctx := schemas.NewBifrostContext(context.Background(), time.Time{})
+		ctx.SetValue(schemas.BifrostContextKeyAccumulatorID, "passthrough-bench")
+		for _, chunk := range chunks {
+			for range 2 {
+				if _, err := accumulator.processPassthroughStreamingResponse(ctx, chunk, nil); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+		ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
+		if _, err := accumulator.processPassthroughStreamingResponse(ctx, final, nil); err != nil {
+			b.Fatal(err)
+		}
+		accumulator.ResetStreamAccumulator("passthrough-bench")
+	}
+}
+
+// Streamed custom tool input accumulates into one custom call, as OpenAI sends it on chat.
+func TestBuildChatMessageFromChunks_CustomToolCall(t *testing.T) {
+	call := func(tc schemas.ChatAssistantMessageToolCall) *ChatStreamChunk {
+		return &ChatStreamChunk{Delta: &schemas.ChatStreamResponseChoiceDelta{ToolCalls: []schemas.ChatAssistantMessageToolCall{tc}}}
+	}
+	chunks := []*ChatStreamChunk{
+		call(schemas.ChatAssistantMessageToolCall{ID: bifrost.Ptr("call_1"), Type: bifrost.Ptr("custom"), Custom: &schemas.ChatAssistantMessageToolCallCustom{Name: bifrost.Ptr("code_exec")}}),
+		call(schemas.ChatAssistantMessageToolCall{Custom: &schemas.ChatAssistantMessageToolCallCustom{Input: "print("}}),
+		call(schemas.ChatAssistantMessageToolCall{Custom: &schemas.ChatAssistantMessageToolCallCustom{Input: "1)"}}),
+	}
+	message := BuildChatMessageFromChunks(chunks)
+	if message.ChatAssistantMessage == nil || len(message.ChatAssistantMessage.ToolCalls) != 1 {
+		t.Fatalf("tool calls not accumulated: %+v", message.ChatAssistantMessage)
+	}
+	tc := message.ChatAssistantMessage.ToolCalls[0]
+	if tc.Custom == nil || tc.Custom.Name == nil || *tc.Custom.Name != "code_exec" || tc.Custom.Input != "print(1)" {
+		t.Fatalf("custom call = %+v, want code_exec/print(1)", tc.Custom)
+	}
+	if body, _ := schemas.Marshal(message); strings.Contains(string(body), `"function"`) {
+		t.Fatalf("custom call carries a function object: %s", body)
 	}
 }

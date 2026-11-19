@@ -32,6 +32,20 @@ graph LR
 Post-hooks execute in **reverse order** of pre-hooks (LIFO pattern). This means a `pre_builtin` plugin's `PreLLMHook` runs first, but its `PostLLMHook` runs last - ensuring proper cleanup and state unwinding.
 </Info>
 
+### Routing layer order (PreRequestHook)
+
+`PreRequestHook` is the per-request **routing phase**. All routing-capable plugins fire here in registration order, and each one sees the routing decisions of those that ran before it. Built-in routing plugins are sequenced as follows within the `builtin` group:
+
+| Order | Plugin | Role |
+|-------|--------|------|
+| 4 | governance | Routing rules (CEL) + VK-scoped weighted load balancing |
+| Higher | adaptive-loadbalancer (Enterprise) | Performance-based provider selection across the model catalog |
+| 9 (last) | model-catalog-resolver | **Final fallback** — fills in `req.Provider` from the model catalog for unprefixed models when no earlier plugin picked one |
+
+The resolver runs last so CEL routing rules can match on `provider == ""` (the unresolved state) and earlier plugins always get the canonical bare model. After `PreRequestHook` returns, the core validates that `req.Provider` is non-empty — an unresolvable request returns a 400 with a clear error.
+
+Custom routing plugins can slot into this chain via `placement` + `order` like any other plugin. Place them in `pre_builtin` to override governance, or `post_builtin` to act as a custom fallback after all built-ins.
+
 ### Ordering within a group
 
 Within each placement group, plugins are sorted by their `order` value (lower executes earlier). Plugins with the same order preserve their registration order.
@@ -73,9 +87,23 @@ If your `config.json` file has plugin sequence configured, it will take preceden
 
 Update a plugin's placement and order using the update endpoint:
 
+<Note>
+  Setting `path` on a non-builtin plugin loads native code into the gateway process, so it
+  requires an authenticated admin session even if [dashboard authentication](/quickstart/gateway/setting-up-auth)
+  is otherwise disabled. A remote (`http`/`https`) `path` is only fetched if it resolves to a
+  public address - loopback, private, and link-local destinations are refused. The same rule
+  covers a built-in plugin's outbound endpoints (the OTEL `collector_url` and `metrics_endpoint`,
+  the telemetry `push_gateway_url`) and any `env.` or `vault.` reference in its config: setting or
+  changing one through the API needs an authenticated admin session, since the plugin resolves
+  such references from the gateway's own environment and sends the values to that endpoint.
+  Requests that keep the stored values, remove them, or edit other fields are not affected, and
+  neither is provisioning through `config.json`.
+</Note>
+
 ```bash
 curl -X PUT http://localhost:8080/api/plugins/my-plugin \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <admin-session-token>" \
   -d '{
     "enabled": true,
     "path": "/path/to/my-plugin.so",
@@ -185,6 +213,6 @@ When in doubt, use the default `post_builtin` placement. Most custom plugins - l
 
 ## Next steps
 
-- **[Writing a Go plugin](./writing-go-plugin)** - Build your first custom plugin with `PreLLMHook` and `PostLLMHook`
+- **[Writing a Go plugin](./writing-go-plugin)** - Build your first custom plugin with `PreRequestHook`, `PreLLMHook`, and `PostLLMHook`
 - **[Writing a WASM plugin](./writing-wasm-plugin)** - Build a portable WASM plugin
 - **[Plugin architecture](../architecture/core/plugins)** - Deep dive into the plugin lifecycle and hook execution model

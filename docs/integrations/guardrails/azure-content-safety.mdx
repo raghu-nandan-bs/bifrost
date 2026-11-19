@@ -17,12 +17,21 @@ Bifrost integrates with **Azure AI Content Safety** to provide multi-modal conte
 - **Protected Material**: Detect copyrighted content (output only)
 - **Custom Blocklists**: Define organization-specific blocked terms
 
+<Note>
+  **Streaming output:** When this profile is used in an `output` or `both` rule, Bifrost accumulates the stream until the model response is complete, then checks the full response. It does not check individual stream chunks. See [Streaming Output Guardrails](/enterprise/guardrails#streaming-output-guardrails) for details.
+</Note>
+
 ## Configuration Fields
 
 | Field                            | Type    | Required | Default  | Description                                                  |
 | -------------------------------- | ------- | -------- | -------- | ------------------------------------------------------------ |
 | `endpoint`                       | string  | Yes      | -        | Azure Content Safety endpoint URL                            |
-| `api_key`                        | string  | Yes      | -        | Azure subscription key                                       |
+| `auth_type`                      | enum    | No       | `api_key` | `api_key`, `default_credential`, or `entra_id`.              |
+| `api_key`                        | string  | Conditional | -      | Required when `auth_type` is `api_key`.                      |
+| `client_id`                      | string  | Conditional | -      | Required when `auth_type` is `entra_id`.                     |
+| `client_secret`                  | string  | Conditional | -      | Required when `auth_type` is `entra_id`.                     |
+| `tenant_id`                      | string  | Conditional | -      | Required when `auth_type` is `entra_id`.                     |
+| `scopes`                         | array   | No       | Azure default | OAuth scopes for token authentication.                    |
 | `analyze_enabled`                | boolean | No       | true     | Enable content analysis for Hate, Sexual, Violence, SelfHarm |
 | `analyze_severity_threshold`     | enum    | No       | "medium" | Severity level to trigger: `low`, `medium`, or `high`        |
 | `jailbreak_shield_enabled`       | boolean | No       | false    | Enable jailbreak detection (input only)                      |

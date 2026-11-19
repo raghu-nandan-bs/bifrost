@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/framework/storehooks"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -25,7 +26,11 @@ func newSqliteConfigStore(ctx context.Context, config *SQLiteConfig, logger sche
 		}
 		_ = f.Close()
 	}
-	dsn := fmt.Sprintf("%s?_journal_mode=WAL&_synchronous=NORMAL&_cache_size=10000&_busy_timeout=60000&_wal_autocheckpoint=1000&_foreign_keys=1", config.Path)
+	// _txlock=immediate begins every transaction holding the write lock. A deferred transaction
+	// that reads and then writes has to upgrade its lock, and SQLite refuses that upgrade at once
+	// ("database is locked") when another connection is writing, without waiting out the busy
+	// timeout; taken at BEGIN, the lock is waited for like any other.
+	dsn := fmt.Sprintf("%s?_journal_mode=WAL&_synchronous=NORMAL&_cache_size=10000&_busy_timeout=60000&_wal_autocheckpoint=1000&_foreign_keys=1&_txlock=immediate", config.Path)
 	logger.Debug("opening DB with dsn: %s", dsn)
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
 		Logger: newGormLogger(logger),
@@ -35,6 +40,11 @@ func newSqliteConfigStore(ctx context.Context, config *SQLiteConfig, logger sche
 		return nil, err
 	}
 	logger.Debug("db opened for configstore")
+	// Install the global vault store/remove callbacks so plaintext SecretVar
+	// fields are rewritten to vault refs before persistence and owned vault
+	// secrets are cleaned up on delete.
+	RegisterVaultCallbacks(db)
+	storehooks.PoolOpened(storehooks.RoleConfig, db)
 	s := &RDBConfigStore{logger: logger}
 	s.db.Store(db)
 	// SQLite has no server-side prepared-plan cache, and opening a second
@@ -51,7 +61,7 @@ func newSqliteConfigStore(ctx context.Context, config *SQLiteConfig, logger sche
 		return nil, fmt.Errorf("failed to remove duplicate keys: %w", err)
 	}
 	// Run migrations
-	if err := triggerMigrations(ctx, db); err != nil {
+	if err := triggerMigrations(ctx, db, logger); err != nil {
 		return nil, err
 	}
 	// Encrypt any plaintext rows if encryption is enabled

@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	schemas "github.com/maximhq/bifrost/core/schemas"
@@ -46,9 +48,9 @@ func checkForErrorStatus(prediction *ReplicatePredictionResponse) *schemas.Bifro
 // parsePreferHeader parses the Prefer header to extract wait duration
 // Examples: "wait", "wait=30", "wait=60"
 // Returns the header value to use and whether sync mode should be enabled
-func parsePreferHeader(extraHeaders map[string]string) bool {
+func parsePreferHeader(extraHeaders map[string]schemas.SecretVar) bool {
 	if preferValue, exists := extraHeaders["Prefer"]; exists {
-		if strings.HasPrefix(preferValue, "wait") {
+		if strings.HasPrefix(preferValue.GetValue(), "wait") {
 			return true
 		}
 		return false
@@ -58,7 +60,7 @@ func parsePreferHeader(extraHeaders map[string]string) bool {
 
 // Streaming requests should always be async and not wait for completion,
 // so the Prefer header (which enables sync mode) must be excluded.
-func stripPreferHeader(extraHeaders map[string]string) map[string]string {
+func stripPreferHeader(extraHeaders map[string]schemas.SecretVar) map[string]schemas.SecretVar {
 	if extraHeaders == nil {
 		return nil
 	}
@@ -70,7 +72,7 @@ func stripPreferHeader(extraHeaders map[string]string) map[string]string {
 	}
 
 	// Create new map without Prefer header
-	filtered := make(map[string]string, len(extraHeaders)-1)
+	filtered := make(map[string]schemas.SecretVar, len(extraHeaders)-1)
 	for key, value := range extraHeaders {
 		if key != "Prefer" {
 			filtered[key] = value
@@ -106,25 +108,27 @@ func listenToReplicateStreamURL(
 	}
 
 	// Make request
-	err := client.Do(req, resp)
+	startTime := time.Now()
+	err := providerUtils.DoStreamingRequest(ctx, client, req, resp)
+	latency := time.Since(startTime)
 	fasthttp.ReleaseRequest(req)
 
 	if err != nil {
 		providerUtils.ReleaseStreamingResponse(ctx, resp)
 		if errors.Is(err, context.Canceled) {
-			return nil, nil, &schemas.BifrostError{
+			return nil, nil, providerUtils.SetErrorLatency(&schemas.BifrostError{
 				IsBifrostError: false,
 				Error: &schemas.ErrorField{
 					Type:    schemas.Ptr(schemas.RequestCancelled),
 					Message: schemas.ErrRequestCancelled,
 					Error:   err,
 				},
-			}
+			}, latency)
 		}
 		if errors.Is(err, fasthttp.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
-			return nil, nil, providerUtils.NewBifrostTimeoutError(schemas.ErrProviderRequestTimedOut, err)
+			return nil, nil, providerUtils.SetErrorLatency(providerUtils.NewBifrostTimeoutError(schemas.ErrProviderRequestTimedOut, err), latency)
 		}
-		return nil, nil, providerUtils.NewBifrostOperationError(schemas.ErrProviderDoRequest, err)
+		return nil, nil, providerUtils.SetErrorLatency(providerUtils.NewBifrostOperationError(schemas.ErrProviderDoRequest, err), latency)
 	}
 
 	// Extract provider response headers before status check so error responses also forward them
@@ -135,7 +139,7 @@ func listenToReplicateStreamURL(
 	// Check for HTTP errors
 	if resp.StatusCode() != fasthttp.StatusOK {
 		defer providerUtils.ReleaseStreamingResponse(ctx, resp)
-		return nil, nil, parseReplicateError(resp.Body(), resp.StatusCode())
+		return nil, nil, providerUtils.SetErrorLatency(parseReplicateError(resp), latency)
 	}
 
 	return resp.BodyStream(), resp, nil
@@ -196,6 +200,19 @@ func buildPredictionURL(ctx *schemas.BifrostContext, baseURL, model string, cust
 	return baseURL + path
 }
 
+// Token-usage log patterns compiled once at package init (hot path — avoid per-call MustCompile).
+var (
+	inputTokenCountPattern      = regexp.MustCompile(`Input token count:\s*(\d+)`)
+	inputTextTokenCountPattern  = regexp.MustCompile(`Input text token count:\s*(\d+)`)
+	inputImageTokenCountPattern = regexp.MustCompile(`Input image token count:\s*(\d+)`)
+	outputTokenCountPattern     = regexp.MustCompile(`Output token count:\s*(\d+)`)
+	totalTokenCountPattern      = regexp.MustCompile(`Total token count:\s*(\d+)`)
+	simpleTokensPattern         = regexp.MustCompile(`Tokens:\s*(\d+)`)
+
+	// Preferred first: "Input token count" then "Input text token count"
+	inputTokenPatterns = []*regexp.Regexp{inputTokenCountPattern, inputTextTokenCountPattern}
+)
+
 // parseTokenUsageFromLogs extracts token counts from Replicate's logs field
 // Handles multiple log formats with varying levels of detail
 func parseTokenUsageFromLogs(logs *string, requestType schemas.RequestType) (inputTokens, outputTokens, totalTokens int, found bool) {
@@ -209,12 +226,8 @@ func parseTokenUsageFromLogs(logs *string, requestType schemas.RequestType) (inp
 	// Pattern 1: Detailed format with input/output breakdown
 	// "Input token count: 20"
 	// "Input text token count: 15"
-	inputPatterns := []string{
-		`Input token count:\s*(\d+)`,
-		`Input text token count:\s*(\d+)`,
-	}
-	for _, pattern := range inputPatterns {
-		if matches := regexp.MustCompile(pattern).FindStringSubmatch(logText); len(matches) > 1 {
+	for _, pattern := range inputTokenPatterns {
+		if matches := pattern.FindStringSubmatch(logText); len(matches) > 1 {
 			if val, err := strconv.Atoi(matches[1]); err == nil {
 				inputTokens = val
 				foundAny = true
@@ -224,7 +237,7 @@ func parseTokenUsageFromLogs(logs *string, requestType schemas.RequestType) (inp
 	}
 
 	// "Input image token count: 0" (for image generation)
-	if matches := regexp.MustCompile(`Input image token count:\s*(\d+)`).FindStringSubmatch(logText); len(matches) > 1 {
+	if matches := inputImageTokenCountPattern.FindStringSubmatch(logText); len(matches) > 1 {
 		if val, err := strconv.Atoi(matches[1]); err == nil {
 			inputTokens += val // Add to text input tokens
 			foundAny = true
@@ -232,7 +245,7 @@ func parseTokenUsageFromLogs(logs *string, requestType schemas.RequestType) (inp
 	}
 
 	// "Output token count: 28"
-	if matches := regexp.MustCompile(`Output token count:\s*(\d+)`).FindStringSubmatch(logText); len(matches) > 1 {
+	if matches := outputTokenCountPattern.FindStringSubmatch(logText); len(matches) > 1 {
 		if val, err := strconv.Atoi(matches[1]); err == nil {
 			outputTokens = val
 			foundAny = true
@@ -240,7 +253,7 @@ func parseTokenUsageFromLogs(logs *string, requestType schemas.RequestType) (inp
 	}
 
 	// "Total token count: 48"
-	if matches := regexp.MustCompile(`Total token count:\s*(\d+)`).FindStringSubmatch(logText); len(matches) > 1 {
+	if matches := totalTokenCountPattern.FindStringSubmatch(logText); len(matches) > 1 {
 		if val, err := strconv.Atoi(matches[1]); err == nil {
 			totalTokens = val
 			foundAny = true
@@ -250,7 +263,7 @@ func parseTokenUsageFromLogs(logs *string, requestType schemas.RequestType) (inp
 	// Pattern 2: Simple "Tokens: X" format (ambiguous - need heuristic)
 	// Only use if detailed format not found
 	if !foundAny {
-		if matches := regexp.MustCompile(`Tokens:\s*(\d+)`).FindStringSubmatch(logText); len(matches) > 1 {
+		if matches := simpleTokensPattern.FindStringSubmatch(logText); len(matches) > 1 {
 			if val, err := strconv.Atoi(matches[1]); err == nil {
 				// Heuristic based on response type
 				switch requestType {
@@ -277,4 +290,63 @@ func parseTokenUsageFromLogs(logs *string, requestType schemas.RequestType) (inp
 	}
 
 	return inputTokens, outputTokens, totalTokens, foundAny
+}
+
+// invalidPaginationCursorError answers a file-list cursor Bifrost cannot use with a 400. The
+// underlying reason names the configured endpoint and the link's shape, so it goes to the log
+// only: it is never attached to the error, which would serialize it to the client as error.error.
+func invalidPaginationCursorError(logger schemas.Logger, err error) *schemas.BifrostError {
+	if logger != nil && err != nil {
+		logger.Warn("replicate file list: refusing pagination cursor: %v", err)
+	}
+	return providerUtils.NewBifrostBadRequestError("invalid pagination cursor")
+}
+
+// replicateNextPageCursor extracts Replicate's cursor value from the "next" link of a list
+// response. Only that value is stored in Bifrost's pagination cursor, so a later page
+// request is always rebuilt on the configured base URL instead of following the link.
+// An empty link means the list is exhausted. A link Bifrost cannot take a cursor from is an
+// error, never the end of the list: ending pagination there would hand the caller a silently
+// truncated list.
+func replicateNextPageCursor(next string) (string, error) {
+	if next == "" {
+		return "", nil
+	}
+	link, err := url.Parse(next)
+	if err != nil {
+		return "", fmt.Errorf("next link is not a URL: %w", err)
+	}
+	cursor := link.Query().Get("cursor")
+	if cursor == "" {
+		return "", errors.New("next link carries no cursor value")
+	}
+	return cursor, nil
+}
+
+// replicateFileListPageCursor resolves a stored file-list cursor to the value sent as
+// Replicate's cursor query parameter. Cursors issued before Bifrost stored the bare value
+// carried the full next link; such a link is still accepted when it points at the
+// configured base URL and the file-list path, and refused otherwise so the request can
+// never leave that endpoint.
+func replicateFileListPageCursor(baseURL, stored string) (string, error) {
+	if !strings.Contains(stored, "://") {
+		return stored, nil
+	}
+	link, err := url.Parse(stored)
+	if err != nil {
+		return "", fmt.Errorf("cursor link is not a valid URL: %w", err)
+	}
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return "", fmt.Errorf("configured base URL is not a valid URL: %w", err)
+	}
+	wantPath := strings.TrimRight(base.Path, "/") + "/v1/files"
+	if link.User != nil || !strings.EqualFold(link.Scheme, base.Scheme) || !strings.EqualFold(link.Host, base.Host) || strings.TrimRight(link.Path, "/") != wantPath {
+		return "", errors.New("cursor link does not point at the configured file endpoint")
+	}
+	cursor := link.Query().Get("cursor")
+	if cursor == "" {
+		return "", errors.New("cursor link carries no cursor value")
+	}
+	return cursor, nil
 }

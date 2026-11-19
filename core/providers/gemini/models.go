@@ -17,7 +17,7 @@ func toGeminiModelResourceName(modelID string) string {
 	return "models/" + modelID
 }
 
-func (response *GeminiListModelsResponse) ToBifrostListModelsResponse(providerKey schemas.ModelProvider, allowedModels schemas.WhiteList, blacklistedModels schemas.BlackList, aliases map[string]string, unfiltered bool) *schemas.BifrostListModelsResponse {
+func (response *GeminiListModelsResponse) ToBifrostListModelsResponse(providerKey schemas.ModelProvider, allowedModels schemas.WhiteList, blacklistedModels schemas.BlackList, aliases schemas.KeyAliases, unfiltered bool) *schemas.BifrostListModelsResponse {
 	if response == nil {
 		return nil
 	}
@@ -68,6 +68,25 @@ func (response *GeminiListModelsResponse) ToBifrostListModelsResponse(providerKe
 		pipeline.BackfillModels(included)...)
 
 	return bifrostResponse
+}
+
+// ToBifrostModelRetrieveResponse converts a Gemini model resource to a Bifrost model retrieve response
+func (model *GeminiModel) ToBifrostModelRetrieveResponse(providerKey schemas.ModelProvider) *schemas.BifrostModelRetrieveResponse {
+	if model == nil {
+		return nil
+	}
+
+	return &schemas.BifrostModelRetrieveResponse{
+		Model: schemas.Model{
+			ID:               string(providerKey) + "/" + strings.TrimPrefix(model.Name, "models/"),
+			Name:             schemas.Ptr(model.DisplayName),
+			Description:      schemas.Ptr(model.Description),
+			ContextLength:    schemas.Ptr(model.InputTokenLimit),
+			MaxInputTokens:   schemas.Ptr(model.InputTokenLimit),
+			MaxOutputTokens:  schemas.Ptr(model.OutputTokenLimit),
+			SupportedMethods: model.SupportedGenerationMethods,
+		},
+	}
 }
 
 func ToGeminiListModelsResponse(resp *schemas.BifrostListModelsResponse) *GeminiListModelsResponse {

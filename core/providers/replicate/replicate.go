@@ -43,7 +43,7 @@ func NewReplicateProvider(config *schemas.ProviderConfig, logger schemas.Logger)
 		ReadTimeout:         requestTimeout,
 		WriteTimeout:        requestTimeout,
 		MaxConnsPerHost:     config.NetworkConfig.MaxConnsPerHost,
-		MaxIdleConnDuration: 30 * time.Second,
+		MaxIdleConnDuration: time.Second * time.Duration(config.NetworkConfig.KeepAliveTimeoutInSeconds),
 		MaxConnWaitTimeout:  requestTimeout,
 		MaxConnDuration:     time.Second * time.Duration(schemas.DefaultMaxConnDurationInSeconds),
 		ConnPoolStrategy:    fasthttp.FIFO,
@@ -51,7 +51,7 @@ func NewReplicateProvider(config *schemas.ProviderConfig, logger schemas.Logger)
 
 	// Configure proxy and retry policy
 	client = providerUtils.ConfigureProxy(client, config.ProxyConfig, logger)
-	client = providerUtils.ConfigureDialer(client)
+	client = providerUtils.ConfigureDialer(client, config.NetworkConfig.AllowPrivateNetwork)
 	client = providerUtils.ConfigureTLS(client, config.NetworkConfig, logger)
 	streamingClient := providerUtils.BuildStreamingClient(client)
 	config.NetworkConfig.BaseURL = strings.TrimRight(config.NetworkConfig.BaseURL, "/")
@@ -90,9 +90,20 @@ const (
 	pollingInterval     = 2 * time.Second
 )
 
-// useDeploymentsEndpoint returns whether the key uses the deployments endpoint.
-// Nil ReplicateKeyConfig is treated as false (default models/predictions behavior).
-func useDeploymentsEndpoint(key schemas.Key) bool {
+// useDeploymentsEndpoint returns whether the request should target the
+// Replicate deployments endpoint vs the predictions endpoint.
+//
+// Priority: per-alias ReplicateAliasCfg.UseDeploymentsEndpoint (when set) >
+// key-level ReplicateKeyConfig.UseDeploymentsEndpoint. The override lets one
+// Replicate API token route some aliases through the deployments endpoint
+// (e.g. production-pinned models) while others use the predictions endpoint
+// (e.g. experimental versioned models).
+//
+// Nil ReplicateKeyConfig and missing alias both default to false (predictions).
+func useDeploymentsEndpoint(ctx *schemas.BifrostContext, key schemas.Key) bool {
+	if ra := schemas.GetResolvedAlias(ctx); ra != nil && ra.Config != nil && ra.Config.ReplicateAliasCfg != nil && ra.Config.ReplicateAliasCfg.UseDeploymentsEndpoint != nil {
+		return *ra.Config.ReplicateAliasCfg.UseDeploymentsEndpoint
+	}
 	return key.ReplicateKeyConfig != nil && key.ReplicateKeyConfig.UseDeploymentsEndpoint
 }
 
@@ -105,7 +116,7 @@ func createPrediction(
 	jsonBody []byte,
 	key schemas.Key,
 	url string,
-	extraHeaders map[string]string,
+	extraHeaders map[string]schemas.SecretVar,
 	stripPrefer bool,
 	logger schemas.Logger,
 	sendBackRawRequest bool,
@@ -151,18 +162,25 @@ func createPrediction(
 
 	// Handle error response
 	if resp.StatusCode() != fasthttp.StatusOK && resp.StatusCode() != fasthttp.StatusCreated {
-		logger.Debug(fmt.Sprintf("error from replicate provider: %s", string(resp.Body())))
-		return nil, nil, latency, providerResponseHeaders, parseReplicateError(resp.Body(), resp.StatusCode())
+		logger.Debug(fmt.Sprintf("error from replicate provider: status %d", resp.StatusCode()))
+		return nil, nil, latency, providerResponseHeaders, providerUtils.SetErrorLatency(parseReplicateError(resp), latency)
 	}
 
 	// Parse response
+	ft, fh := providerUtils.StartPhaseSpan(ctx, "response-finalize")
 	body, decodeErr := providerUtils.CheckAndDecodeBody(resp)
 	if decodeErr != nil {
+		if ft != nil {
+			ft.EndSpan(fh, schemas.SpanStatusError, decodeErr.Error())
+		}
 		return nil, nil, latency, providerResponseHeaders, providerUtils.NewBifrostOperationError(schemas.ErrProviderResponseDecode, decodeErr)
+	}
+	if ft != nil {
+		ft.EndSpan(fh, schemas.SpanStatusOk, "")
 	}
 
 	var prediction ReplicatePredictionResponse
-	_, rawResponse, bifrostErr := providerUtils.HandleProviderResponse(body, &prediction, jsonBody, providerUtils.ShouldSendBackRawRequest(ctx, sendBackRawRequest), providerUtils.ShouldSendBackRawResponse(ctx, sendBackRawResponse))
+	_, rawResponse, bifrostErr := providerUtils.HandleProviderResponseCtx(ctx, body, &prediction, jsonBody, providerUtils.ShouldSendBackRawRequest(ctx, sendBackRawRequest), providerUtils.ShouldSendBackRawResponse(ctx, sendBackRawResponse))
 	if bifrostErr != nil {
 		return nil, nil, latency, providerResponseHeaders, bifrostErr
 	}
@@ -195,7 +213,7 @@ func getPrediction(
 	}
 
 	// Make request
-	_, bifrostErr, wait := providerUtils.MakeRequestWithContext(ctx, client, req, resp)
+	latency, bifrostErr, wait := providerUtils.MakeRequestWithContext(ctx, client, req, resp)
 	defer wait()
 	if bifrostErr != nil {
 		return nil, nil, nil, bifrostErr
@@ -206,18 +224,25 @@ func getPrediction(
 
 	// Handle error response
 	if resp.StatusCode() != fasthttp.StatusOK {
-		logger.Debug(fmt.Sprintf("error from replicate provider: %s", string(resp.Body())))
-		return nil, nil, providerResponseHeaders, parseReplicateError(resp.Body(), resp.StatusCode())
+		logger.Debug(fmt.Sprintf("error from replicate provider: status %d", resp.StatusCode()))
+		return nil, nil, providerResponseHeaders, providerUtils.SetErrorLatency(parseReplicateError(resp), latency)
 	}
 
 	// Parse response
+	ft, fh := providerUtils.StartPhaseSpan(ctx, "response-finalize")
 	body, err := providerUtils.CheckAndDecodeBody(resp)
 	if err != nil {
+		if ft != nil {
+			ft.EndSpan(fh, schemas.SpanStatusError, err.Error())
+		}
 		return nil, nil, providerResponseHeaders, providerUtils.NewBifrostOperationError(schemas.ErrProviderResponseDecode, err)
+	}
+	if ft != nil {
+		ft.EndSpan(fh, schemas.SpanStatusOk, "")
 	}
 
 	prediction := &ReplicatePredictionResponse{}
-	_, rawResponse, bifrostErr := providerUtils.HandleProviderResponse(body, prediction, nil, false, sendBackRawResponse)
+	_, rawResponse, bifrostErr := providerUtils.HandleProviderResponseCtx(ctx, body, prediction, nil, false, sendBackRawResponse)
 	if bifrostErr != nil {
 		return nil, nil, providerResponseHeaders, bifrostErr
 	}
@@ -284,7 +309,7 @@ func (provider *ReplicateProvider) listDeploymentsByKey(ctx *schemas.BifrostCont
 	client := provider.client
 	extraHeaders := provider.networkConfig.ExtraHeaders
 
-	if !useDeploymentsEndpoint(key) {
+	if !useDeploymentsEndpoint(ctx, key) {
 		return ToBifrostListModelsResponse(
 			&ReplicateDeploymentListResponse{},
 			providerName,
@@ -322,7 +347,7 @@ func (provider *ReplicateProvider) listDeploymentsByKey(ctx *schemas.BifrostCont
 		providerUtils.SetExtraHeaders(ctx, req, extraHeaders, nil)
 
 		// Make request
-		_, bifrostErr, wait := providerUtils.MakeRequestWithContext(ctx, client, req, resp)
+		latency, bifrostErr, wait := providerUtils.MakeRequestWithContext(ctx, client, req, resp)
 
 		// Release resources
 		wait()
@@ -335,7 +360,7 @@ func (provider *ReplicateProvider) listDeploymentsByKey(ctx *schemas.BifrostCont
 
 		// Handle error response
 		if resp.StatusCode() != fasthttp.StatusOK {
-			errorResponse := parseReplicateError(resp.Body(), resp.StatusCode())
+			errorResponse := providerUtils.SetErrorLatency(parseReplicateError(resp), latency)
 			fasthttp.ReleaseResponse(resp)
 			return nil, errorResponse
 		}
@@ -424,7 +449,7 @@ func (provider *ReplicateProvider) TextCompletion(ctx *schemas.BifrostContext, k
 	jsonData, bifrostErr := providerUtils.CheckContextAndGetRequestBody(
 		ctx,
 		request,
-		func() (providerUtils.RequestBodyWithExtraParams, error) { return ToReplicateTextRequest(request) })
+		func() (*ReplicatePredictionRequest, error) { return ToReplicateTextRequest(request) })
 	if bifrostErr != nil {
 		return nil, bifrostErr
 	}
@@ -439,7 +464,7 @@ func (provider *ReplicateProvider) TextCompletion(ctx *schemas.BifrostContext, k
 		request.Model,
 		provider.customProviderConfig,
 		schemas.TextCompletionRequest,
-		useDeploymentsEndpoint(key),
+		useDeploymentsEndpoint(ctx, key),
 	)
 
 	// create prediction
@@ -456,7 +481,7 @@ func (provider *ReplicateProvider) TextCompletion(ctx *schemas.BifrostContext, k
 		provider.sendBackRawResponse,
 	)
 	if err != nil {
-		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	// if not sync, poll until done
@@ -471,13 +496,13 @@ func (provider *ReplicateProvider) TextCompletion(ctx *schemas.BifrostContext, k
 			providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
 		)
 		if err != nil {
-			return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+			return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 		}
 	}
 
 	// Check for terminal error status (failed/canceled) after sync mode or polling
 	if err := checkForErrorStatus(prediction); err != nil {
-		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	if providerResponseHeaders != nil {
@@ -512,7 +537,7 @@ func (provider *ReplicateProvider) TextCompletionStream(ctx *schemas.BifrostCont
 	jsonData, bifrostErr := providerUtils.CheckContextAndGetRequestBody(
 		ctx,
 		request,
-		func() (providerUtils.RequestBodyWithExtraParams, error) {
+		func() (*ReplicatePredictionRequest, error) {
 			replicateReq, err := ToReplicateTextRequest(request)
 			if err != nil {
 				return nil, err
@@ -531,12 +556,12 @@ func (provider *ReplicateProvider) TextCompletionStream(ctx *schemas.BifrostCont
 		request.Model,
 		provider.customProviderConfig,
 		schemas.TextCompletionStreamRequest,
-		useDeploymentsEndpoint(key),
+		useDeploymentsEndpoint(ctx, key),
 	)
 
 	startTime := time.Now()
 	// Create prediction
-	prediction, _, _, _, err := createPrediction(
+	prediction, _, latency, _, err := createPrediction(
 		ctx,
 		provider.client,
 		jsonData,
@@ -549,7 +574,7 @@ func (provider *ReplicateProvider) TextCompletionStream(ctx *schemas.BifrostCont
 		provider.sendBackRawResponse,
 	)
 	if err != nil {
-		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	// Verify stream URL is available
@@ -557,7 +582,7 @@ func (provider *ReplicateProvider) TextCompletionStream(ctx *schemas.BifrostCont
 		bifrostErr := providerUtils.NewBifrostOperationError(
 			"stream URL not available in prediction response",
 			fmt.Errorf("prediction response missing stream URL"))
-		return nil, providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	streamURL := *prediction.URLs.Stream
@@ -565,23 +590,23 @@ func (provider *ReplicateProvider) TextCompletionStream(ctx *schemas.BifrostCont
 	// Connect to stream URL
 	_, resp, bifrostErr := listenToReplicateStreamURL(ctx, provider.streamingClient, streamURL, key)
 	if bifrostErr != nil {
-		return nil, providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	// Store provider response headers in context for transport layer
 	ctx.SetValue(schemas.BifrostContextKeyProviderResponseHeaders, providerUtils.ExtractProviderResponseHeaders(resp))
 
+	providerUtils.SetStreamIdleTimeoutIfEmpty(ctx, provider.networkConfig.StreamIdleTimeoutInSeconds)
+
 	// Large payload streaming passthrough — pipe raw upstream SSE to client
 	if providerUtils.SetupStreamingPassthrough(ctx, resp) {
 		responseChan := make(chan *schemas.BifrostStreamChunk)
-		close(responseChan)
+		providerUtils.CloseStream(ctx, responseChan)
 		return responseChan, nil
 	}
 
 	// Create response channel
 	responseChan := make(chan *schemas.BifrostStreamChunk, schemas.DefaultStreamBufferSize)
-
-	providerUtils.SetStreamIdleTimeoutIfEmpty(ctx, provider.networkConfig.StreamIdleTimeoutInSeconds)
 
 	// Start streaming in a goroutine
 	go func() {
@@ -592,8 +617,9 @@ func (provider *ReplicateProvider) TextCompletionStream(ctx *schemas.BifrostCont
 			} else if ctx.Err() == context.DeadlineExceeded {
 				providerUtils.HandleStreamTimeout(ctx, postHookRunner, responseChan, provider.logger, postHookSpanFinalizer, jsonData)
 			}
-			close(responseChan)
+			providerUtils.CloseStream(ctx, responseChan)
 		}()
+		defer providerUtils.RecoverStreamPanic(ctx, postHookRunner, responseChan, provider.logger, postHookSpanFinalizer)
 		defer providerUtils.ReleaseStreamingResponse(ctx, resp)
 
 		// Decompress gzip-encoded streams transparently (no-op for non-gzip)
@@ -634,7 +660,7 @@ func (provider *ReplicateProvider) TextCompletionStream(ctx *schemas.BifrostCont
 				if readErr != io.EOF {
 					ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
 					provider.logger.Warn("Error reading stream: %v", readErr)
-					enrichedErr := providerUtils.EnrichError(ctx, providerUtils.NewBifrostOperationError(schemas.ErrProviderDoRequest, readErr), jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+					enrichedErr := providerUtils.EnrichError(ctx, providerUtils.NewBifrostOperationError(schemas.ErrProviderDoRequest, readErr), jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 					providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, enrichedErr, responseChan, provider.logger, postHookSpanFinalizer)
 				}
 				break
@@ -653,9 +679,10 @@ func (provider *ReplicateProvider) TextCompletionStream(ctx *schemas.BifrostCont
 					// Create a streaming chunk with text completion response
 					text := eventData
 					response := &schemas.BifrostTextCompletionResponse{
-						ID:     messageID,
-						Model:  request.Model,
-						Object: "text_completion",
+						ID:      messageID,
+						Model:   request.Model,
+						Created: int(ParseReplicateTimestamp(prediction.CreatedAt)),
+						Object:  "text_completion",
 						Choices: []schemas.BifrostResponseChoice{
 							{
 								Index: 0,
@@ -675,6 +702,7 @@ func (provider *ReplicateProvider) TextCompletionStream(ctx *schemas.BifrostCont
 						rawEvent := ReplicateSSEEvent{Event: eventType, Data: eventData}
 						if eventJSON, err := providerUtils.MarshalSorted(rawEvent); err == nil {
 							response.ExtraFields.RawResponse = string(eventJSON)
+							response.ExtraFields.RawResponseFormat = schemas.RawResponseFormatReplicateStreamEvent
 						}
 					}
 
@@ -702,7 +730,7 @@ func (provider *ReplicateProvider) TextCompletionStream(ctx *schemas.BifrostCont
 						"prediction was canceled",
 						fmt.Errorf("stream ended: prediction canceled"))
 					ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
-					enrichedErr := providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+					enrichedErr := providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 					providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, enrichedErr, responseChan, provider.logger, postHookSpanFinalizer)
 					// Explicitly close the body stream to terminate connection to Replicate
 					resp.CloseBodyStream()
@@ -717,7 +745,7 @@ func (provider *ReplicateProvider) TextCompletionStream(ctx *schemas.BifrostCont
 						errorMsg,
 						fmt.Errorf("stream ended with error"))
 					ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
-					enrichedErr := providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+					enrichedErr := providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 					providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, enrichedErr, responseChan, provider.logger, postHookSpanFinalizer)
 					// Explicitly close the body stream to terminate connection to Replicate
 					resp.CloseBodyStream()
@@ -732,7 +760,8 @@ func (provider *ReplicateProvider) TextCompletionStream(ctx *schemas.BifrostCont
 					finishReason,
 					chunkIndex,
 					schemas.TextCompletionStreamRequest,
-					request.Model)
+					request.Model,
+					int(ParseReplicateTimestamp(prediction.CreatedAt)))
 
 				// Set raw request if enabled
 				if providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest) {
@@ -749,6 +778,14 @@ func (provider *ReplicateProvider) TextCompletionStream(ctx *schemas.BifrostCont
 				return
 			}
 		}
+
+		// Replicate terminates a prediction stream with a `done` event, which every
+		// branch of the loop returns on. Falling out means the body ended first — a
+		// plain io.EOF, indistinguishable from a healthy close. The read-error path
+		// above sets the indicator, so an already-reported failure stays quiet here.
+		if ended, _ := ctx.Value(schemas.BifrostContextKeyStreamEndIndicator).(bool); !ended {
+			providerUtils.SendStreamTruncatedError(ctx, postHookRunner, responseChan, provider.logger, postHookSpanFinalizer, jsonData)
+		}
 	}()
 
 	return responseChan, nil
@@ -764,7 +801,7 @@ func (provider *ReplicateProvider) ChatCompletion(ctx *schemas.BifrostContext, k
 	jsonData, bifrostErr := providerUtils.CheckContextAndGetRequestBody(
 		ctx,
 		request,
-		func() (providerUtils.RequestBodyWithExtraParams, error) { return ToReplicateChatRequest(request) })
+		func() (*ReplicatePredictionRequest, error) { return ToReplicateChatRequest(request) })
 	if bifrostErr != nil {
 		return nil, bifrostErr
 	}
@@ -779,7 +816,7 @@ func (provider *ReplicateProvider) ChatCompletion(ctx *schemas.BifrostContext, k
 		request.Model,
 		provider.customProviderConfig,
 		schemas.ChatCompletionRequest,
-		useDeploymentsEndpoint(key),
+		useDeploymentsEndpoint(ctx, key),
 	)
 
 	// create prediction
@@ -796,7 +833,7 @@ func (provider *ReplicateProvider) ChatCompletion(ctx *schemas.BifrostContext, k
 		provider.sendBackRawResponse,
 	)
 	if err != nil {
-		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	// if not sync, poll until done
@@ -811,13 +848,13 @@ func (provider *ReplicateProvider) ChatCompletion(ctx *schemas.BifrostContext, k
 			providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
 		)
 		if err != nil {
-			return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+			return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 		}
 	}
 
 	// Check for terminal error status (failed/canceled) after sync mode or polling
 	if err := checkForErrorStatus(prediction); err != nil {
-		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	if providerResponseHeaders != nil {
@@ -852,7 +889,7 @@ func (provider *ReplicateProvider) ChatCompletionStream(ctx *schemas.BifrostCont
 	jsonData, bifrostErr := providerUtils.CheckContextAndGetRequestBody(
 		ctx,
 		request,
-		func() (providerUtils.RequestBodyWithExtraParams, error) {
+		func() (*ReplicatePredictionRequest, error) {
 			replicateReq, err := ToReplicateChatRequest(request)
 			if err != nil {
 				return nil, err
@@ -871,12 +908,12 @@ func (provider *ReplicateProvider) ChatCompletionStream(ctx *schemas.BifrostCont
 		request.Model,
 		provider.customProviderConfig,
 		schemas.ChatCompletionStreamRequest,
-		useDeploymentsEndpoint(key),
+		useDeploymentsEndpoint(ctx, key),
 	)
 
 	startTime := time.Now()
 	// Create prediction
-	prediction, _, _, _, err := createPrediction(
+	prediction, _, latency, _, err := createPrediction(
 		ctx,
 		provider.client,
 		jsonData,
@@ -889,7 +926,7 @@ func (provider *ReplicateProvider) ChatCompletionStream(ctx *schemas.BifrostCont
 		provider.sendBackRawResponse,
 	)
 	if err != nil {
-		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	// Verify stream URL is available
@@ -897,7 +934,7 @@ func (provider *ReplicateProvider) ChatCompletionStream(ctx *schemas.BifrostCont
 		bifrostErr := providerUtils.NewBifrostOperationError(
 			"stream URL not available in prediction response",
 			fmt.Errorf("prediction response missing stream URL"))
-		return nil, providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	streamURL := *prediction.URLs.Stream
@@ -905,23 +942,23 @@ func (provider *ReplicateProvider) ChatCompletionStream(ctx *schemas.BifrostCont
 	// Connect to stream URL
 	_, resp, bifrostErr := listenToReplicateStreamURL(ctx, provider.streamingClient, streamURL, key)
 	if bifrostErr != nil {
-		return nil, providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	// Store provider response headers in context for transport layer
 	ctx.SetValue(schemas.BifrostContextKeyProviderResponseHeaders, providerUtils.ExtractProviderResponseHeaders(resp))
 
+	providerUtils.SetStreamIdleTimeoutIfEmpty(ctx, provider.networkConfig.StreamIdleTimeoutInSeconds)
+
 	// Large payload streaming passthrough — pipe raw upstream SSE to client
 	if providerUtils.SetupStreamingPassthrough(ctx, resp) {
 		responseChan := make(chan *schemas.BifrostStreamChunk)
-		close(responseChan)
+		providerUtils.CloseStream(ctx, responseChan)
 		return responseChan, nil
 	}
 
 	// Create response channel
 	responseChan := make(chan *schemas.BifrostStreamChunk, schemas.DefaultStreamBufferSize)
-
-	providerUtils.SetStreamIdleTimeoutIfEmpty(ctx, provider.networkConfig.StreamIdleTimeoutInSeconds)
 
 	// Start streaming in a goroutine
 	go func() {
@@ -932,8 +969,9 @@ func (provider *ReplicateProvider) ChatCompletionStream(ctx *schemas.BifrostCont
 			} else if ctx.Err() == context.DeadlineExceeded {
 				providerUtils.HandleStreamTimeout(ctx, postHookRunner, responseChan, provider.logger, postHookSpanFinalizer, jsonData)
 			}
-			close(responseChan)
+			providerUtils.CloseStream(ctx, responseChan)
 		}()
+		defer providerUtils.RecoverStreamPanic(ctx, postHookRunner, responseChan, provider.logger, postHookSpanFinalizer)
 		defer providerUtils.ReleaseStreamingResponse(ctx, resp)
 
 		// Decompress gzip-encoded streams transparently (no-op for non-gzip)
@@ -974,7 +1012,7 @@ func (provider *ReplicateProvider) ChatCompletionStream(ctx *schemas.BifrostCont
 				if readErr != io.EOF {
 					ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
 					provider.logger.Warn("Error reading stream: %v", readErr)
-					enrichedErr := providerUtils.EnrichError(ctx, providerUtils.NewBifrostOperationError(schemas.ErrProviderDoRequest, readErr), jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+					enrichedErr := providerUtils.EnrichError(ctx, providerUtils.NewBifrostOperationError(schemas.ErrProviderDoRequest, readErr), jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 					providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, enrichedErr, responseChan, provider.logger, postHookSpanFinalizer)
 				}
 				break
@@ -1022,6 +1060,7 @@ func (provider *ReplicateProvider) ChatCompletionStream(ctx *schemas.BifrostCont
 						rawEvent := ReplicateSSEEvent{Event: eventType, Data: eventData}
 						if eventJSON, err := providerUtils.MarshalSorted(rawEvent); err == nil {
 							response.ExtraFields.RawResponse = string(eventJSON)
+							response.ExtraFields.RawResponseFormat = schemas.RawResponseFormatReplicateStreamEvent
 						}
 					}
 
@@ -1049,7 +1088,7 @@ func (provider *ReplicateProvider) ChatCompletionStream(ctx *schemas.BifrostCont
 						"prediction was canceled",
 						fmt.Errorf("stream ended: prediction canceled"))
 					ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
-					enrichedErr := providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+					enrichedErr := providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 					providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, enrichedErr, responseChan, provider.logger, postHookSpanFinalizer)
 					// Explicitly close the body stream to terminate connection to Replicate
 					resp.CloseBodyStream()
@@ -1064,7 +1103,7 @@ func (provider *ReplicateProvider) ChatCompletionStream(ctx *schemas.BifrostCont
 						errorMsg,
 						fmt.Errorf("stream ended with error"))
 					ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
-					enrichedErr := providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+					enrichedErr := providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 					providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, enrichedErr, responseChan, provider.logger, postHookSpanFinalizer)
 					// Explicitly close the body stream to terminate connection to Replicate
 					resp.CloseBodyStream()
@@ -1106,6 +1145,13 @@ func (provider *ReplicateProvider) ChatCompletionStream(ctx *schemas.BifrostCont
 				return
 			}
 		}
+
+		// See TextCompletionStream: no `done` event means the body ended before the
+		// prediction finished, which a plain io.EOF cannot distinguish from a
+		// healthy close.
+		if ended, _ := ctx.Value(schemas.BifrostContextKeyStreamEndIndicator).(bool); !ended {
+			providerUtils.SendStreamTruncatedError(ctx, postHookRunner, responseChan, provider.logger, postHookSpanFinalizer, jsonData)
+		}
 	}()
 
 	return responseChan, nil
@@ -1121,7 +1167,7 @@ func (provider *ReplicateProvider) Responses(ctx *schemas.BifrostContext, key sc
 	jsonData, bifrostErr := providerUtils.CheckContextAndGetRequestBody(
 		ctx,
 		request,
-		func() (providerUtils.RequestBodyWithExtraParams, error) { return ToReplicateResponsesRequest(request) })
+		func() (*ReplicatePredictionRequest, error) { return ToReplicateResponsesRequest(request) })
 	if bifrostErr != nil {
 		return nil, bifrostErr
 	}
@@ -1136,7 +1182,7 @@ func (provider *ReplicateProvider) Responses(ctx *schemas.BifrostContext, key sc
 		request.Model,
 		provider.customProviderConfig,
 		schemas.ResponsesRequest,
-		useDeploymentsEndpoint(key),
+		useDeploymentsEndpoint(ctx, key),
 	)
 
 	// create prediction
@@ -1153,7 +1199,7 @@ func (provider *ReplicateProvider) Responses(ctx *schemas.BifrostContext, key sc
 		provider.sendBackRawResponse,
 	)
 	if err != nil {
-		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	// if not sync, poll until done
@@ -1168,13 +1214,13 @@ func (provider *ReplicateProvider) Responses(ctx *schemas.BifrostContext, key sc
 			providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
 		)
 		if err != nil {
-			return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+			return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 		}
 	}
 
 	// Check for terminal error status (failed/canceled) after sync mode or polling
 	if err := checkForErrorStatus(prediction); err != nil {
-		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	if providerResponseHeaders != nil {
@@ -1204,7 +1250,7 @@ func (provider *ReplicateProvider) ResponsesStream(ctx *schemas.BifrostContext, 
 	jsonData, bifrostErr := providerUtils.CheckContextAndGetRequestBody(
 		ctx,
 		request,
-		func() (providerUtils.RequestBodyWithExtraParams, error) { return ToReplicateResponsesRequest(request) })
+		func() (*ReplicatePredictionRequest, error) { return ToReplicateResponsesRequest(request) })
 	if bifrostErr != nil {
 		return nil, bifrostErr
 	}
@@ -1223,12 +1269,12 @@ func (provider *ReplicateProvider) ResponsesStream(ctx *schemas.BifrostContext, 
 		request.Model,
 		provider.customProviderConfig,
 		schemas.ResponsesStreamRequest,
-		useDeploymentsEndpoint(key),
+		useDeploymentsEndpoint(ctx, key),
 	)
 
 	startTime := time.Now()
 	// Create prediction
-	prediction, _, _, _, err := createPrediction(
+	prediction, _, latency, _, err := createPrediction(
 		ctx,
 		provider.client,
 		jsonData,
@@ -1241,7 +1287,7 @@ func (provider *ReplicateProvider) ResponsesStream(ctx *schemas.BifrostContext, 
 		provider.sendBackRawResponse,
 	)
 	if err != nil {
-		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	// Verify stream URL is available
@@ -1249,7 +1295,7 @@ func (provider *ReplicateProvider) ResponsesStream(ctx *schemas.BifrostContext, 
 		bifrostErr := providerUtils.NewBifrostOperationError(
 			"stream URL not available in prediction response",
 			fmt.Errorf("prediction response missing stream URL"))
-		return nil, providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	streamURL := *prediction.URLs.Stream
@@ -1273,7 +1319,9 @@ func (provider *ReplicateProvider) ResponsesStream(ctx *schemas.BifrostContext, 
 	providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, nil)
 
 	// Make the streaming request
-	streamErr := provider.streamingClient.Do(req, resp)
+	startTime = time.Now()
+	streamErr := providerUtils.DoStreamingRequest(ctx, provider.streamingClient, req, resp)
+	latency = time.Since(startTime)
 	if streamErr != nil {
 		defer providerUtils.ReleaseStreamingResponse(ctx, resp)
 		if errors.Is(streamErr, context.Canceled) {
@@ -1284,12 +1332,12 @@ func (provider *ReplicateProvider) ResponsesStream(ctx *schemas.BifrostContext, 
 					Message: schemas.ErrRequestCancelled,
 					Error:   streamErr,
 				},
-			}, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+			}, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 		}
 		if errors.Is(streamErr, fasthttp.ErrTimeout) || errors.Is(streamErr, context.DeadlineExceeded) {
-			return nil, providerUtils.EnrichError(ctx, providerUtils.NewBifrostTimeoutError(schemas.ErrProviderRequestTimedOut, streamErr), jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+			return nil, providerUtils.EnrichError(ctx, providerUtils.NewBifrostTimeoutError(schemas.ErrProviderRequestTimedOut, streamErr), jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 		}
-		return nil, providerUtils.EnrichError(ctx, providerUtils.NewBifrostOperationError(schemas.ErrProviderDoRequest, streamErr), jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, providerUtils.NewBifrostOperationError(schemas.ErrProviderDoRequest, streamErr), jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	// Extract provider response headers before status check so error responses also forward them
@@ -1298,21 +1346,20 @@ func (provider *ReplicateProvider) ResponsesStream(ctx *schemas.BifrostContext, 
 	// Check for HTTP errors
 	if resp.StatusCode() != fasthttp.StatusOK {
 		defer providerUtils.ReleaseStreamingResponse(ctx, resp)
-		body := resp.Body()
-		return nil, providerUtils.EnrichError(ctx, parseReplicateError(body, resp.StatusCode()), jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, parseReplicateError(resp), jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
+
+	providerUtils.SetStreamIdleTimeoutIfEmpty(ctx, provider.networkConfig.StreamIdleTimeoutInSeconds)
 
 	// Large payload streaming passthrough — pipe raw upstream SSE to client
 	if providerUtils.SetupStreamingPassthrough(ctx, resp) {
 		responseChan := make(chan *schemas.BifrostStreamChunk)
-		close(responseChan)
+		providerUtils.CloseStream(ctx, responseChan)
 		return responseChan, nil
 	}
 
 	// Create response channel
 	responseChan := make(chan *schemas.BifrostStreamChunk, schemas.DefaultStreamBufferSize)
-
-	providerUtils.SetStreamIdleTimeoutIfEmpty(ctx, provider.networkConfig.StreamIdleTimeoutInSeconds)
 
 	// Start streaming in a goroutine
 	go func() {
@@ -1326,8 +1373,9 @@ func (provider *ReplicateProvider) ResponsesStream(ctx *schemas.BifrostContext, 
 			} else if ctx.Err() == context.DeadlineExceeded {
 				providerUtils.HandleStreamTimeout(ctx, postHookRunner, responseChan, provider.logger, postHookSpanFinalizer, jsonData)
 			}
-			close(responseChan)
+			providerUtils.CloseStream(ctx, responseChan)
 		}()
+		defer providerUtils.RecoverStreamPanic(ctx, postHookRunner, responseChan, provider.logger, postHookSpanFinalizer)
 		defer providerUtils.ReleaseStreamingResponse(ctx, resp)
 
 		// Decompress gzip-encoded streams transparently (no-op for non-gzip)
@@ -1339,7 +1387,7 @@ func (provider *ReplicateProvider) ResponsesStream(ctx *schemas.BifrostContext, 
 				"provider returned an empty response",
 				fmt.Errorf("provider returned an empty response"))
 			ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
-			providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse), responseChan, provider.logger, postHookSpanFinalizer)
+			providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency), responseChan, provider.logger, postHookSpanFinalizer)
 			return
 		}
 
@@ -1365,8 +1413,6 @@ func (provider *ReplicateProvider) ResponsesStream(ctx *schemas.BifrostContext, 
 		outputIndex := 0
 		contentIndex := 0
 
-		// Accumulate raw responses for debugging
-		var rawResponseChunks []interface{}
 		sendBackRawRequest := providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest)
 		sendBackRawResponse := providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse)
 
@@ -1384,13 +1430,7 @@ func (provider *ReplicateProvider) ResponsesStream(ctx *schemas.BifrostContext, 
 					ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
 					provider.logger.Warn("Error reading stream: %v", readErr)
 					bifrostErr := providerUtils.NewBifrostOperationError(schemas.ErrProviderDoRequest, readErr)
-
-					// Include accumulated raw responses in error
-					if sendBackRawResponse && len(rawResponseChunks) > 0 {
-						bifrostErr.ExtraFields.RawResponse = rawResponseChunks
-					}
-
-					enrichedErr := providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, sendBackRawRequest, sendBackRawResponse)
+					enrichedErr := providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, sendBackRawRequest, sendBackRawResponse, latency)
 					providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, enrichedErr, responseChan, provider.logger, postHookSpanFinalizer)
 					return
 				}
@@ -1408,10 +1448,6 @@ func (provider *ReplicateProvider) ResponsesStream(ctx *schemas.BifrostContext, 
 				case "output":
 					// Text chunk received
 					if currentEvent.Data != "" {
-						// Accumulate raw response if enabled
-						if sendBackRawResponse {
-							rawResponseChunks = append(rawResponseChunks, currentEvent)
-						}
 
 						// Emit lifecycle events on first content
 						if !hasEmittedCreated {
@@ -1529,6 +1565,13 @@ func (provider *ReplicateProvider) ResponsesStream(ctx *schemas.BifrostContext, 
 								ChunkIndex: sequenceNumber,
 							},
 						}
+						// Each output event rides on the delta carrying its text, as on the chat and text streams.
+						if sendBackRawResponse {
+							if eventJSON, err := providerUtils.MarshalSorted(currentEvent); err == nil {
+								deltaResp.ExtraFields.RawResponse = string(eventJSON)
+								deltaResp.ExtraFields.RawResponseFormat = schemas.RawResponseFormatReplicateStreamEvent
+							}
+						}
 						providerUtils.ProcessAndSendResponse(ctx, postHookRunner,
 							providerUtils.GetBifrostResponseForStreamResponse(nil, nil, deltaResp, nil, nil, nil),
 							responseChan, postHookSpanFinalizer)
@@ -1536,11 +1579,6 @@ func (provider *ReplicateProvider) ResponsesStream(ctx *schemas.BifrostContext, 
 						hasReceivedContent = true
 					}
 				case "done":
-					// Accumulate done event in raw responses if enabled
-					if sendBackRawResponse {
-						rawResponseChunks = append(rawResponseChunks, currentEvent)
-					}
-
 					// Stream completed
 					if hasReceivedContent {
 						// response.output_text.done
@@ -1639,9 +1677,12 @@ func (provider *ReplicateProvider) ResponsesStream(ctx *schemas.BifrostContext, 
 						providerUtils.ParseAndSetRawRequest(&completedResp.ExtraFields, jsonData)
 					}
 
-					// Set raw response if enabled
-					if sendBackRawResponse && len(rawResponseChunks) > 0 {
-						completedResp.ExtraFields.RawResponse = rawResponseChunks
+					// The done event rides on the completed response; output events already rode on their deltas.
+					if sendBackRawResponse {
+						if eventJSON, err := providerUtils.MarshalSorted(currentEvent); err == nil {
+							completedResp.ExtraFields.RawResponse = string(eventJSON)
+							completedResp.ExtraFields.RawResponseFormat = schemas.RawResponseFormatReplicateStreamEvent
+						}
 					}
 
 					ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
@@ -1651,11 +1692,6 @@ func (provider *ReplicateProvider) ResponsesStream(ctx *schemas.BifrostContext, 
 					resp.CloseBodyStream()
 					return
 				case "error":
-					// Accumulate error event in raw responses if enabled
-					if sendBackRawResponse {
-						rawResponseChunks = append(rawResponseChunks, currentEvent)
-					}
-
 					// Handle error
 					errorMsg := "stream error"
 					if currentEvent.Data != "" {
@@ -1665,18 +1701,25 @@ func (provider *ReplicateProvider) ResponsesStream(ctx *schemas.BifrostContext, 
 						errorMsg,
 						fmt.Errorf("stream error: %s", errorMsg))
 
-					// Include accumulated raw responses in error
-					if sendBackRawResponse && len(rawResponseChunks) > 0 {
-						bifrostErr.ExtraFields.RawResponse = rawResponseChunks
+					// The error event is the stream's last raw payload; earlier events already rode on their deltas.
+					if sendBackRawResponse {
+						bifrostErr.ExtraFields.RawResponse = []interface{}{currentEvent}
 					}
 
 					ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
-					enrichedErr := providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, sendBackRawRequest, sendBackRawResponse)
+					enrichedErr := providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, sendBackRawRequest, sendBackRawResponse, latency)
 					providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, enrichedErr, responseChan, provider.logger, postHookSpanFinalizer)
 					resp.CloseBodyStream()
 					return
 				}
 			}
+		}
+
+		// See TextCompletionStream: no `done` event means the body ended before the
+		// prediction finished, which a plain io.EOF cannot distinguish from a
+		// healthy close.
+		if ended, _ := ctx.Value(schemas.BifrostContextKeyStreamEndIndicator).(bool); !ended {
+			providerUtils.SendStreamTruncatedError(ctx, postHookRunner, responseChan, provider.logger, postHookSpanFinalizer, jsonData)
 		}
 	}()
 
@@ -1696,6 +1739,11 @@ func (provider *ReplicateProvider) Speech(ctx *schemas.BifrostContext, key schem
 // Rerank is not supported by the Replicate provider.
 func (provider *ReplicateProvider) Rerank(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostRerankRequest) (*schemas.BifrostRerankResponse, *schemas.BifrostError) {
 	return nil, providerUtils.NewUnsupportedOperationError(schemas.RerankRequest, provider.GetProviderKey())
+}
+
+// Decision is not supported by the Replicate provider.
+func (provider *ReplicateProvider) Decision(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostDecisionRequest) (*schemas.BifrostDecisionResponse, *schemas.BifrostError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.DecisionRequest, provider.GetProviderKey())
 }
 
 // OCR is not supported by the Replicate provider.
@@ -1728,8 +1776,8 @@ func (provider *ReplicateProvider) ImageGeneration(ctx *schemas.BifrostContext, 
 	jsonData, bifrostErr := providerUtils.CheckContextAndGetRequestBody(
 		ctx,
 		request,
-		func() (providerUtils.RequestBodyWithExtraParams, error) {
-			return ToReplicateImageGenerationInput(request), nil
+		func() (*ReplicatePredictionRequest, error) {
+			return ToReplicateImageGenerationInput(request)
 		})
 	if bifrostErr != nil {
 		return nil, bifrostErr
@@ -1745,7 +1793,7 @@ func (provider *ReplicateProvider) ImageGeneration(ctx *schemas.BifrostContext, 
 		request.Model,
 		provider.customProviderConfig,
 		schemas.ImageGenerationRequest,
-		useDeploymentsEndpoint(key),
+		useDeploymentsEndpoint(ctx, key),
 	)
 
 	// Create prediction with appropriate mode
@@ -1762,7 +1810,7 @@ func (provider *ReplicateProvider) ImageGeneration(ctx *schemas.BifrostContext, 
 		provider.sendBackRawResponse,
 	)
 	if err != nil {
-		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	// If async mode and not complete, poll until done
@@ -1777,13 +1825,13 @@ func (provider *ReplicateProvider) ImageGeneration(ctx *schemas.BifrostContext, 
 			providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
 		)
 		if err != nil {
-			return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+			return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 		}
 	}
 
 	// Check for terminal error status (failed/canceled) after sync mode or polling
 	if err := checkForErrorStatus(prediction); err != nil {
-		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	if providerResponseHeaders != nil {
@@ -1793,8 +1841,13 @@ func (provider *ReplicateProvider) ImageGeneration(ctx *schemas.BifrostContext, 
 	// Convert to Bifrost response
 	bifrostResponse, err := ToBifrostImageGenerationResponse(prediction)
 	if err != nil {
-		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
+
+	// Backfill output resolution for upscale-style models (target/factor
+	// input, no plain size param) so resolution-tiered cost calculation
+	// doesn't silently fall back to the base per-image rate.
+	applyUpscaleOutputResolution(request, prediction, bifrostResponse)
 
 	// Set extra fields
 	bifrostResponse.ExtraFields.Latency = latency.Milliseconds()
@@ -1823,8 +1876,11 @@ func (provider *ReplicateProvider) ImageGenerationStream(ctx *schemas.BifrostCon
 	jsonData, bifrostErr := providerUtils.CheckContextAndGetRequestBody(
 		ctx,
 		request,
-		func() (providerUtils.RequestBodyWithExtraParams, error) {
-			replicateReq := ToReplicateImageGenerationInput(request)
+		func() (*ReplicatePredictionRequest, error) {
+			replicateReq, err := ToReplicateImageGenerationInput(request)
+			if err != nil {
+				return nil, err
+			}
 			replicateReq.Stream = schemas.Ptr(true)
 			return replicateReq, nil
 		})
@@ -1839,11 +1895,11 @@ func (provider *ReplicateProvider) ImageGenerationStream(ctx *schemas.BifrostCon
 		request.Model,
 		provider.customProviderConfig,
 		schemas.ImageGenerationStreamRequest,
-		useDeploymentsEndpoint(key),
+		useDeploymentsEndpoint(ctx, key),
 	)
 	startTime := time.Now()
 	// Create prediction
-	prediction, _, _, _, err := createPrediction(
+	prediction, _, latency, _, err := createPrediction(
 		ctx,
 		provider.client,
 		jsonData,
@@ -1856,7 +1912,7 @@ func (provider *ReplicateProvider) ImageGenerationStream(ctx *schemas.BifrostCon
 		provider.sendBackRawResponse,
 	)
 	if err != nil {
-		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	// Verify stream URL is available
@@ -1871,6 +1927,7 @@ func (provider *ReplicateProvider) ImageGenerationStream(ctx *schemas.BifrostCon
 			nil,
 			sendBackRawRequest,
 			sendBackRawResponse,
+			latency,
 		)
 	}
 
@@ -1885,17 +1942,17 @@ func (provider *ReplicateProvider) ImageGenerationStream(ctx *schemas.BifrostCon
 	// Store provider response headers in context for transport layer
 	ctx.SetValue(schemas.BifrostContextKeyProviderResponseHeaders, providerUtils.ExtractProviderResponseHeaders(resp))
 
+	providerUtils.SetStreamIdleTimeoutIfEmpty(ctx, provider.networkConfig.StreamIdleTimeoutInSeconds)
+
 	// Large payload streaming passthrough — pipe raw upstream SSE to client
 	if providerUtils.SetupStreamingPassthrough(ctx, resp) {
 		responseChan := make(chan *schemas.BifrostStreamChunk)
-		close(responseChan)
+		providerUtils.CloseStream(ctx, responseChan)
 		return responseChan, nil
 	}
 
 	// Create response channel
 	responseChan := make(chan *schemas.BifrostStreamChunk, schemas.DefaultStreamBufferSize)
-
-	providerUtils.SetStreamIdleTimeoutIfEmpty(ctx, provider.networkConfig.StreamIdleTimeoutInSeconds)
 
 	// Start streaming in a goroutine
 	go func() {
@@ -1906,8 +1963,9 @@ func (provider *ReplicateProvider) ImageGenerationStream(ctx *schemas.BifrostCon
 			} else if ctx.Err() == context.DeadlineExceeded {
 				providerUtils.HandleStreamTimeout(ctx, postHookRunner, responseChan, provider.logger, postHookSpanFinalizer, jsonData)
 			}
-			close(responseChan)
+			providerUtils.CloseStream(ctx, responseChan)
 		}()
+		defer providerUtils.RecoverStreamPanic(ctx, postHookRunner, responseChan, provider.logger, postHookSpanFinalizer)
 		defer providerUtils.ReleaseStreamingResponse(ctx, resp)
 
 		// Decompress gzip-encoded streams transparently (no-op for non-gzip)
@@ -1950,7 +2008,7 @@ func (provider *ReplicateProvider) ImageGenerationStream(ctx *schemas.BifrostCon
 				if readErr != io.EOF {
 					ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
 					provider.logger.Warn(fmt.Sprintf("Error reading SSE stream: %v", readErr))
-					enrichedErr := providerUtils.EnrichError(ctx, providerUtils.NewBifrostOperationError(schemas.ErrProviderDoRequest, readErr), jsonData, nil, sendBackRawRequest, sendBackRawResponse)
+					enrichedErr := providerUtils.EnrichError(ctx, providerUtils.NewBifrostOperationError(schemas.ErrProviderDoRequest, readErr), jsonData, nil, sendBackRawRequest, sendBackRawResponse, latency)
 					providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, enrichedErr, responseChan, provider.logger, postHookSpanFinalizer)
 				}
 				break
@@ -2036,7 +2094,7 @@ func (provider *ReplicateProvider) ImageGenerationStream(ctx *schemas.BifrostCon
 					if sendBackRawResponse && len(rawResponseChunks) > 0 {
 						bifrostErr.ExtraFields.RawResponse = rawResponseChunks
 					}
-					bifrostErr = providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, sendBackRawRequest, sendBackRawResponse)
+					bifrostErr = providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, sendBackRawRequest, sendBackRawResponse, latency)
 					ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
 					providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, bifrostErr, responseChan, provider.logger, postHookSpanFinalizer)
 					return
@@ -2048,7 +2106,7 @@ func (provider *ReplicateProvider) ImageGenerationStream(ctx *schemas.BifrostCon
 					if sendBackRawResponse && len(rawResponseChunks) > 0 {
 						bifrostErr.ExtraFields.RawResponse = rawResponseChunks
 					}
-					bifrostErr = providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, sendBackRawRequest, sendBackRawResponse)
+					bifrostErr = providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, sendBackRawRequest, sendBackRawResponse, latency)
 					ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
 					providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, bifrostErr, responseChan, provider.logger, postHookSpanFinalizer)
 					return
@@ -2067,6 +2125,12 @@ func (provider *ReplicateProvider) ImageGenerationStream(ctx *schemas.BifrostCon
 						Latency:    time.Since(startTime).Milliseconds(),
 					},
 				}
+
+				// Backfill output resolution for upscale-style models. Only the
+				// request-side target signal is available here: the SSE path never
+				// re-reads the finished prediction, so factor mode has no metrics
+				// band to fall back to.
+				applyUpscaleStreamOutputResolution(resolveUpscaleOutputPixels(request, nil), finalChunk)
 
 				// Set raw request only on final chunk if enabled
 				if sendBackRawRequest {
@@ -2112,11 +2176,18 @@ func (provider *ReplicateProvider) ImageGenerationStream(ctx *schemas.BifrostCon
 					rawResponseChunks = append(rawResponseChunks, ReplicateSSEEvent{Event: eventType, Data: eventData})
 					bifrostErr.ExtraFields.RawResponse = rawResponseChunks
 				}
-				bifrostErr = providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, sendBackRawRequest, sendBackRawResponse)
+				bifrostErr = providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, sendBackRawRequest, sendBackRawResponse, latency)
 				ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
 				providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, bifrostErr, responseChan, provider.logger, postHookSpanFinalizer)
 				return
 			}
+		}
+
+		// See TextCompletionStream: no `done` event means the body ended before the
+		// prediction finished, which a plain io.EOF cannot distinguish from a
+		// healthy close.
+		if ended, _ := ctx.Value(schemas.BifrostContextKeyStreamEndIndicator).(bool); !ended {
+			providerUtils.SendStreamTruncatedError(ctx, postHookRunner, responseChan, provider.logger, postHookSpanFinalizer, jsonData)
 		}
 	}()
 
@@ -2133,7 +2204,7 @@ func (provider *ReplicateProvider) ImageEdit(ctx *schemas.BifrostContext, key sc
 	jsonData, bifrostErr := providerUtils.CheckContextAndGetRequestBody(
 		ctx,
 		request,
-		func() (providerUtils.RequestBodyWithExtraParams, error) {
+		func() (*ReplicatePredictionRequest, error) {
 			return ToReplicateImageEditInput(request), nil
 		})
 	if bifrostErr != nil {
@@ -2150,7 +2221,7 @@ func (provider *ReplicateProvider) ImageEdit(ctx *schemas.BifrostContext, key sc
 		request.Model,
 		provider.customProviderConfig,
 		schemas.ImageEditRequest,
-		useDeploymentsEndpoint(key),
+		useDeploymentsEndpoint(ctx, key),
 	)
 
 	// Create prediction with appropriate mode
@@ -2167,7 +2238,7 @@ func (provider *ReplicateProvider) ImageEdit(ctx *schemas.BifrostContext, key sc
 		provider.sendBackRawResponse,
 	)
 	if err != nil {
-		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	// If async mode and not complete, poll until done
@@ -2182,13 +2253,13 @@ func (provider *ReplicateProvider) ImageEdit(ctx *schemas.BifrostContext, key sc
 			providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
 		)
 		if err != nil {
-			return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+			return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 		}
 	}
 
 	// Check for terminal error status (failed/canceled) after sync mode or polling
 	if err := checkForErrorStatus(prediction); err != nil {
-		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	if providerResponseHeaders != nil {
@@ -2198,8 +2269,14 @@ func (provider *ReplicateProvider) ImageEdit(ctx *schemas.BifrostContext, key sc
 	// Convert to Bifrost response (reuse image generation response format)
 	bifrostResponse, err := ToBifrostImageGenerationResponse(prediction)
 	if err != nil {
-		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
+
+	// Backfill output resolution for upscale-style models, which reach this path
+	// through the first-class target_megapixels/upscale_factor edit params, so
+	// resolution-tiered cost calculation doesn't silently fall back to the base
+	// per-image rate.
+	applyUpscaleEditOutputResolution(request, prediction, bifrostResponse)
 
 	// Set extra fields
 	bifrostResponse.ExtraFields.Latency = latency.Milliseconds()
@@ -2228,7 +2305,7 @@ func (provider *ReplicateProvider) ImageEditStream(ctx *schemas.BifrostContext, 
 	jsonData, bifrostErr := providerUtils.CheckContextAndGetRequestBody(
 		ctx,
 		request,
-		func() (providerUtils.RequestBodyWithExtraParams, error) {
+		func() (*ReplicatePredictionRequest, error) {
 			replicateReq := ToReplicateImageEditInput(request)
 			replicateReq.Stream = schemas.Ptr(true)
 			return replicateReq, nil
@@ -2244,12 +2321,12 @@ func (provider *ReplicateProvider) ImageEditStream(ctx *schemas.BifrostContext, 
 		request.Model,
 		provider.customProviderConfig,
 		schemas.ImageEditStreamRequest,
-		useDeploymentsEndpoint(key),
+		useDeploymentsEndpoint(ctx, key),
 	)
 
 	startTime := time.Now()
 	// Create prediction
-	prediction, _, _, _, err := createPrediction(
+	prediction, _, latency, _, err := createPrediction(
 		ctx,
 		provider.client,
 		jsonData,
@@ -2262,7 +2339,7 @@ func (provider *ReplicateProvider) ImageEditStream(ctx *schemas.BifrostContext, 
 		provider.sendBackRawResponse,
 	)
 	if err != nil {
-		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	// Verify stream URL is available
@@ -2277,6 +2354,7 @@ func (provider *ReplicateProvider) ImageEditStream(ctx *schemas.BifrostContext, 
 			nil,
 			sendBackRawRequest,
 			sendBackRawResponse,
+			latency,
 		)
 	}
 
@@ -2291,17 +2369,17 @@ func (provider *ReplicateProvider) ImageEditStream(ctx *schemas.BifrostContext, 
 	// Store provider response headers in context for transport layer
 	ctx.SetValue(schemas.BifrostContextKeyProviderResponseHeaders, providerUtils.ExtractProviderResponseHeaders(resp))
 
+	providerUtils.SetStreamIdleTimeoutIfEmpty(ctx, provider.networkConfig.StreamIdleTimeoutInSeconds)
+
 	// Large payload streaming passthrough — pipe raw upstream SSE to client
 	if providerUtils.SetupStreamingPassthrough(ctx, resp) {
 		responseChan := make(chan *schemas.BifrostStreamChunk)
-		close(responseChan)
+		providerUtils.CloseStream(ctx, responseChan)
 		return responseChan, nil
 	}
 
 	// Create response channel
 	responseChan := make(chan *schemas.BifrostStreamChunk, schemas.DefaultStreamBufferSize)
-
-	providerUtils.SetStreamIdleTimeoutIfEmpty(ctx, provider.networkConfig.StreamIdleTimeoutInSeconds)
 
 	// Start streaming in a goroutine
 	go func() {
@@ -2312,8 +2390,9 @@ func (provider *ReplicateProvider) ImageEditStream(ctx *schemas.BifrostContext, 
 			} else if ctx.Err() == context.DeadlineExceeded {
 				providerUtils.HandleStreamTimeout(ctx, postHookRunner, responseChan, provider.logger, postHookSpanFinalizer, jsonData)
 			}
-			close(responseChan)
+			providerUtils.CloseStream(ctx, responseChan)
 		}()
+		defer providerUtils.RecoverStreamPanic(ctx, postHookRunner, responseChan, provider.logger, postHookSpanFinalizer)
 		defer providerUtils.ReleaseStreamingResponse(ctx, resp)
 
 		// Decompress gzip-encoded streams transparently (no-op for non-gzip)
@@ -2354,7 +2433,7 @@ func (provider *ReplicateProvider) ImageEditStream(ctx *schemas.BifrostContext, 
 					return
 				}
 				if readErr != io.EOF {
-					enrichedErr := providerUtils.EnrichError(ctx, providerUtils.NewBifrostOperationError("stream read error", readErr), jsonData, nil, sendBackRawRequest, sendBackRawResponse)
+					enrichedErr := providerUtils.EnrichError(ctx, providerUtils.NewBifrostOperationError("stream read error", readErr), jsonData, nil, sendBackRawRequest, sendBackRawResponse, latency)
 					ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
 					providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, enrichedErr, responseChan, provider.logger, postHookSpanFinalizer)
 				}
@@ -2438,7 +2517,7 @@ func (provider *ReplicateProvider) ImageEditStream(ctx *schemas.BifrostContext, 
 					if sendBackRawResponse && len(rawResponseChunks) > 0 {
 						bifrostErr.ExtraFields.RawResponse = rawResponseChunks
 					}
-					bifrostErr = providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, sendBackRawRequest, sendBackRawResponse)
+					bifrostErr = providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, sendBackRawRequest, sendBackRawResponse, latency)
 					ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
 					providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, bifrostErr, responseChan, provider.logger, postHookSpanFinalizer)
 					return
@@ -2449,7 +2528,7 @@ func (provider *ReplicateProvider) ImageEditStream(ctx *schemas.BifrostContext, 
 					if sendBackRawResponse && len(rawResponseChunks) > 0 {
 						bifrostErr.ExtraFields.RawResponse = rawResponseChunks
 					}
-					bifrostErr = providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, sendBackRawRequest, sendBackRawResponse)
+					bifrostErr = providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, sendBackRawRequest, sendBackRawResponse, latency)
 					ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
 					providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, bifrostErr, responseChan, provider.logger, postHookSpanFinalizer)
 					return
@@ -2468,6 +2547,12 @@ func (provider *ReplicateProvider) ImageEditStream(ctx *schemas.BifrostContext, 
 						Latency:    time.Since(startTime).Milliseconds(),
 					},
 				}
+
+				// Backfill output resolution for upscale-style models. Only the
+				// request-side target signal is available here: the SSE path never
+				// re-reads the finished prediction, so factor mode has no metrics
+				// band to fall back to.
+				applyUpscaleStreamOutputResolution(resolveUpscaleEditOutputPixels(request, nil), finalChunk)
 
 				if sendBackRawRequest {
 					providerUtils.ParseAndSetRawRequest(&finalChunk.ExtraFields, jsonData)
@@ -2498,11 +2583,18 @@ func (provider *ReplicateProvider) ImageEditStream(ctx *schemas.BifrostContext, 
 					rawResponseChunks = append(rawResponseChunks, ReplicateSSEEvent{Event: eventType, Data: eventData})
 					bifrostErr.ExtraFields.RawResponse = rawResponseChunks
 				}
-				bifrostErr = providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, sendBackRawRequest, sendBackRawResponse)
+				bifrostErr = providerUtils.EnrichError(ctx, bifrostErr, jsonData, nil, sendBackRawRequest, sendBackRawResponse, latency)
 				ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
 				providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, bifrostErr, responseChan, provider.logger, postHookSpanFinalizer)
 				return
 			}
+		}
+
+		// See TextCompletionStream: no `done` event means the body ended before the
+		// prediction finished, which a plain io.EOF cannot distinguish from a
+		// healthy close.
+		if ended, _ := ctx.Value(schemas.BifrostContextKeyStreamEndIndicator).(bool); !ended {
+			providerUtils.SendStreamTruncatedError(ctx, postHookRunner, responseChan, provider.logger, postHookSpanFinalizer, jsonData)
 		}
 	}()
 
@@ -2524,7 +2616,7 @@ func (provider *ReplicateProvider) VideoGeneration(ctx *schemas.BifrostContext, 
 	jsonData, bifrostErr := providerUtils.CheckContextAndGetRequestBody(
 		ctx,
 		request,
-		func() (providerUtils.RequestBodyWithExtraParams, error) {
+		func() (*ReplicatePredictionRequest, error) {
 			return ToReplicateVideoGenerationInput(request)
 		})
 	if bifrostErr != nil {
@@ -2538,7 +2630,7 @@ func (provider *ReplicateProvider) VideoGeneration(ctx *schemas.BifrostContext, 
 		request.Model,
 		provider.customProviderConfig,
 		schemas.VideoGenerationRequest,
-		useDeploymentsEndpoint(key),
+		useDeploymentsEndpoint(ctx, key),
 	)
 
 	// Create prediction with appropriate mode
@@ -2555,7 +2647,7 @@ func (provider *ReplicateProvider) VideoGeneration(ctx *schemas.BifrostContext, 
 		provider.sendBackRawResponse,
 	)
 	if err != nil {
-		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
 	if providerResponseHeaders != nil {
@@ -2565,7 +2657,7 @@ func (provider *ReplicateProvider) VideoGeneration(ctx *schemas.BifrostContext, 
 	// Convert to Bifrost response
 	bifrostResponse, err := ToBifrostVideoGenerationResponse(prediction)
 	if err != nil {
-		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 	bifrostResponse.ID = providerUtils.AddVideoIDProviderSuffix(bifrostResponse.ID, schemas.Replicate)
 
@@ -2594,8 +2686,12 @@ func (provider *ReplicateProvider) VideoRetrieve(ctx *schemas.BifrostContext, ke
 	}
 
 	videoID := providerUtils.StripVideoIDProviderSuffix(request.ID, providerName)
+	escapedVideoID, idErr := providerUtils.EscapeResourceID(videoID, "video_id")
+	if idErr != nil {
+		return nil, idErr
+	}
 	// Build URL to fetch the prediction by ID.
-	predictionURL := provider.buildRequestURL(ctx, "/v1/predictions/"+videoID, schemas.VideoRetrieveRequest)
+	predictionURL := provider.buildRequestURL(ctx, "/v1/predictions/"+escapedVideoID, schemas.VideoRetrieveRequest)
 
 	req := fasthttp.AcquireRequest()
 	resp := fasthttp.AcquireResponse()
@@ -2619,32 +2715,40 @@ func (provider *ReplicateProvider) VideoRetrieve(ctx *schemas.BifrostContext, ke
 	if resp.StatusCode() != fasthttp.StatusOK {
 		return nil, providerUtils.EnrichError(
 			ctx,
-			parseReplicateError(resp.Body(), resp.StatusCode()),
+			parseReplicateError(resp),
 			nil,
 			nil,
 			provider.sendBackRawRequest,
 			provider.sendBackRawResponse,
+			latency,
 		)
 	}
 
 	providerResponseHeaders := providerUtils.ExtractProviderResponseHeaders(resp)
 	ctx.SetValue(schemas.BifrostContextKeyProviderResponseHeaders, providerResponseHeaders)
 
+	ft, fh := providerUtils.StartPhaseSpan(ctx, "response-finalize")
 	body, err := providerUtils.CheckAndDecodeBody(resp)
 	if err != nil {
+		if ft != nil {
+			ft.EndSpan(fh, schemas.SpanStatusError, err.Error())
+		}
 		return nil, providerUtils.NewBifrostOperationError(schemas.ErrProviderResponseDecode, err)
+	}
+	if ft != nil {
+		ft.EndSpan(fh, schemas.SpanStatusOk, "")
 	}
 
 	sendBackRawResponse := providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse)
 	var prediction ReplicatePredictionResponse
-	_, rawResponse, bifrostErr := providerUtils.HandleProviderResponse(body, &prediction, nil, false, sendBackRawResponse)
+	_, rawResponse, bifrostErr := providerUtils.HandleProviderResponseCtx(ctx, body, &prediction, nil, false, sendBackRawResponse)
 	if bifrostErr != nil {
 		return nil, bifrostErr
 	}
 
 	bifrostResponse, convertErr := ToBifrostVideoGenerationResponse(&prediction)
 	if convertErr != nil {
-		return nil, providerUtils.EnrichError(ctx, convertErr, nil, body, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		return nil, providerUtils.EnrichError(ctx, convertErr, nil, body, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 	bifrostResponse.ID = providerUtils.AddVideoIDProviderSuffix(bifrostResponse.ID, providerName)
 
@@ -2705,9 +2809,9 @@ func (provider *ReplicateProvider) VideoDownload(ctx *schemas.BifrostContext, ke
 		return nil, bifrostErr
 	}
 	if resp.StatusCode() != fasthttp.StatusOK {
-		return nil, providerUtils.NewBifrostOperationError(
+		return nil, providerUtils.SetErrorLatency(providerUtils.NewBifrostOperationError(
 			fmt.Sprintf("failed to download video: HTTP %d", resp.StatusCode()),
-			nil)
+			nil), latency)
 	}
 
 	providerResponseHeaders := providerUtils.ExtractProviderResponseHeaders(resp)
@@ -2742,6 +2846,11 @@ func (provider *ReplicateProvider) VideoDelete(_ *schemas.BifrostContext, _ sche
 // VideoList is not supported by replicate provider.
 func (provider *ReplicateProvider) VideoList(_ *schemas.BifrostContext, _ schemas.Key, _ *schemas.BifrostVideoListRequest) (*schemas.BifrostVideoListResponse, *schemas.BifrostError) {
 	return nil, providerUtils.NewUnsupportedOperationError(schemas.VideoListRequest, provider.GetProviderKey())
+}
+
+// VideoEdit is not supported by the Replicate provider.
+func (provider *ReplicateProvider) VideoEdit(_ *schemas.BifrostContext, _ schemas.Key, _ *schemas.BifrostVideoEditRequest) (*schemas.BifrostVideoEditResponse, *schemas.BifrostError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.VideoEditRequest, provider.GetProviderKey())
 }
 
 // VideoRemix is not supported by replicate provider.
@@ -2892,8 +3001,8 @@ func (provider *ReplicateProvider) FileUpload(ctx *schemas.BifrostContext, key s
 
 	// Handle error response
 	if resp.StatusCode() != fasthttp.StatusOK && resp.StatusCode() != fasthttp.StatusCreated {
-		provider.logger.Debug("error from %s provider: %s", providerName, string(resp.Body()))
-		return nil, parseReplicateError(resp.Body(), resp.StatusCode())
+		provider.logger.Debug("error from %s provider: status %d", providerName, resp.StatusCode())
+		return nil, providerUtils.SetErrorLatency(parseReplicateError(resp), latency)
 	}
 
 	body, err := providerUtils.CheckAndDecodeBody(resp)
@@ -2924,11 +3033,11 @@ func (provider *ReplicateProvider) FileList(ctx *schemas.BifrostContext, keys []
 	sendBackRawRequest := providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest)
 
 	// Initialize serial pagination helper (Replicate uses cursor-based pagination)
-	// allowNativeCursorFallback=false: Replicate's cursor is a full URL, so passing an
-	// unrecognised value through would produce a malformed request rather than a clean API error.
+	// allowNativeCursorFallback=false: an unrecognised value is a caller mistake and gets a
+	// clean 400 rather than being sent upstream as a cursor.
 	helper, err := providerUtils.NewSerialListHelper(keys, request.After, provider.logger, false)
 	if err != nil {
-		return nil, providerUtils.NewBifrostOperationError("invalid pagination cursor", err)
+		return nil, invalidPaginationCursorError(provider.logger, err)
 	}
 
 	// Get current key to query
@@ -2948,17 +3057,21 @@ func (provider *ReplicateProvider) FileList(ctx *schemas.BifrostContext, keys []
 	defer fasthttp.ReleaseRequest(req)
 	defer fasthttp.ReleaseResponse(resp)
 
-	// Build URL with query params
+	// Build URL with query params. The request always lands on the configured file
+	// endpoint; a stored cursor only ever contributes the cursor query parameter.
 	requestURL := provider.networkConfig.BaseURL + "/v1/files"
 	values := url.Values{}
 	if request.Limit > 0 {
 		values.Set("limit", fmt.Sprintf("%d", request.Limit))
 	}
-	// Use native cursor from serial helper (Replicate pagination URL)
 	if nativeCursor != "" {
-		// For Replicate, the cursor is actually the full next URL
-		requestURL = nativeCursor
-	} else if encodedValues := values.Encode(); encodedValues != "" {
+		pageCursor, cursorErr := replicateFileListPageCursor(provider.networkConfig.BaseURL, nativeCursor)
+		if cursorErr != nil {
+			return nil, invalidPaginationCursorError(provider.logger, cursorErr)
+		}
+		values.Set("cursor", pageCursor)
+	}
+	if encodedValues := values.Encode(); encodedValues != "" {
 		requestURL += "?" + encodedValues
 	}
 
@@ -2981,8 +3094,8 @@ func (provider *ReplicateProvider) FileList(ctx *schemas.BifrostContext, keys []
 
 	// Handle error response
 	if resp.StatusCode() != fasthttp.StatusOK {
-		provider.logger.Debug("error from %s provider: %s", providerName, string(resp.Body()))
-		return nil, parseReplicateError(resp.Body(), resp.StatusCode())
+		provider.logger.Debug("error from %s provider: status %d", providerName, resp.StatusCode())
+		return nil, providerUtils.SetErrorLatency(parseReplicateError(resp), latency)
 	}
 
 	body, decodeErr := providerUtils.CheckAndDecodeBody(resp)
@@ -3010,13 +3123,19 @@ func (provider *ReplicateProvider) FileList(ctx *schemas.BifrostContext, keys []
 		})
 	}
 
-	// Build cursor for next request
-	// Replicate uses full URL for pagination
+	// Build cursor for next request. Replicate's "next" field is a link; only its cursor
+	// value is stored so the follow-up request is rebuilt on the configured endpoint.
 	var nextCursor string
 	hasMore := false
-	if replicateResp.Next != nil && *replicateResp.Next != "" {
-		nextCursor = *replicateResp.Next
-		hasMore = true
+	if replicateResp.Next != nil {
+		pageCursor, cursorErr := replicateNextPageCursor(*replicateResp.Next)
+		if cursorErr != nil {
+			return nil, providerUtils.NewBifrostOperationError("replicate file list returned a next link Bifrost cannot page from", cursorErr)
+		}
+		if pageCursor != "" {
+			nextCursor = pageCursor
+			hasMore = true
+		}
 	}
 
 	// Use helper to build proper cursor with key index
@@ -3049,6 +3168,10 @@ func (provider *ReplicateProvider) FileRetrieve(ctx *schemas.BifrostContext, key
 	if request.FileID == "" {
 		return nil, providerUtils.NewBifrostOperationError("file_id is required", nil)
 	}
+	escapedFileID, idErr := providerUtils.EscapeResourceID(request.FileID, "file_id")
+	if idErr != nil {
+		return nil, idErr
+	}
 
 	sendBackRawRequest := providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest)
 	sendBackRawResponse := providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse)
@@ -3061,7 +3184,7 @@ func (provider *ReplicateProvider) FileRetrieve(ctx *schemas.BifrostContext, key
 
 		// Set headers
 		providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, nil)
-		req.SetRequestURI(provider.networkConfig.BaseURL + "/v1/files/" + url.PathEscape(request.FileID))
+		req.SetRequestURI(provider.networkConfig.BaseURL + "/v1/files/" + escapedFileID)
 		req.Header.SetMethod(http.MethodGet)
 		req.Header.SetContentType("application/json")
 
@@ -3081,8 +3204,8 @@ func (provider *ReplicateProvider) FileRetrieve(ctx *schemas.BifrostContext, key
 
 		// Handle error response
 		if resp.StatusCode() != fasthttp.StatusOK {
-			provider.logger.Debug("error from %s provider: %s", providerName, string(resp.Body()))
-			lastErr = parseReplicateError(resp.Body(), resp.StatusCode())
+			provider.logger.Debug("error from %s provider: status %d", providerName, resp.StatusCode())
+			lastErr = parseReplicateError(resp)
 			fasthttp.ReleaseRequest(req)
 			fasthttp.ReleaseResponse(resp)
 			continue
@@ -3126,6 +3249,10 @@ func (provider *ReplicateProvider) FileDelete(ctx *schemas.BifrostContext, keys 
 	if request.FileID == "" {
 		return nil, providerUtils.NewBifrostOperationError("file_id is required", nil)
 	}
+	escapedFileID, idErr := providerUtils.EscapeResourceID(request.FileID, "file_id")
+	if idErr != nil {
+		return nil, idErr
+	}
 
 	sendBackRawRequest := providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest)
 	sendBackRawResponse := providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse)
@@ -3138,7 +3265,7 @@ func (provider *ReplicateProvider) FileDelete(ctx *schemas.BifrostContext, keys 
 
 		// Set headers
 		providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, nil)
-		req.SetRequestURI(provider.networkConfig.BaseURL + "/v1/files/" + url.PathEscape(request.FileID))
+		req.SetRequestURI(provider.networkConfig.BaseURL + "/v1/files/" + escapedFileID)
 		req.Header.SetMethod(http.MethodDelete)
 		req.Header.SetContentType("application/json")
 
@@ -3175,8 +3302,8 @@ func (provider *ReplicateProvider) FileDelete(ctx *schemas.BifrostContext, keys 
 
 		// Handle error response
 		if resp.StatusCode() != fasthttp.StatusOK {
-			provider.logger.Debug("error from %s provider: %s", providerName, string(resp.Body()))
-			lastErr = parseReplicateError(resp.Body(), resp.StatusCode())
+			provider.logger.Debug("error from %s provider: status %d", providerName, resp.StatusCode())
+			lastErr = parseReplicateError(resp)
 			fasthttp.ReleaseRequest(req)
 			fasthttp.ReleaseResponse(resp)
 			continue
@@ -3238,6 +3365,16 @@ func (provider *ReplicateProvider) FileContent(ctx *schemas.BifrostContext, keys
 
 func (provider *ReplicateProvider) CountTokens(_ *schemas.BifrostContext, _ schemas.Key, _ *schemas.BifrostResponsesRequest) (*schemas.BifrostCountTokensResponse, *schemas.BifrostError) {
 	return nil, providerUtils.NewUnsupportedOperationError(schemas.CountTokensRequest, provider.GetProviderKey())
+}
+
+// ModelRetrieve is not supported by the Replicate provider.
+func (provider *ReplicateProvider) ModelRetrieve(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostModelRetrieveRequest) (*schemas.BifrostModelRetrieveResponse, *schemas.BifrostError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ModelRetrieveRequest, provider.GetProviderKey())
+}
+
+// Compaction is not supported by the Replicate provider.
+func (provider *ReplicateProvider) Compaction(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostCompactionRequest) (*schemas.BifrostCompactionResponse, *schemas.BifrostError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.CompactionRequest, provider.GetProviderKey())
 }
 
 // ContainerCreate is not supported by replicate provider.

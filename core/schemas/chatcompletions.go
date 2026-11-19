@@ -4,8 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
+	"strings"
 	"time"
+	"unsafe"
 
+	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -18,6 +23,8 @@ type BifrostChatRequest struct {
 	Params         *ChatParameters `json:"params,omitempty"`
 	Fallbacks      []Fallback      `json:"fallbacks,omitempty"`
 	RawRequestBody []byte          `json:"-"` // set bifrost-use-raw-request-body to true in ctx to use the raw request body. Bifrost will directly send this to the downstream provider.
+
+	CustomToolNames map[string]struct{} `json:"-"` // custom tools sent as function tools, for restoring their calls
 }
 
 // GetRawRequestBody returns the raw request body
@@ -34,21 +41,40 @@ func (cr *BifrostChatRequest) GetExtraParams() map[string]interface{} {
 
 // BifrostChatResponse represents the complete result from a chat completion request.
 type BifrostChatResponse struct {
-	ID                string                     `json:"id"`
-	Choices           []BifrostResponseChoice    `json:"choices"`
-	Created           int                        `json:"created"` // The Unix timestamp (in seconds).
-	Model             string                     `json:"model"`
-	Object            string                     `json:"object"` // "chat.completion" or "chat.completion.chunk"
-	ServiceTier       *BifrostServiceTier        `json:"service_tier,omitempty"`
-	SystemFingerprint string                     `json:"system_fingerprint"`
-	Usage             *BifrostLLMUsage           `json:"usage"`
-	ExtraFields       BifrostResponseExtraFields `json:"extra_fields"`
-	ExtraParams       map[string]interface{}     `json:"-"`
+	ID                  string                     `json:"id"`
+	Choices             []BifrostResponseChoice    `json:"choices"`
+	Created             int                        `json:"created"` // The Unix timestamp (in seconds).
+	Model               string                     `json:"model"`
+	Object              string                     `json:"object"` // "chat.completion", "chat.completion.chunk", or Perplexity's passthrough terminal "chat.completion.done"
+	ServiceTier         *BifrostServiceTier        `json:"service_tier,omitempty"`
+	Speed               *string                    `json:"speed,omitempty"`         // "fast" | "standard" — speed actually served (Anthropic fast mode); drives fast-mode billing
+	InferenceGeo        *string                    `json:"inference_geo,omitempty"` // "us" | "global" — inference geography served (Anthropic data residency); drives the 1.1x US multiplier
+	Diagnostics         *CacheDiagnostics          `json:"diagnostics,omitempty"`   // Anthropic cache diagnostics (cache-diagnosis-2026-04-07); first prompt-cache prefix divergence point
+	SystemFingerprint   string                     `json:"system_fingerprint"`
+	PromptFilterResults json.RawMessage            `json:"prompt_filter_results,omitempty"` // Azure content-filter annotations for the prompt, passed through untouched
+	Usage               *BifrostLLMUsage           `json:"usage"`
+	ExtraFields         BifrostResponseExtraFields `json:"extra_fields"`
+	ExtraParams         map[string]interface{}     `json:"-"`
 
 	// Perplexity-specific fields
 	SearchResults []SearchResult `json:"search_results,omitempty"`
 	Videos        []VideoResult  `json:"videos,omitempty"`
 	Citations     []string       `json:"citations,omitempty"`
+}
+
+// WithPreservedUsage retains explicitly reported zero counts on the completion
+// wire without filling in missing counts or mutating the shared usage.
+func (cr *BifrostChatResponse) WithPreservedUsage() any {
+	if cr == nil || !cr.Usage.hasExplicitZeroTokens() {
+		return cr
+	}
+	return &struct {
+		*BifrostChatResponse
+		Usage completionUsage `json:"usage"`
+	}{
+		BifrostChatResponse: cr,
+		Usage:               cr.Usage.completionWireUsage(),
+	}
 }
 
 // BackfillParams populates response fields from the request that are needed
@@ -89,6 +115,7 @@ func (cr *BifrostChatResponse) ToTextCompletionResponse() *BifrostTextCompletion
 				Latency:                 cr.ExtraFields.Latency,
 				RawResponse:             cr.ExtraFields.RawResponse,
 				CacheDebug:              cr.ExtraFields.CacheDebug,
+				GuardrailDebug:          cr.ExtraFields.GuardrailDebug,
 				ProviderResponseHeaders: cr.ExtraFields.ProviderResponseHeaders,
 			},
 		}
@@ -123,6 +150,7 @@ func (cr *BifrostChatResponse) ToTextCompletionResponse() *BifrostTextCompletion
 				Latency:                 cr.ExtraFields.Latency,
 				RawResponse:             cr.ExtraFields.RawResponse,
 				CacheDebug:              cr.ExtraFields.CacheDebug,
+				GuardrailDebug:          cr.ExtraFields.GuardrailDebug,
 				ProviderResponseHeaders: cr.ExtraFields.ProviderResponseHeaders,
 			},
 		}
@@ -160,6 +188,7 @@ func (cr *BifrostChatResponse) ToTextCompletionResponse() *BifrostTextCompletion
 				Latency:                 cr.ExtraFields.Latency,
 				RawResponse:             cr.ExtraFields.RawResponse,
 				CacheDebug:              cr.ExtraFields.CacheDebug,
+				GuardrailDebug:          cr.ExtraFields.GuardrailDebug,
 				ProviderResponseHeaders: cr.ExtraFields.ProviderResponseHeaders,
 			},
 		}
@@ -181,6 +210,7 @@ func (cr *BifrostChatResponse) ToTextCompletionResponse() *BifrostTextCompletion
 			Latency:                 cr.ExtraFields.Latency,
 			RawResponse:             cr.ExtraFields.RawResponse,
 			CacheDebug:              cr.ExtraFields.CacheDebug,
+			GuardrailDebug:          cr.ExtraFields.GuardrailDebug,
 			ProviderResponseHeaders: cr.ExtraFields.ProviderResponseHeaders,
 		},
 	}
@@ -200,7 +230,8 @@ type ChatParameters struct {
 	Prediction           *ChatPrediction       `json:"prediction,omitempty"`             // Predicted output content (OpenAI only)
 	PresencePenalty      *float64              `json:"presence_penalty,omitempty"`       // Penalizes repeated tokens
 	PromptCacheKey       *string               `json:"prompt_cache_key,omitempty"`       // Prompt cache key
-	PromptCacheRetention *string               `json:"prompt_cache_retention,omitempty"` // Prompt cache retention ("in-memory" or "24h")
+	PromptCacheRetention *string               `json:"prompt_cache_retention,omitempty"` // Prompt cache retention ("in_memory" or "24h")
+	PromptCacheOptions   *PromptCacheOptions   `json:"prompt_cache_options,omitempty"`   // Request-wide prompt cache options (OpenAI gpt-5.6+)
 	Reasoning            *ChatReasoning        `json:"reasoning,omitempty"`              // Reasoning parameters
 	ResponseFormat       *interface{}          `json:"response_format,omitempty"`        // Format for the response
 	SafetyIdentifier     *string               `json:"safety_identifier,omitempty"`      // Safety identifier
@@ -216,20 +247,25 @@ type ChatParameters struct {
 	Tools                []ChatTool            `json:"tools,omitempty"`              // Tools to use
 	User                 *string               `json:"user,omitempty"`               // User identifier for tracking
 	Verbosity            *string               `json:"verbosity,omitempty"`          // "low" | "medium" | "high"
-	WebSearchOptions     *ChatWebSearchOptions `json:"web_search_options,omitempty"` // Web search options (OpenAI only)
+	WebSearchOptions     *ChatWebSearchOptions `json:"web_search_options,omitempty"` // Web search options (OpenAI; mapped to Google Search grounding on Gemini)
 
 	// Anthropic-native knobs promoted to the neutral layer. These pass through
 	// typed to Anthropic-family providers (honored/stripped per ProviderFeatures
 	// in core/providers/anthropic/types.go). Non-Anthropic providers (OpenAI
 	// etc.) silently ignore them.
 	TopK              *int            `json:"top_k,omitempty"`              // Anthropic top_k sampling
-	Speed             *string         `json:"speed,omitempty"`              // "fast" (Anthropic fast-mode-2026-02-01 beta, Opus 4.6 only)
+	Speed             *string         `json:"speed,omitempty"`              // "fast" (Anthropic fast-mode-2026-02-01 beta, Opus 4.6 and 4.7+)
 	InferenceGeo      *string         `json:"inference_geo,omitempty"`      // Anthropic inference_geo (Claude API only)
 	MCPServers        []ChatMCPServer `json:"mcp_servers,omitempty"`        // Anthropic MCP connector (mcp-client-2025-11-20)
 	Container         *ChatContainer  `json:"container,omitempty"`          // Anthropic container (string id, or object with skills[] — beta skills-2025-10-02)
 	CacheControl      *CacheControl   `json:"cache_control,omitempty"`      // Top-level request cache control (Anthropic family)
 	TaskBudget        *ChatTaskBudget `json:"task_budget,omitempty"`        // Anthropic output_config.task_budget (task-budgets-2026-03-13 beta)
 	ContextManagement json.RawMessage `json:"context_management,omitempty"` // Anthropic context_management — complex union, passed as raw JSON to the provider layer
+
+	// Opts into running built-in server-side tools (e.g. Google Search) in the same
+	// turn as function declarations. Required by Gemini 3+, which otherwise rejects
+	// the combination; providers without the concept ignore it.
+	IncludeServerSideToolInvocations *bool `json:"include_server_side_tool_invocations,omitempty"`
 
 	// Dynamic parameters that can be provider-specific, they are directly
 	// added to the request as is.
@@ -258,15 +294,25 @@ func (cp *ChatParameters) UnmarshalJSON(data []byte) error {
 
 	// Now aux.Reasoning (from Alias) and aux.ReasoningEffort are filled
 
-	// Validate that specific fields don't conflict
-	if aux.ReasoningEffort != nil && aux.Reasoning != nil && aux.Reasoning.Effort != nil {
-		return fmt.Errorf("both reasoning_effort and reasoning.effort cannot be present at the same time")
+	// Clients that mirror the same reasoning directive in both spellings (the
+	// flat reasoning_* shorthand and the equivalent reasoning object field)
+	// are accepted as long as the two agree; the value canonicalizes to the
+	// object form in the merge below. Only contradictory values stay an error,
+	// which keeps the union invariant's protective intent: a request that asks
+	// for two different efforts is still rejected instead of silently picking
+	// a winner. Clients known to send both spellings include ai-sdk-based
+	// agents that emit every vendor dialect at once.
+	if aux.ReasoningEffort != nil && aux.Reasoning != nil && aux.Reasoning.Effort != nil &&
+		*aux.ReasoningEffort != *aux.Reasoning.Effort {
+		return fmt.Errorf("reasoning_effort (%q) conflicts with reasoning.effort (%q)", *aux.ReasoningEffort, *aux.Reasoning.Effort)
 	}
-	if aux.ReasoningMaxTokens != nil && aux.Reasoning != nil && aux.Reasoning.MaxTokens != nil {
-		return fmt.Errorf("both reasoning_max_tokens and reasoning.max_tokens cannot be present at the same time")
+	if aux.ReasoningMaxTokens != nil && aux.Reasoning != nil && aux.Reasoning.MaxTokens != nil &&
+		*aux.ReasoningMaxTokens != *aux.Reasoning.MaxTokens {
+		return fmt.Errorf("reasoning_max_tokens (%d) conflicts with reasoning.max_tokens (%d)", *aux.ReasoningMaxTokens, *aux.Reasoning.MaxTokens)
 	}
-	if aux.ReasoningDisplay != nil && aux.Reasoning != nil && aux.Reasoning.Display != nil {
-		return fmt.Errorf("both reasoning_display and reasoning.display cannot be present at the same time")
+	if aux.ReasoningDisplay != nil && aux.Reasoning != nil && aux.Reasoning.Display != nil &&
+		*aux.ReasoningDisplay != *aux.Reasoning.Display {
+		return fmt.Errorf("reasoning_display (%q) conflicts with reasoning.display (%q)", *aux.ReasoningDisplay, *aux.Reasoning.Display)
 	}
 
 	if aux.ReasoningEffort != nil || aux.ReasoningMaxTokens != nil || aux.ReasoningDisplay != nil {
@@ -284,6 +330,24 @@ func (cp *ChatParameters) UnmarshalJSON(data []byte) error {
 			cp.Reasoning.Display = aux.ReasoningDisplay
 		}
 	}
+	// response_format carries a user-authored JSON Schema, and Bifrost is not
+	// entitled to rewrite it. Decoding it into interface{} (what the alias does)
+	// yields a map[string]interface{}, which loses two things the provider cares
+	// about: key order, because Structured Outputs generates fields in schema key
+	// order ("outputs will be produced in the same order as the ordering of keys
+	// in the schema", https://developers.openai.com/api/docs/guides/structured-outputs),
+	// and numeric literals, because every number becomes a float64 (so an integer
+	// above 2^53 comes back corrupted and 1.0 comes back as 1).
+	//
+	// Keep the object form as raw bytes instead. Providers that forward
+	// response_format unchanged then emit exactly what the client sent, and the
+	// few that must rewrite it read it on demand via ParseChatResponseFormat.
+	// Non-object values (null, or a provider quirk) keep whatever the alias produced.
+	if rf := gjson.GetBytes(data, "response_format"); rf.IsObject() {
+		var value interface{} = json.RawMessage(rf.Raw)
+		cp.ResponseFormat = &value
+	}
+
 	// ExtraParams etc. are already handled by the alias
 	return nil
 }
@@ -300,6 +364,9 @@ type ChatReasoning struct {
 	Effort    *string `json:"effort,omitempty"`     // "none" |  "minimal" | "low" | "medium" | "high" (any value other than "none" will enable reasoning)
 	MaxTokens *int    `json:"max_tokens,omitempty"` // Maximum number of tokens to generate for the reasoning output (required for anthropic)
 	Display   *string `json:"display,omitempty"`    // Anthropic thinking.display: "summarized" | "omitted" (requires model support for adaptive thinking)
+	Type      *string `json:"type,omitempty"`       // Anthropic thinking.type: "between_tools" (no up-front thinking); independent of effort
+	Mode      *string `json:"mode,omitempty"`       // OpenAI reasoning.mode: "standard" | "pro" (Responses API only; routes OpenAI/Azure chat through Responses)
+	Summary   *string `json:"summary,omitempty"`    // OpenAI reasoning.summary: "auto" | "concise" | "detailed" (sent when chat is served by the Responses API)
 }
 
 // ChatPrediction represents predicted output content for the model to reference (OpenAI only).
@@ -309,10 +376,22 @@ type ChatPrediction struct {
 	Content interface{} `json:"content"` // String or array of content parts
 }
 
-// ChatWebSearchOptions represents web search options for chat completions (OpenAI only).
+// ChatWebSearchOptions represents web search options for chat completions.
 type ChatWebSearchOptions struct {
 	SearchContextSize *string                           `json:"search_context_size,omitempty"` // "low" | "medium" | "high"
 	UserLocation      *ChatWebSearchOptionsUserLocation `json:"user_location,omitempty"`
+	Filters           *ChatWebSearchOptionsFilters      `json:"filters,omitempty"` // Bifrost extension; stripped on the OpenAI wire
+}
+
+// ChatWebSearchOptionsFilters represents search filters; mirrors ResponsesToolWebSearchFilters.
+type ChatWebSearchOptionsFilters struct {
+	AllowedDomains []string `json:"allowed_domains,omitempty"`
+	BlockedDomains []string `json:"blocked_domains,omitempty"`
+
+	// Gemini only
+	// Filter search results to a specific time range.
+	// If users set a start time, they must set an end time (and vice versa).
+	TimeRangeFilter *Interval `json:"time_range_filter,omitempty"`
 }
 
 // ChatWebSearchOptionsUserLocation represents user location for web search.
@@ -378,12 +457,13 @@ type ChatTool struct {
 	Custom       *ChatToolCustom     `json:"custom,omitempty"`        // Custom tool definition (shape 2)
 	CacheControl *CacheControl       `json:"cache_control,omitempty"` // Cache control for the tool
 	Annotations  *MCPToolAnnotations `json:"-"`                       // MCP tool annotations (Bifrost-internal, never forwarded to providers)
+	MCP          *MCPToolMetadata    `json:"-"`                       // MCP title, icons and output schema (Bifrost-internal)
 
 	// Anthropic-native tool flags promoted to the neutral layer. All optional;
 	// ignored by providers that don't support them. Gating per ProviderFeatures
 	// in core/providers/anthropic/types.go.
 	DeferLoading        *bool                  `json:"defer_loading,omitempty"`         // Anthropic advanced-tool-use: defer loading of tool definition
-	AllowedCallers      []string               `json:"allowed_callers,omitempty"`       // Anthropic advanced-tool-use: which callers can invoke this tool ("direct", "code_execution_20250825", "code_execution_20260120")
+	AllowedCallers      []string               `json:"allowed_callers,omitempty"`       // Which callers can invoke this tool; see ResponsesToolCaller* for the two vendor vocabularies
 	InputExamples       []ChatToolInputExample `json:"input_examples,omitempty"`        // Anthropic tool-examples-2025-10-29: example inputs for the tool
 	EagerInputStreaming *bool                  `json:"eager_input_streaming,omitempty"` // Anthropic fine-grained-tool-streaming-2025-05-14: stream input_json_delta before full args are determined (custom tools only)
 
@@ -416,6 +496,13 @@ type ChatTool struct {
 	MCPServerName string                           `json:"mcp_server_name,omitempty"`
 	DefaultConfig *ChatMCPToolsetConfig            `json:"default_config,omitempty"`
 	Configs       map[string]*ChatMCPToolsetConfig `json:"configs,omitempty"`
+
+	// serialized caches this tool's MarshalJSON output. Set only for immutable,
+	// shared tools (MCP catalog entries precomputed once per refresh via
+	// EnsureSerialized) so logging/marshal reuse the bytes instead of re-running
+	// the full tool marshal per request. nil for client-supplied tools, which
+	// marshal normally. Unexported so it never appears in JSON.
+	serialized []byte
 }
 
 // normalizeShape clears fields that don't belong to the ChatTool's active
@@ -470,10 +557,37 @@ func (t *ChatTool) clearServerToolVariantFields() {
 // dispatch on the top-level Type/Name shape — could misinterpret or
 // silently forward the stray fields.
 func (t ChatTool) MarshalJSON() ([]byte, error) {
+	if len(t.serialized) > 0 {
+		return t.serialized, nil
+	}
 	normalized := t
 	normalized.normalizeShape()
 	type Alias ChatTool
 	return MarshalSorted((*Alias)(&normalized))
+}
+
+// EnsureSerialized precomputes and caches this tool's MarshalJSON output so later
+// marshals (logging especially) reuse the bytes. Call ONLY on immutable, shared
+// tools (e.g. MCP catalog entries at refresh time) — a later mutation would leave
+// the cache stale. Idempotent; a no-op once cached.
+func (t *ChatTool) EnsureSerialized() error {
+	if len(t.serialized) > 0 {
+		return nil
+	}
+	b, err := t.MarshalJSON()
+	if err != nil {
+		return err
+	}
+	t.serialized = b
+	return nil
+}
+
+// InvalidateSerialized drops the cached MarshalJSON bytes so the next
+// EnsureSerialized (or MarshalJSON) recomputes them. Call after mutating any
+// field that changes the wire output (e.g. Function.Name); otherwise the stale
+// cache keeps emitting the old bytes.
+func (t *ChatTool) InvalidateSerialized() {
+	t.serialized = nil
 }
 
 // UnmarshalJSON tolerantly decodes whatever JSON shape arrives, then
@@ -790,7 +904,9 @@ func (a *AdditionalPropertiesStruct) UnmarshalJSON(data []byte) error {
 }
 
 type ChatToolCustom struct {
-	Format *ChatToolCustomFormat `json:"format,omitempty"` // The input format
+	Name        string                `json:"name,omitempty"`        // OpenAI Chat wire nests the custom tool name here
+	Description *string               `json:"description,omitempty"` // Description of the custom tool
+	Format      *ChatToolCustomFormat `json:"format,omitempty"`      // The input format
 }
 
 type ChatToolCustomFormat struct {
@@ -912,6 +1028,38 @@ type ChatToolChoice struct {
 	ChatToolChoiceStruct *ChatToolChoiceStruct
 }
 
+// IsForced reports whether the choice obliges the model to call a tool, in any
+// of its spellings — "any"/"required", a named function or custom tool, a
+// pinned server tool, or an allowed-tools set in "required" mode. Only "none"
+// and "auto" are unforced. Models that reject forced tool use (Fable 5.1+)
+// need the choice dropped; see ModelCaps.SupportsForcedToolChoice.
+func (ctc *ChatToolChoice) IsForced() bool {
+	if ctc == nil {
+		return false
+	}
+	if ctc.ChatToolChoiceStr != nil {
+		switch ChatToolChoiceType(*ctc.ChatToolChoiceStr) {
+		case ChatToolChoiceTypeNone, ChatToolChoiceTypeAuto:
+			return false
+		default:
+			return true
+		}
+	}
+	if ctc.ChatToolChoiceStruct != nil {
+		switch ctc.ChatToolChoiceStruct.Type {
+		case ChatToolChoiceTypeNone, ChatToolChoiceTypeAuto:
+			return false
+		case ChatToolChoiceTypeAllowedTools:
+			// The set is a constraint, not a forcing; only its mode forces.
+			return ctc.ChatToolChoiceStruct.AllowedTools != nil &&
+				ctc.ChatToolChoiceStruct.AllowedTools.Mode == string(ChatToolChoiceTypeRequired)
+		default:
+			return true
+		}
+	}
+	return false
+}
+
 // MarshalJSON implements custom JSON marshalling for ChatMessageContent.
 // It marshals either ContentStr or ContentBlocks directly without wrapping.
 func (ctc ChatToolChoice) MarshalJSON() ([]byte, error) {
@@ -971,8 +1119,39 @@ type ChatToolChoiceAllowedTools struct {
 
 // ChatToolChoiceAllowedToolsTool represents a allowed tools tool.
 type ChatToolChoiceAllowedToolsTool struct {
-	Type     string                 `json:"type"` // "function"
+	Type     string                 `json:"type"` // "function" | "custom"
 	Function ChatToolChoiceFunction `json:"function,omitempty"`
+	Custom   *ChatToolChoiceCustom  `json:"custom,omitempty"`
+}
+
+// MarshalJSON emits type plus custom for a custom entry, and type plus function otherwise.
+func (t ChatToolChoiceAllowedToolsTool) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	typeBytes, err := MarshalSorted(t.Type)
+	if err != nil {
+		return nil, err
+	}
+	buf.WriteString(`{"type":`)
+	buf.Write(typeBytes)
+	if t.Type == string(ChatToolChoiceTypeCustom) {
+		if t.Custom != nil {
+			customBytes, err := MarshalSorted(t.Custom)
+			if err != nil {
+				return nil, err
+			}
+			buf.WriteString(`,"custom":`)
+			buf.Write(customBytes)
+		}
+	} else {
+		funcBytes, err := MarshalSorted(t.Function)
+		if err != nil {
+			return nil, err
+		}
+		buf.WriteString(`,"function":`)
+		buf.Write(funcBytes)
+	}
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
 }
 
 // ChatMessageRole represents the role of a chat message
@@ -991,12 +1170,87 @@ const (
 type ChatMessage struct {
 	Name    *string             `json:"name,omitempty"` // for chat completions
 	Role    ChatMessageRole     `json:"role,omitempty"`
-	Content *ChatMessageContent `json:"content,omitempty"`
+	Content *ChatMessageContent `json:"content"`
 
 	// Embedded pointer structs - when non-nil, their exported fields are flattened into the top-level JSON object
 	// IMPORTANT: Only one of the following can be non-nil at a time, otherwise the JSON marshalling will override the common fields
 	*ChatToolMessage
 	*ChatAssistantMessage
+}
+
+// MarshalJSON implements custom JSON marshalling for ChatMessage.
+//
+// The mirror of UnmarshalJSON below, and needed for the same reason: Go promotes
+// an embedded type's MarshalJSON to the outer struct, so ChatAssistantMessage's
+// marshaller would otherwise serialise a ChatMessage as ONLY its assistant fields,
+// silently dropping role, content and name from every message on the wire.
+//
+// The embedded pointers are flattened by hand rather than by struct embedding,
+// because embedding them in the output type would re-promote the same method and
+// reintroduce the bug this exists to prevent.
+//
+// The fragments are spliced textually rather than merged through a map: a Go map
+// marshals its keys in sorted order, which silently reorders every message body
+// on the wire (payload_ordering_test.go pins that ordering, and providers that
+// hash or cache on the raw payload are sensitive to it).
+func (cm ChatMessage) MarshalJSON() ([]byte, error) {
+	// Base fields first, in declaration order. Marshalled through a plain struct so
+	// the omitempty rules and ChatMessageContent's own marshaller are honoured
+	// exactly as declared.
+	base, err := Marshal(struct {
+		Name    *string             `json:"name,omitempty"`
+		Role    ChatMessageRole     `json:"role,omitempty"`
+		Content *ChatMessageContent `json:"content"`
+	}{Name: cm.Name, Role: cm.Role, Content: cm.Content})
+	if err != nil {
+		return nil, err
+	}
+	fragments := [][]byte{base}
+
+	// Only one of the embedded pointers is ever set (see the struct comment), but
+	// appending both keeps this correct if that ever stops holding.
+	if cm.ChatToolMessage != nil {
+		encoded, err := Marshal(cm.ChatToolMessage)
+		if err != nil {
+			return nil, err
+		}
+		fragments = append(fragments, encoded)
+	}
+	if cm.ChatAssistantMessage != nil {
+		encoded, err := Marshal(cm.ChatAssistantMessage)
+		if err != nil {
+			return nil, err
+		}
+		fragments = append(fragments, encoded)
+	}
+
+	return spliceJSONObjects(fragments), nil
+}
+
+// spliceJSONObjects concatenates the bodies of several JSON objects into one,
+// preserving the order the fragments were produced in. Each fragment must be a
+// marshalled object; empty ones contribute nothing.
+func spliceJSONObjects(fragments [][]byte) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	first := true
+	for _, fragment := range fragments {
+		trimmed := bytes.TrimSpace(fragment)
+		if len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
+			continue
+		}
+		body := bytes.TrimSpace(trimmed[1 : len(trimmed)-1])
+		if len(body) == 0 {
+			continue
+		}
+		if !first {
+			buf.WriteByte(',')
+		}
+		buf.Write(body)
+		first = false
+	}
+	buf.WriteByte('}')
+	return buf.Bytes()
 }
 
 // UnmarshalJSON implements custom JSON unmarshalling for ChatMessage.
@@ -1005,9 +1259,10 @@ type ChatMessage struct {
 func (cm *ChatMessage) UnmarshalJSON(data []byte) error {
 	// Unmarshal the base fields directly
 	type baseFields struct {
-		Name    *string             `json:"name,omitempty"`
-		Role    ChatMessageRole     `json:"role,omitempty"`
-		Content *ChatMessageContent `json:"content,omitempty"`
+		Name         *string             `json:"name,omitempty"`
+		Role         ChatMessageRole     `json:"role,omitempty"`
+		Content      *ChatMessageContent `json:"content,omitempty"`
+		CacheControl *CacheControl       `json:"cache_control,omitempty"`
 	}
 	var base baseFields
 	if err := Unmarshal(data, &base); err != nil {
@@ -1023,7 +1278,10 @@ func (cm *ChatMessage) UnmarshalJSON(data []byte) error {
 	if err := Unmarshal(data, &toolMsg); err != nil {
 		return err
 	}
-	if toolMsg.ToolCallID != nil {
+	// Gate on every field the struct carries, not just ToolCallID -- keying on one
+	// field silently makes the others conditional on it, which would drop a tool
+	// message that marks a failure without correlating an id.
+	if toolMsg.ToolCallID != nil || toolMsg.IsError != nil {
 		cm.ChatToolMessage = (*ChatToolMessage)(&toolMsg)
 	}
 
@@ -1035,11 +1293,54 @@ func (cm *ChatMessage) UnmarshalJSON(data []byte) error {
 	// Only set if any field is populated
 	if assistantMsg.Refusal != nil || assistantMsg.Reasoning != nil ||
 		len(assistantMsg.ReasoningDetails) > 0 || len(assistantMsg.Annotations) > 0 ||
-		len(assistantMsg.ToolCalls) > 0 || assistantMsg.Audio != nil {
+		len(assistantMsg.ToolCalls) > 0 || assistantMsg.Audio != nil || len(assistantMsg.Images) > 0 ||
+		len(assistantMsg.Context) > 0 {
 		cm.ChatAssistantMessage = &assistantMsg
 	}
 
+	cm.AttachMessageCacheControl(base.CacheControl)
 	return nil
+}
+
+// AttachMessageCacheControl places a cache_control the client set on the message
+// object (the shape OpenAI-compatible SDKs emit) where every provider converter
+// reads it: the last content block, promoting string content to a single text
+// block, or the last tool call when the message has no content. A block or tool
+// call that already carries its own marker keeps it. Empty string content is left
+// alone, since providers reject a breakpoint on an empty text block, and the marker
+// falls through to the tool calls. Content and tool calls are copied before they
+// are changed, so values shared with the caller are never modified.
+func (cm *ChatMessage) AttachMessageCacheControl(marker *CacheControl) {
+	if marker == nil {
+		return
+	}
+	if cm.Content != nil {
+		if s := cm.Content.ContentStr; s != nil {
+			if *s != "" {
+				cm.Content = &ChatMessageContent{ContentBlocks: []ChatContentBlock{{
+					Type:         ChatContentBlockTypeText,
+					Text:         s,
+					CacheControl: marker,
+				}}}
+				return
+			}
+		} else if n := len(cm.Content.ContentBlocks); n > 0 {
+			if cm.Content.ContentBlocks[n-1].CacheControl == nil {
+				blocks := slices.Clone(cm.Content.ContentBlocks)
+				blocks[n-1].CacheControl = marker
+				cm.Content = &ChatMessageContent{ContentBlocks: blocks}
+			}
+			return
+		}
+	}
+	if cm.ChatAssistantMessage != nil {
+		if n := len(cm.ChatAssistantMessage.ToolCalls); n > 0 && cm.ChatAssistantMessage.ToolCalls[n-1].CacheControl == nil {
+			assistant := *cm.ChatAssistantMessage
+			assistant.ToolCalls = slices.Clone(assistant.ToolCalls)
+			assistant.ToolCalls[n-1].CacheControl = marker
+			cm.ChatAssistantMessage = &assistant
+		}
+	}
 }
 
 // ChatMessageContent represents a content in a message.
@@ -1121,9 +1422,15 @@ type ChatContentBlock struct {
 	CacheControl *CacheControl `json:"cache_control,omitempty"`
 	Citations    *Citations    `json:"citations,omitempty"`
 
+	// PromptCacheBreakpoint marks an explicit prompt-cache breakpoint on this block (OpenAI gpt-5.6+).
+	PromptCacheBreakpoint *PromptCacheBreakpoint `json:"prompt_cache_breakpoint,omitempty"`
+
 	// CachePoint is a Bedrock-specific field for standalone cache point blocks
 	// When present without other content, this indicates a cache point marker
 	CachePoint *CachePoint `json:"cachePoint,omitempty"`
+
+	// GuardContent marks this text or image block for selective guardrail evaluation (Bedrock).
+	GuardContent *GuardContent `json:"guard_content,omitempty"`
 }
 
 // UnmarshalJSON normalizes Anthropic-style document content blocks
@@ -1224,7 +1531,8 @@ func rewriteDocumentBlock(data []byte) ([]byte, error) {
 
 // CachePoint represents a cache point marker (Bedrock-specific)
 type CachePoint struct {
-	Type string `json:"type"` // "default"
+	Type string  `json:"type"`          // "default"
+	TTL  *string `json:"ttl,omitempty"` // "5m" | "1h"
 }
 
 type CacheControlType string
@@ -1338,7 +1646,8 @@ type ChatMCPServer struct {
 
 // ChatInputImage represents image data in a message.
 type ChatInputImage struct {
-	URL    string  `json:"url"`
+	URL    string  `json:"url,omitempty"`
+	FileID *string `json:"file_id,omitempty"` // Reference to an uploaded file (in place of URL)
 	Detail *string `json:"detail,omitempty"`
 }
 
@@ -1362,16 +1671,73 @@ type ChatInputFile struct {
 // ChatToolMessage represents a tool message in a chat conversation.
 type ChatToolMessage struct {
 	ToolCallID *string `json:"tool_call_id,omitempty"`
+	// IsError marks the tool execution as failed. Not part of the OpenAI wire
+	// format — converters for providers whose wire supports an error marker map
+	// it (Anthropic tool_result.is_error, Bedrock toolResult.status), and
+	// OpenAI-wire converters strip it before serialization so providers that
+	// reject unknown message parameters never see it.
+	IsError *bool `json:"is_error,omitempty"`
+
+	mcpResult        *mcp.CallToolResult // the MCP server's own result; see SetMCPResult
+	mcpResultIsText  bool                // whether the content made from it is mcpResultText
+	mcpResultText    string              // that text, copied so in-place edits show
+	mcpResultContent []string            // else its content blocks, as toolContentFields lists them
 }
 
 // ChatAssistantMessage represents a message in a chat conversation.
 type ChatAssistantMessage struct {
-	Refusal          *string                          `json:"refusal,omitempty"`
+	Refusal          *string                          `json:"refusal"`
 	Audio            *ChatAudioMessageAudio           `json:"audio,omitempty"`
+	Images           []ChatAssistantMessageImage      `json:"images,omitempty"`
 	Reasoning        *string                          `json:"reasoning,omitempty"`
 	ReasoningDetails []ChatReasoningDetails           `json:"reasoning_details,omitempty"`
 	Annotations      []ChatAssistantMessageAnnotation `json:"annotations,omitempty"`
 	ToolCalls        []ChatAssistantMessageToolCall   `json:"tool_calls,omitempty"`
+	Context          json.RawMessage                  `json:"context,omitempty"` // Azure On Your Data citations and intent, passed through untouched
+}
+
+// MarshalJSON emits reasoning under both spellings the ecosystem uses.
+//
+// OpenRouter defines them as interchangeable: reasoning text "will appear in the
+// `reasoning` field of each message", and "you can also use `reasoning_content`
+// as an alias - it functions identically to `reasoning`"
+// (https://openrouter.ai/docs/use-cases/reasoning-tokens). DeepSeek and xAI spell
+// it reasoning_content; OpenRouter-shaped clients read reasoning. UnmarshalJSON
+// below already accepts either on the way in, so emitting only one on the way out
+// left a client written against the other spelling seeing no reasoning at all -
+// the text was present the whole time, under a key it never looked at.
+//
+// The alias is derived from Reasoning at marshal time rather than stored, so the
+// two can never disagree, and a message with no reasoning gains no empty key.
+//
+// This does NOT reach provider requests. The outbound OpenAI-family wire type is
+// openai.OpenAIChatAssistantMessage, which has its own field set (and already
+// spells the outbound field reasoning_content); the other providers build their
+// own message types. This type is the internal/response shape.
+//
+// NOTE: ChatMessage embeds *ChatAssistantMessage, and Go promotes an embedded
+// type's MarshalJSON to the outer struct - so ChatMessage carries its own
+// MarshalJSON to stop this one swallowing role/content/name. Same reason
+// ChatMessage.UnmarshalJSON exists. Do not remove one without the other.
+func (cm ChatAssistantMessage) MarshalJSON() ([]byte, error) {
+	type Alias ChatAssistantMessage
+	if wire := customToolCallsWire(cm.ToolCalls); wire != nil {
+		return Marshal(struct {
+			Alias
+			ToolCalls        []customToolCallWire `json:"tool_calls,omitempty"`
+			ReasoningContent *string              `json:"reasoning_content,omitempty"`
+		}{Alias: Alias(cm), ToolCalls: wire, ReasoningContent: cm.Reasoning})
+	}
+	if cm.Reasoning == nil {
+		return Marshal(Alias(cm))
+	}
+	return Marshal(struct {
+		Alias
+		ReasoningContent *string `json:"reasoning_content,omitempty"`
+	}{
+		Alias:            Alias(cm),
+		ReasoningContent: cm.Reasoning,
+	})
 }
 
 // UnmarshalJSON implements custom unmarshalling for ChatAssistantMessage.
@@ -1397,11 +1763,25 @@ func (cm *ChatAssistantMessage) UnmarshalJSON(data []byte) error {
 
 	// Copy decoded data back into the original type
 	*cm = ChatAssistantMessage(aux.Alias)
+	// The raw context may alias the decoder's input buffer, which a provider can reuse.
+	if len(cm.Context) > 0 {
+		cm.Context = bytes.Clone(cm.Context)
+	}
 
 	// Map xAI's reasoning_content to Bifrost's Reasoning field
 	// This allows both OpenAI's "reasoning" and xAI's "reasoning_content" to work
 	if aux.ReasoningContent != nil && cm.Reasoning == nil {
 		cm.Reasoning = aux.ReasoningContent
+	}
+
+	// DeepSeek-shaped upstreams (ModelScope) keep sending empty reasoning fields
+	// on every content-phase frame once thinking has ended. Folding "" into a
+	// non-nil Reasoning made MarshalJSON re-emit it under both spellings and
+	// synthesize an empty details entry below, which reasoning-aware clients
+	// render as a fresh thinking block per chunk (#7294). Empty means absent.
+	cm.ReasoningDetails = pruneEmptyReasoningDetails(cm.ReasoningDetails)
+	if cm.Reasoning != nil && *cm.Reasoning == "" {
+		cm.Reasoning = nil
 	}
 
 	// If Reasoning is present and there are no reasoning_details,
@@ -1420,6 +1800,43 @@ func (cm *ChatAssistantMessage) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// pruneEmptyReasoningDetails drops reasoning detail entries that carry no
+// payload at all: no text, summary, signature, or data. An entry with empty
+// text but a signature (or summary/data) is payload, not noise, and survives.
+// Returns the input slice untouched when nothing prunes; nil when nothing
+// survives, so len()==0 checks and omitempty both see absence (#7294).
+func pruneEmptyReasoningDetails(details []ChatReasoningDetails) []ChatReasoningDetails {
+	isEmpty := func(d ChatReasoningDetails) bool {
+		return (d.Text == nil || *d.Text == "") && d.Summary == nil && d.Signature == nil && d.Data == nil
+	}
+	needsPrune := false
+	for _, d := range details {
+		if isEmpty(d) {
+			needsPrune = true
+			break
+		}
+	}
+	if !needsPrune {
+		return details
+	}
+	kept := make([]ChatReasoningDetails, 0, len(details))
+	for _, d := range details {
+		if !isEmpty(d) {
+			kept = append(kept, d)
+		}
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	return kept
+}
+
+// ChatAssistantMessageImage is a model-generated image, in OpenRouter's message.images shape.
+type ChatAssistantMessageImage struct {
+	Type     string         `json:"type"`
+	ImageURL ChatInputImage `json:"image_url"`
+}
+
 // ChatAssistantMessageAnnotation represents an annotation in a response.
 type ChatAssistantMessageAnnotation struct {
 	Type        string                                 `json:"type"`
@@ -1432,22 +1849,63 @@ type ChatAssistantMessageAnnotationCitation struct {
 	EndIndex   int          `json:"end_index"`
 	Title      string       `json:"title"`
 	URL        *string      `json:"url,omitempty"`
+	Text       *string      `json:"text,omitempty"` // Cited text snippet (Bifrost extension; stripped on the OpenAI wire)
 	Sources    *interface{} `json:"sources,omitempty"`
 	Type       *string      `json:"type,omitempty"`
 }
 
-// ChatAssistantMessageToolCall represents a tool call in a message
+// ChatAssistantMessageToolCall represents a tool call in a message.
+// ExtraContent preserves provider-specific metadata (e.g. Gemini's
+// thought_signature for multi-turn continuation when extended thinking
+// is active). Stored as json.RawMessage so unknown nested fields are
+// forwarded verbatim through any proxy/gateway layer without loss.
 type ChatAssistantMessageToolCall struct {
-	Index    uint16                               `json:"index"`
-	Type     *string                              `json:"type,omitempty"`
-	ID       *string                              `json:"id,omitempty"`
-	Function ChatAssistantMessageToolCallFunction `json:"function"`
+	Index        uint16                               `json:"index"`
+	Type         *string                              `json:"type,omitempty"`
+	ID           *string                              `json:"id,omitempty"`
+	Function     ChatAssistantMessageToolCallFunction `json:"function"`
+	Custom       *ChatAssistantMessageToolCallCustom  `json:"custom,omitempty"` // set for type "custom"; Function is then omitted on the wire
+	ExtraContent json.RawMessage                      `json:"extra_content,omitempty"`
+	CacheControl *CacheControl                        `json:"cache_control,omitempty"` // Anthropic-family cache breakpoint on the tool_use block
+}
+
+// customToolCallWire encodes a tool call without its function object when it is a custom call.
+// Only messages that carry a custom call pay for it; see customToolCallsWire.
+type customToolCallWire ChatAssistantMessageToolCall
+
+func (tc customToolCallWire) MarshalJSON() ([]byte, error) {
+	type Alias customToolCallWire
+	if tc.Custom == nil {
+		return Marshal(Alias(tc))
+	}
+	return Marshal(struct {
+		Alias
+		Function *ChatAssistantMessageToolCallFunction `json:"function,omitempty"`
+	}{Alias: Alias(tc)})
+}
+
+// customToolCallsWire returns calls as wire values when any is a custom call, else nil.
+func customToolCallsWire(calls []ChatAssistantMessageToolCall) []customToolCallWire {
+	if !slices.ContainsFunc(calls, func(tc ChatAssistantMessageToolCall) bool { return tc.Custom != nil }) {
+		return nil
+	}
+	wire := make([]customToolCallWire, len(calls))
+	for i, tc := range calls {
+		wire[i] = customToolCallWire(tc)
+	}
+	return wire
+}
+
+// ChatAssistantMessageToolCallCustom is a call to a custom (freeform) tool.
+type ChatAssistantMessageToolCallCustom struct {
+	Name  *string `json:"name,omitempty"` // omitted on streaming continuation deltas
+	Input string  `json:"input"`
 }
 
 // ChatAssistantMessageToolCallFunction represents a call to a function.
 type ChatAssistantMessageToolCallFunction struct {
-	Name      *string `json:"name"`
-	Arguments string  `json:"arguments"` // stringified json as retured by OpenAI, might not be a valid JSON always
+	Name      *string `json:"name,omitempty"` // omitted on streaming continuation deltas; strict clients reject an explicit null (issue #5900)
+	Arguments string  `json:"arguments"`      // stringified json as retured by OpenAI, might not be a valid JSON always
 }
 
 // ChatAudioMessageAudio represents audio data in a message.
@@ -1463,9 +1921,10 @@ type ChatAudioMessageAudio struct {
 // IMPORTANT: Only one of TextCompletionResponseChoice, NonStreamResponseChoice or StreamResponseChoice
 // should be non-nil at a time.
 type BifrostResponseChoice struct {
-	Index        int              `json:"index"`
-	FinishReason *string          `json:"finish_reason,omitempty"`
-	LogProbs     *BifrostLogProbs `json:"logprobs,omitempty"`
+	Index                int              `json:"index"`
+	FinishReason         *string          `json:"finish_reason"`
+	LogProbs             *BifrostLogProbs `json:"logprobs"`
+	ContentFilterResults json.RawMessage  `json:"content_filter_results,omitempty"` // Azure content-filter annotations for this choice, passed through untouched
 
 	*TextCompletionResponseChoice
 	*ChatNonStreamResponseChoice
@@ -1491,7 +1950,12 @@ const (
 	BifrostServiceTierDefault     BifrostServiceTier = "default"
 	BifrostServiceTierFlex        BifrostServiceTier = "flex"
 	BifrostServiceTierPriority    BifrostServiceTier = "priority"
+	BifrostServiceTierUltrafast   BifrostServiceTier = "ultrafast"
 	BifrostServiceTierProvisioned BifrostServiceTier = "provisioned"
+	// BifrostServiceTierFast is OpenAI Fast mode, the Priority tier renamed on
+	// 2026-07-30. OpenAI accepts "priority" and "fast" interchangeably and bills
+	// both at the same rates, so the two values share the priority pricing columns.
+	BifrostServiceTierFast BifrostServiceTier = "fast"
 )
 
 type BifrostReasoningDetailsType string
@@ -1539,13 +2003,46 @@ type ChatStreamResponseChoice struct {
 
 // ChatStreamResponseChoiceDelta represents a delta in the stream response
 type ChatStreamResponseChoiceDelta struct {
-	Role             *string                        `json:"role,omitempty"`      // Only in the first chunk
-	Content          *string                        `json:"content,omitempty"`   // May be empty string or null
-	Refusal          *string                        `json:"refusal,omitempty"`   // Refusal content if any
-	Audio            *ChatAudioMessageAudio         `json:"audio,omitempty"`     // Audio data if any
-	Reasoning        *string                        `json:"reasoning,omitempty"` // May be empty string or null
-	ReasoningDetails []ChatReasoningDetails         `json:"reasoning_details,omitempty"`
-	ToolCalls        []ChatAssistantMessageToolCall `json:"tool_calls,omitempty"` // If tool calls used (supports incremental updates)
+	Role             *string                          `json:"role,omitempty"`      // Only in the first chunk
+	Content          *string                          `json:"content,omitempty"`   // May be empty string or null
+	Refusal          *string                          `json:"refusal,omitempty"`   // Refusal content if any
+	Audio            *ChatAudioMessageAudio           `json:"audio,omitempty"`     // Audio data if any
+	Images           []ChatAssistantMessageImage      `json:"images,omitempty"`    // Generated images, whole per chunk
+	Reasoning        *string                          `json:"reasoning,omitempty"` // May be empty string or null
+	ReasoningDetails []ChatReasoningDetails           `json:"reasoning_details,omitempty"`
+	Annotations      []ChatAssistantMessageAnnotation `json:"annotations,omitempty"`   // URL citations from web search
+	ToolCalls        []ChatAssistantMessageToolCall   `json:"tool_calls,omitempty"`    // If tool calls used (supports incremental updates)
+	ExtraContent     json.RawMessage                  `json:"extra_content,omitempty"` // Provider-specific metadata (e.g. Gemini thought markers, thought_signature)
+	Context          json.RawMessage                  `json:"context,omitempty"`       // Azure On Your Data citations and intent, passed through untouched
+}
+
+// MarshalJSON emits reasoning under both spellings, matching
+// ChatAssistantMessage.MarshalJSON. See that method for why the alias exists.
+//
+// Streaming needs this independently of the non-streaming path: DeepSeek streams
+// its thinking phase under reasoning_content, so a client written against that
+// wire watched a Bifrost stream emit the entire reasoning phase under a key it
+// never read. Unlike ChatAssistantMessage this type is not embedded anywhere, so
+// no companion marshaller is required.
+func (d ChatStreamResponseChoiceDelta) MarshalJSON() ([]byte, error) {
+	type Alias ChatStreamResponseChoiceDelta
+	if wire := customToolCallsWire(d.ToolCalls); wire != nil {
+		return Marshal(struct {
+			Alias
+			ToolCalls        []customToolCallWire `json:"tool_calls,omitempty"`
+			ReasoningContent *string              `json:"reasoning_content,omitempty"`
+		}{Alias: Alias(d), ToolCalls: wire, ReasoningContent: d.Reasoning})
+	}
+	if d.Reasoning == nil {
+		return Marshal(Alias(d))
+	}
+	return Marshal(struct {
+		Alias
+		ReasoningContent *string `json:"reasoning_content,omitempty"`
+	}{
+		Alias:            Alias(d),
+		ReasoningContent: d.Reasoning,
+	})
 }
 
 // UnmarshalJSON implements custom unmarshalling for ChatStreamResponseChoiceDelta.
@@ -1567,11 +2064,24 @@ func (d *ChatStreamResponseChoiceDelta) UnmarshalJSON(data []byte) error {
 
 	// Copy decoded data back into the original type
 	*d = ChatStreamResponseChoiceDelta(aux.Alias)
+	// Stream frames come out of a reused scanner buffer, so the raw context is copied.
+	if len(d.Context) > 0 {
+		d.Context = bytes.Clone(d.Context)
+	}
 
 	// Map xAI's reasoning_content to Bifrost's Reasoning field
 	// This allows both OpenAI's "reasoning" and xAI's "reasoning_content" to work
 	if aux.ReasoningContent != nil && d.Reasoning == nil {
 		d.Reasoning = aux.ReasoningContent
+	}
+
+	// Same normalization as ChatAssistantMessage.UnmarshalJSON above: an empty
+	// reasoning string on a content-phase delta is upstream noise, and
+	// re-emitting it (plus a synthesized empty details entry) opened a fresh
+	// thinking block per chunk in reasoning-aware clients (#7294).
+	d.ReasoningDetails = pruneEmptyReasoningDetails(d.ReasoningDetails)
+	if d.Reasoning != nil && *d.Reasoning == "" {
+		d.Reasoning = nil
 	}
 
 	// If Reasoning is present and there are no reasoning_details,
@@ -1606,13 +2116,143 @@ type ContentLogProb struct {
 }
 
 // BifrostLLMUsage represents token usage information
+// TokenUsageEstimation identifies locally estimated fields of interrupted usage.
+// Provider-reported fields and successfully completed responses are unchanged.
+type TokenUsageEstimation struct {
+	Prompt     bool   `json:"prompt,omitempty"`
+	Completion bool   `json:"completion,omitempty"`
+	Tokenizer  string `json:"tokenizer"`
+}
+
 type BifrostLLMUsage struct {
+	Estimation              *TokenUsageEstimation        `json:"estimation,omitempty"`
 	PromptTokens            int                          `json:"prompt_tokens,omitempty"`
 	PromptTokensDetails     *ChatPromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
 	CompletionTokens        int                          `json:"completion_tokens,omitempty"`
 	CompletionTokensDetails *ChatCompletionTokensDetails `json:"completion_tokens_details,omitempty"`
+	ReasoningTokens         int                          `json:"reasoning_tokens,omitempty"` // SGLang's top-level spelling; folded by NormalizeReasoningTokens
 	TotalTokens             int                          `json:"total_tokens"`
-	Cost                    *BifrostCost                 `json:"cost,omitempty"` // Only for the providers which support cost calculation
+	// AudioSeconds carries duration-based audio usage when a provider reports
+	// seconds instead of tokens.
+	AudioSeconds *float64 `json:"audio_seconds,omitempty"`
+	// SearchUnits is the billable unit for rerank: Cohere and Bedrock both define one unit as
+	// a single query against up to 100 document chunks, so a request over that many chunks
+	// bills as several. Distinct from ChatCompletionTokensDetails.NumSearchQueries, which
+	// counts web-search calls made during a chat turn.
+	SearchUnits *int         `json:"search_units,omitempty"`
+	ToolUsage   *ToolUsage   `json:"tool_usage,omitempty"`
+	Cost        *BifrostCost `json:"cost,omitempty"` // Only for the providers which support cost calculation
+	// xAI-specific usage field, normalized into Cost by NormalizeProviderCost.
+	CostInUsdTicks *int64 `json:"cost_in_usd_ticks,omitempty"`
+	// Laya decision usage: state token accounting and truncation, reported on /v1/decisions.
+	StateTokens        *int     `json:"state_tokens,omitempty"`
+	StateTokensDropped *int     `json:"state_tokens_dropped,omitempty"`
+	Truncated          *bool    `json:"truncated,omitempty"`
+	TruncatedQuestions []string `json:"truncated_questions,omitempty"`
+	// Served Anthropic tier (fast mode / data residency), carried internally so
+	// cancel/timeout billing (which reads a bare usage via BilledUsage) can apply
+	// the tier multiplier. json:"-" keeps them out of every serialized usage payload.
+	Speed        *string `json:"-"`
+	InferenceGeo *string `json:"-"`
+	// Model that actually served the turn after a server-side fallback handoff.
+	// Carried here for the same reason as the two above: the bare-usage billing path
+	// (CalculateCostForUsage) never sees RoutingInfo, so without it a fallback-served
+	// turn is priced at the requested model's rates.
+	ServerSideFallbackModel *string                  `json:"-"`
+	Iterations              []ResponsesResponseUsage `json:"-"` // Anthropic per-pass usage, so an interrupted stream still bills its advisor passes
+
+	PromptTokensExplicitZero     bool `json:"-"` // Completion wire: zero was reported, not missing/null.
+	CompletionTokensExplicitZero bool `json:"-"` // Completion wire: zero was reported, not missing/null.
+}
+
+// PreserveTokenCountZeros records numeric zeros at the given JSON field paths.
+// Used when decoding completion responses from providers or cached snapshots.
+// Nil/nonzero usage needs no JSON lookup; no response buffer is retained.
+func (u *BifrostLLMUsage) PreserveTokenCountZeros(data []byte, promptPath, completionPath string) {
+	if u == nil {
+		return
+	}
+	u.PromptTokensExplicitZero = false
+	u.CompletionTokensExplicitZero = false
+	if u.PromptTokens != 0 && u.CompletionTokens != 0 {
+		return
+	}
+	// Sibling paths (every caller's "usage.*") scan the body once for the parent
+	// object, then read both keys from that small sub-document. The string view
+	// avoids copying data; no result outlives this call.
+	promptParent, promptKey := splitJSONFieldPath(promptPath)
+	completionParent, completionKey := splitJSONFieldPath(completionPath)
+	if promptParent != "" && promptParent == completionParent {
+		parent := gjson.Get(unsafe.String(unsafe.SliceData(data), len(data)), promptParent)
+		if !parent.IsObject() {
+			return
+		}
+		if u.PromptTokens == 0 {
+			u.PromptTokensExplicitZero = isJSONNumberZero(gjson.Get(parent.Raw, promptKey))
+		}
+		if u.CompletionTokens == 0 {
+			u.CompletionTokensExplicitZero = isJSONNumberZero(gjson.Get(parent.Raw, completionKey))
+		}
+		return
+	}
+	if u.PromptTokens == 0 {
+		u.PromptTokensExplicitZero = isJSONNumberZero(gjson.GetBytes(data, promptPath))
+	}
+	if u.CompletionTokens == 0 {
+		u.CompletionTokensExplicitZero = isJSONNumberZero(gjson.GetBytes(data, completionPath))
+	}
+}
+
+// splitJSONFieldPath splits a plain dotted gjson path into parent and last key.
+// Paths with escapes or no parent return an empty parent so callers look up the full path.
+func splitJSONFieldPath(path string) (parent, key string) {
+	idx := strings.LastIndexByte(path, '.')
+	if idx <= 0 || strings.IndexByte(path, '\\') >= 0 {
+		return "", path
+	}
+	return path[:idx], path[idx+1:]
+}
+
+func isJSONNumberZero(value gjson.Result) bool {
+	return value.Type == gjson.Number && value.Num == 0
+}
+
+// completionUsage preserves prompt/completion presence; total_tokens serialization is unchanged.
+type completionUsage struct {
+	*BifrostLLMUsage
+	PromptTokens     *int `json:"prompt_tokens,omitempty"`
+	CompletionTokens *int `json:"completion_tokens,omitempty"`
+}
+
+func (u *BifrostLLMUsage) hasExplicitZeroTokens() bool {
+	return u != nil && ((u.PromptTokensExplicitZero && u.PromptTokens == 0) ||
+		(u.CompletionTokensExplicitZero && u.CompletionTokens == 0))
+}
+
+func (u *BifrostLLMUsage) completionWireUsage() completionUsage {
+	wire := completionUsage{BifrostLLMUsage: u}
+	if u.PromptTokens != 0 || u.PromptTokensExplicitZero {
+		wire.PromptTokens = &u.PromptTokens
+	}
+	if u.CompletionTokens != 0 || u.CompletionTokensExplicitZero {
+		wire.CompletionTokens = &u.CompletionTokens
+	}
+	return wire
+}
+
+// NormalizeReasoningTokens folds a top-level reasoning_tokens into CompletionTokensDetails, keeping a nested value if set.
+// (sglang sets reasoning tokens in usage.reasoning_tokens instead of usage.completion_tokens_details.reasoning_tokens).
+func (u *BifrostLLMUsage) NormalizeReasoningTokens() {
+	if u == nil || u.ReasoningTokens == 0 {
+		return
+	}
+	if u.CompletionTokensDetails == nil {
+		u.CompletionTokensDetails = &ChatCompletionTokensDetails{}
+	}
+	if u.CompletionTokensDetails.ReasoningTokens == 0 {
+		u.CompletionTokensDetails.ReasoningTokens = u.ReasoningTokens
+	}
+	u.ReasoningTokens = 0
 }
 
 type ChatPromptTokensDetails struct {
@@ -1624,11 +2264,17 @@ type ChatPromptTokensDetails struct {
 	CachedReadTokens        int                          `json:"cached_read_tokens,omitempty"`
 	CachedWriteTokens       int                          `json:"cached_write_tokens,omitempty"`
 	CachedWriteTokenDetails *ChatCachedWriteTokenDetails `json:"cached_write_token_details,omitempty"`
+
+	// Parts of AudioTokens that Azure Voice Live handled with Azure Speech, which it bills at their own rates.
+	StandardSpeechAudioTokens int `json:"standard_speech_audio_tokens,omitempty"`
+	CustomSpeechAudioTokens   int `json:"custom_speech_audio_tokens,omitempty"`
 }
 
 type ChatCachedWriteTokenDetails struct {
-	CachedWriteTokens5m int `json:"cached_write_tokens_5m"`
-	CachedWriteTokens1h int `json:"cached_write_tokens_1h"`
+	CachedWriteTokens5m  int `json:"cached_write_tokens_5m"`
+	CachedWriteTokens1h  int `json:"cached_write_tokens_1h"`
+	CachedWriteTokens30m int `json:"cached_write_tokens_30m"` // OpenAI gpt-5.6+ ttl_30m_tokens
+	CachedWriteTokens12h int `json:"cached_write_tokens_12h"` // OpenAI gpt-5.6+ ttl_12h_tokens
 }
 
 // UnmarshalJSON maps OpenAI's cached_tokens into CachedReadTokens for compatibility.
@@ -1641,6 +2287,10 @@ func (d *ChatPromptTokensDetails) UnmarshalJSON(data []byte) error {
 		CachedWriteTokens       int                          `json:"cached_write_tokens"`
 		CachedWriteTokenDetails *ChatCachedWriteTokenDetails `json:"cached_write_token_details"`
 		CachedTokens            *int                         `json:"cached_tokens"`
+		CacheWriteTokens        *int                         `json:"cache_write_tokens"`
+
+		StandardSpeechAudioTokens int `json:"standard_speech_audio_tokens"`
+		CustomSpeechAudioTokens   int `json:"custom_speech_audio_tokens"`
 	}
 	if err := Unmarshal(data, &raw); err != nil {
 		return err
@@ -1651,14 +2301,22 @@ func (d *ChatPromptTokensDetails) UnmarshalJSON(data []byte) error {
 	d.CachedReadTokens = raw.CachedReadTokens
 	d.CachedWriteTokens = raw.CachedWriteTokens
 	d.CachedWriteTokenDetails = raw.CachedWriteTokenDetails
+	d.StandardSpeechAudioTokens = raw.StandardSpeechAudioTokens
+	d.CustomSpeechAudioTokens = raw.CustomSpeechAudioTokens
 	// OpenAI spec providers send just cached_tokens, not separate read and write tokens and we handle them as read tokens in pricing calculations.
 	if raw.CachedTokens != nil && raw.CachedReadTokens == 0 && raw.CachedWriteTokens == 0 {
 		d.CachedReadTokens = *raw.CachedTokens
 	}
+	// OpenAI's Responses API reports cache writes under cache_write_tokens (distinct from Bifrost's cached_write_tokens).
+	if raw.CacheWriteTokens != nil && d.CachedWriteTokens == 0 {
+		d.CachedWriteTokens = *raw.CacheWriteTokens
+	}
 	return nil
 }
 
-// MarshalJSON emits cached_tokens (read+write) alongside the individual fields for OpenAI spec compatibility.
+// MarshalJSON emits cached_tokens (reads only, per the OpenAI spec and mirroring UnmarshalJSON above) alongside the individual fields.
+// Cache writes are reported separately via cached_write_tokens and are excluded from cached_tokens so that
+// OpenAI-spec consumers do not price cache writes as cache reads.
 func (d ChatPromptTokensDetails) MarshalJSON() ([]byte, error) {
 	type raw struct {
 		TextTokens              int                          `json:"text_tokens,omitempty"`
@@ -1668,6 +2326,12 @@ func (d ChatPromptTokensDetails) MarshalJSON() ([]byte, error) {
 		CachedWriteTokens       int                          `json:"cached_write_tokens,omitempty"`
 		CachedWriteTokenDetails *ChatCachedWriteTokenDetails `json:"cached_write_token_details,omitempty"`
 		CachedTokens            int                          `json:"cached_tokens"`
+		// OpenAI's field name for cache writes (mirrors cached_tokens for reads) so the
+		// OpenAI SDK — which reads cache_write_tokens, not cached_write_tokens — finds it.
+		CacheWriteTokens int `json:"cache_write_tokens"`
+
+		StandardSpeechAudioTokens int `json:"standard_speech_audio_tokens,omitempty"`
+		CustomSpeechAudioTokens   int `json:"custom_speech_audio_tokens,omitempty"`
 	}
 	return MarshalSorted(raw{
 		TextTokens:              d.TextTokens,
@@ -1676,7 +2340,11 @@ func (d ChatPromptTokensDetails) MarshalJSON() ([]byte, error) {
 		CachedReadTokens:        d.CachedReadTokens,
 		CachedWriteTokens:       d.CachedWriteTokens,
 		CachedWriteTokenDetails: d.CachedWriteTokenDetails,
-		CachedTokens:            d.CachedReadTokens + d.CachedWriteTokens,
+		CachedTokens:            d.CachedReadTokens,
+		CacheWriteTokens:        d.CachedWriteTokens,
+
+		StandardSpeechAudioTokens: d.StandardSpeechAudioTokens,
+		CustomSpeechAudioTokens:   d.CustomSpeechAudioTokens,
 	})
 }
 
@@ -1685,23 +2353,445 @@ type ChatCompletionTokensDetails struct {
 	AcceptedPredictionTokens int  `json:"accepted_prediction_tokens,omitempty"`
 	AudioTokens              int  `json:"audio_tokens,omitempty"`
 	CitationTokens           *int `json:"citation_tokens,omitempty"`
+	// Deprecated: use BifrostLLMUsage.ToolUsage.WebSearch. Populated, will be removed in 3.0.0.
 	NumSearchQueries         *int `json:"num_search_queries,omitempty"`
 	ReasoningTokens          int  `json:"reasoning_tokens,omitempty"`
 	ImageTokens              *int `json:"image_tokens,omitempty"`
 	RejectedPredictionTokens int  `json:"rejected_prediction_tokens,omitempty"`
+
+	// Parts of AudioTokens that Azure Voice Live handled with Azure Speech, which it bills at their own rates.
+	StandardSpeechAudioTokens int `json:"standard_speech_audio_tokens,omitempty"`
+	CustomSpeechAudioTokens   int `json:"custom_speech_audio_tokens,omitempty"`
 }
 
+// BifrostCost splits a request's cost into an input side, an output side, and an
+// additional side, each with an optional per-category detail breakdown, mirroring
+// the token-usage shape (BifrostLLMUsage's PromptTokens/PromptTokensDetails +
+// CompletionTokens/CompletionTokensDetails). InputCost + OutputCost +
+// AdditionalCost == TotalCost. Flat, non-token request costs (per-request
+// surcharge, OCR per-page, container per-session) fold into the input side as
+// InputCostDetails.RequestCost. Internal sidecar costs that map to no token
+// category (guardrail judge calls, MCP tool executions, semantic cache embedding
+// lookups) go on the additional side as AdditionalCostDetails.
 type BifrostCost struct {
-	InputTokensCost     float64 `json:"input_tokens_cost,omitempty"`
-	OutputTokensCost    float64 `json:"output_tokens_cost,omitempty"`
-	ReasoningTokensCost float64 `json:"reasoning_tokens_cost,omitempty"`
-	CitationTokensCost  float64 `json:"citation_tokens_cost,omitempty"`
-	SearchQueriesCost   float64 `json:"search_queries_cost,omitempty"`
-	RequestCost         float64 `json:"request_cost,omitempty"`
-	TotalCost           float64 `json:"total_cost,omitempty"`
+	InputCost             float64                `json:"input_cost,omitempty"`
+	InputCostDetails      *InputCostDetails      `json:"input_cost_details,omitempty"`
+	OutputCost            float64                `json:"output_cost,omitempty"`
+	OutputCostDetails     *OutputCostDetails     `json:"output_cost_details,omitempty"`
+	AdditionalCost        float64                `json:"additional_cost,omitempty"`
+	AdditionalCostDetails *AdditionalCostDetails `json:"additional_cost_details,omitempty"`
+	TotalCost             float64                `json:"total_cost,omitempty"`
 }
 
-// UnmarshalJSON implements custom JSON unmarshalling for BifrostCost.
+// MergeBifrostLLMUsage returns a usage value containing the sum of base and add.
+// Nil inputs are treated as absent values; if both inputs are nil, nil is returned.
+func MergeBifrostLLMUsage(base, add *BifrostLLMUsage) *BifrostLLMUsage {
+	if add == nil {
+		return base
+	}
+	if base == nil {
+		return add
+	}
+
+	merged := &BifrostLLMUsage{
+		PromptTokens:     base.PromptTokens + add.PromptTokens,
+		CompletionTokens: base.CompletionTokens + add.CompletionTokens,
+		TotalTokens:      base.TotalTokens + add.TotalTokens,
+		// A sum is known to be zero only if both contributing turns reported
+		// zero. An unreported count in either turn must not become a known zero.
+		PromptTokensExplicitZero:     base.PromptTokensExplicitZero && add.PromptTokensExplicitZero,
+		CompletionTokensExplicitZero: base.CompletionTokensExplicitZero && add.CompletionTokensExplicitZero,
+	}
+
+	if base.PromptTokensDetails != nil || add.PromptTokensDetails != nil {
+		baseDetails := base.PromptTokensDetails
+		addDetails := add.PromptTokensDetails
+		if baseDetails == nil {
+			baseDetails = &ChatPromptTokensDetails{}
+		}
+		if addDetails == nil {
+			addDetails = &ChatPromptTokensDetails{}
+		}
+		merged.PromptTokensDetails = &ChatPromptTokensDetails{
+			TextTokens:        baseDetails.TextTokens + addDetails.TextTokens,
+			AudioTokens:       baseDetails.AudioTokens + addDetails.AudioTokens,
+			ImageTokens:       baseDetails.ImageTokens + addDetails.ImageTokens,
+			CachedReadTokens:  baseDetails.CachedReadTokens + addDetails.CachedReadTokens,
+			CachedWriteTokens: baseDetails.CachedWriteTokens + addDetails.CachedWriteTokens,
+
+			StandardSpeechAudioTokens: baseDetails.StandardSpeechAudioTokens + addDetails.StandardSpeechAudioTokens,
+			CustomSpeechAudioTokens:   baseDetails.CustomSpeechAudioTokens + addDetails.CustomSpeechAudioTokens,
+		}
+		if baseDetails.CachedWriteTokenDetails != nil || addDetails.CachedWriteTokenDetails != nil {
+			merged.PromptTokensDetails.CachedWriteTokenDetails = &ChatCachedWriteTokenDetails{
+				CachedWriteTokens5m: cachedWriteTokens5m(baseDetails) + cachedWriteTokens5m(addDetails),
+				CachedWriteTokens1h: cachedWriteTokens1h(baseDetails) + cachedWriteTokens1h(addDetails),
+			}
+			for _, d := range []*ChatCachedWriteTokenDetails{baseDetails.CachedWriteTokenDetails, addDetails.CachedWriteTokenDetails} {
+				if d != nil {
+					merged.PromptTokensDetails.CachedWriteTokenDetails.CachedWriteTokens30m += d.CachedWriteTokens30m
+					merged.PromptTokensDetails.CachedWriteTokenDetails.CachedWriteTokens12h += d.CachedWriteTokens12h
+				}
+			}
+		}
+	}
+
+	if base.CompletionTokensDetails != nil || add.CompletionTokensDetails != nil {
+		baseDetails := base.CompletionTokensDetails
+		addDetails := add.CompletionTokensDetails
+		if baseDetails == nil {
+			baseDetails = &ChatCompletionTokensDetails{}
+		}
+		if addDetails == nil {
+			addDetails = &ChatCompletionTokensDetails{}
+		}
+		merged.CompletionTokensDetails = &ChatCompletionTokensDetails{
+			TextTokens:               baseDetails.TextTokens + addDetails.TextTokens,
+			AcceptedPredictionTokens: baseDetails.AcceptedPredictionTokens + addDetails.AcceptedPredictionTokens,
+			AudioTokens:              baseDetails.AudioTokens + addDetails.AudioTokens,
+			ReasoningTokens:          baseDetails.ReasoningTokens + addDetails.ReasoningTokens,
+			RejectedPredictionTokens: baseDetails.RejectedPredictionTokens + addDetails.RejectedPredictionTokens,
+
+			StandardSpeechAudioTokens: baseDetails.StandardSpeechAudioTokens + addDetails.StandardSpeechAudioTokens,
+			CustomSpeechAudioTokens:   baseDetails.CustomSpeechAudioTokens + addDetails.CustomSpeechAudioTokens,
+		}
+		merged.CompletionTokensDetails.CitationTokens = sumOptionalInts(baseDetails.CitationTokens, addDetails.CitationTokens)
+		merged.CompletionTokensDetails.NumSearchQueries = sumOptionalInts(baseDetails.NumSearchQueries, addDetails.NumSearchQueries)
+		merged.CompletionTokensDetails.ImageTokens = sumOptionalInts(baseDetails.ImageTokens, addDetails.ImageTokens)
+	}
+
+	merged.ToolUsage = base.ToolUsage.Add(add.ToolUsage)
+	merged.Cost = base.Cost.Add(add.Cost)
+	merged.Estimation = mergeTokenUsageEstimation(base.Estimation, add.Estimation)
+	if len(base.Iterations)+len(add.Iterations) > 0 {
+		merged.Iterations = append(slices.Clone(base.Iterations), add.Iterations...)
+	}
+
+	return merged
+}
+
+// mixedTokenizerEstimation names the tokenizer of a sum whose estimated turns used different ones.
+const mixedTokenizerEstimation = "mixed"
+
+// mergeTokenUsageEstimation carries the estimation marker into a sum of usages. A count is
+// estimated when either turn's count was. It returns nil when neither turn was estimated.
+func mergeTokenUsageEstimation(base, add *TokenUsageEstimation) *TokenUsageEstimation {
+	if base == nil && add == nil {
+		return nil
+	}
+	if base == nil {
+		return new(*add)
+	}
+	if add == nil {
+		return new(*base)
+	}
+	merged := &TokenUsageEstimation{
+		Prompt:     base.Prompt || add.Prompt,
+		Completion: base.Completion || add.Completion,
+		Tokenizer:  base.Tokenizer,
+	}
+	if base.Tokenizer != add.Tokenizer {
+		merged.Tokenizer = mixedTokenizerEstimation
+	}
+	return merged
+}
+
+type ToolUsage struct {
+	WebSearch *WebSearchToolUsage `json:"web_search,omitempty"`
+	ImageGen  *ImageGenToolUsage  `json:"image_gen,omitempty"`
+	// ImageGenModel is the image model the request's tool asked for. Bifrost derives it; no provider reports it.
+	ImageGenModel string `json:"image_gen_model,omitempty"`
+	// ContainerSessions counts containers a request started, by memory tier. Bifrost derives it; no provider reports it.
+	ContainerSessions map[string]int `json:"container_sessions,omitempty"`
+}
+
+// UnmarshalJSON keeps a malformed image_gen block from failing the response it arrives on: it loses
+// only the image charge. Well-formed usage decodes once; the second pass runs only after a failure.
+func (t *ToolUsage) UnmarshalJSON(data []byte) error {
+	type alias ToolUsage
+	var parsed alias
+	if Unmarshal(data, &parsed) == nil {
+		*t = ToolUsage(parsed)
+		return nil
+	}
+	parsed = alias{}
+	aux := struct {
+		*alias
+		ImageGen json.RawMessage `json:"image_gen"`
+	}{alias: &parsed}
+	if err := Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*t = ToolUsage(parsed)
+	var imageGen *ImageGenToolUsage
+	if Unmarshal(aux.ImageGen, &imageGen) == nil {
+		t.ImageGen = imageGen
+	}
+	return nil
+}
+
+// withoutZeroImageGen drops OpenAI's all-zero image_gen block from t, which the caller must own. Chat usage
+// never carried it. Generated images stay, because pricing reads them from this usage.
+func (t *ToolUsage) withoutZeroImageGen() *ToolUsage {
+	if t == nil || t.ImageGen == nil || t.ImageGen.HasTokens() {
+		return t
+	}
+	t.ImageGen = nil
+	if t.WebSearch == nil && len(t.ContainerSessions) == 0 {
+		return nil
+	}
+	return t
+}
+
+// ContainerTierDefault is the ContainerSessions key for a container with no explicit memory tier.
+const ContainerTierDefault = "default"
+
+// ContainerPricingModel returns the datasheet model that prices a session of the given tier.
+func ContainerPricingModel(tier string) string {
+	if tier == "" || tier == ContainerTierDefault {
+		return "container"
+	}
+	return "container-" + tier
+}
+
+// SetContainerSessions records sessions on *t, allocating it when needed; a no-op when sessions is empty.
+func SetContainerSessions(t **ToolUsage, sessions map[string]int) {
+	if len(sessions) == 0 {
+		return
+	}
+	if *t == nil {
+		*t = &ToolUsage{}
+	}
+	(*t).ContainerSessions = sessions
+}
+
+// withoutDerivedFields returns t without the fields Bifrost derives, for the provider-shaped tool_usage clients see.
+func (t *ToolUsage) withoutDerivedFields() *ToolUsage {
+	if t == nil || (t.ContainerSessions == nil && t.ImageGenModel == "") {
+		return t
+	}
+	if t.WebSearch == nil && t.ImageGen == nil {
+		return nil
+	}
+	c := *t
+	c.ContainerSessions = nil
+	c.ImageGenModel = ""
+	return &c
+}
+
+// ImageGenToolUsage is OpenAI's tool_usage.image_gen: token counts summed across image generation calls.
+type ImageGenToolUsage struct {
+	InputTokens         int                         `json:"input_tokens"`
+	InputTokensDetails  *ImageGenTokenDetails       `json:"input_tokens_details,omitempty"`
+	OutputTokens        int                         `json:"output_tokens"`
+	OutputTokensDetails *ImageGenTokenDetails       `json:"output_tokens_details,omitempty"`
+	TotalTokens         int                         `json:"total_tokens"`
+	CachedTokens        *int                        `json:"cached_tokens,omitempty"`
+	CachedTokensDetails *ImageGenCachedTokenDetails `json:"cached_tokens_details,omitempty"`
+}
+
+// ImageGenTokenDetails splits an image generation token count by modality.
+type ImageGenTokenDetails struct {
+	ImageTokens int `json:"image_tokens"`
+	TextTokens  int `json:"text_tokens"`
+}
+
+// ImageGenCachedTokenDetails splits cached input tokens by modality.
+type ImageGenCachedTokenDetails struct {
+	CachedImageTokens int `json:"cached_image_tokens"`
+	CachedTextTokens  int `json:"cached_text_tokens"`
+}
+
+// HasTokens reports whether any image was generated; OpenAI sends zero counts on every response.
+func (u *ImageGenToolUsage) HasTokens() bool {
+	return u != nil && (u.TotalTokens > 0 || u.InputTokens > 0 || u.OutputTokens > 0)
+}
+
+// deepCopy returns an owned copy of u.
+func (u *ImageGenToolUsage) deepCopy() *ImageGenToolUsage {
+	if u == nil {
+		return nil
+	}
+	c := *u
+	if u.InputTokensDetails != nil {
+		d := *u.InputTokensDetails
+		c.InputTokensDetails = &d
+	}
+	if u.OutputTokensDetails != nil {
+		d := *u.OutputTokensDetails
+		c.OutputTokensDetails = &d
+	}
+	if u.CachedTokens != nil {
+		n := *u.CachedTokens
+		c.CachedTokens = &n
+	}
+	if u.CachedTokensDetails != nil {
+		d := *u.CachedTokensDetails
+		c.CachedTokensDetails = &d
+	}
+	return &c
+}
+
+// add returns the sum of u and o; details missing on one side stay missing, since a partial split cannot be priced.
+func (u *ImageGenToolUsage) add(o *ImageGenToolUsage) *ImageGenToolUsage {
+	if u == nil {
+		return o.deepCopy()
+	}
+	if o == nil {
+		return u.deepCopy()
+	}
+	sum := &ImageGenToolUsage{
+		InputTokens:  u.InputTokens + o.InputTokens,
+		OutputTokens: u.OutputTokens + o.OutputTokens,
+		TotalTokens:  u.TotalTokens + o.TotalTokens,
+	}
+	if u.InputTokensDetails != nil && o.InputTokensDetails != nil {
+		sum.InputTokensDetails = &ImageGenTokenDetails{
+			ImageTokens: u.InputTokensDetails.ImageTokens + o.InputTokensDetails.ImageTokens,
+			TextTokens:  u.InputTokensDetails.TextTokens + o.InputTokensDetails.TextTokens,
+		}
+	}
+	if u.OutputTokensDetails != nil && o.OutputTokensDetails != nil {
+		sum.OutputTokensDetails = &ImageGenTokenDetails{
+			ImageTokens: u.OutputTokensDetails.ImageTokens + o.OutputTokensDetails.ImageTokens,
+			TextTokens:  u.OutputTokensDetails.TextTokens + o.OutputTokensDetails.TextTokens,
+		}
+	}
+	if u.CachedTokens != nil && o.CachedTokens != nil {
+		n := *u.CachedTokens + *o.CachedTokens
+		sum.CachedTokens = &n
+	}
+	if u.CachedTokensDetails != nil && o.CachedTokensDetails != nil {
+		sum.CachedTokensDetails = &ImageGenCachedTokenDetails{
+			CachedImageTokens: u.CachedTokensDetails.CachedImageTokens + o.CachedTokensDetails.CachedImageTokens,
+			CachedTextTokens:  u.CachedTokensDetails.CachedTextTokens + o.CachedTokensDetails.CachedTextTokens,
+		}
+	}
+	return sum
+}
+
+// WebSearchToolUsage counts billable web search calls.
+type WebSearchToolUsage struct {
+	NumRequests int `json:"num_requests"`
+}
+
+// Add returns the per-tool sum of t and o; nil when both are nil.
+func (t *ToolUsage) Add(o *ToolUsage) *ToolUsage {
+	if t == nil && o == nil {
+		return nil
+	}
+	sum := &ToolUsage{}
+	if t != nil && t.WebSearch != nil {
+		sum.WebSearch = &WebSearchToolUsage{NumRequests: t.WebSearch.NumRequests}
+	}
+	if o != nil && o.WebSearch != nil {
+		if sum.WebSearch == nil {
+			sum.WebSearch = &WebSearchToolUsage{}
+		}
+		sum.WebSearch.NumRequests += o.WebSearch.NumRequests
+	}
+	for _, u := range []*ToolUsage{t, o} {
+		if u == nil {
+			continue
+		}
+		sum.ImageGen = sum.ImageGen.add(u.ImageGen)
+		if sum.ImageGenModel == "" {
+			sum.ImageGenModel = u.ImageGenModel
+		}
+		for tier, n := range u.ContainerSessions {
+			if sum.ContainerSessions == nil {
+				sum.ContainerSessions = make(map[string]int, len(u.ContainerSessions))
+			}
+			sum.ContainerSessions[tier] += n
+		}
+	}
+	return sum
+}
+
+// DeepCopy returns an owned copy of t.
+func (t *ToolUsage) DeepCopy() *ToolUsage {
+	if t == nil {
+		return nil
+	}
+	c := *t
+	if t.WebSearch != nil {
+		ws := *t.WebSearch
+		c.WebSearch = &ws
+	}
+	c.ImageGen = t.ImageGen.deepCopy()
+	c.ContainerSessions = maps.Clone(t.ContainerSessions)
+	return &c
+}
+
+func cachedWriteTokens5m(details *ChatPromptTokensDetails) int {
+	if details == nil || details.CachedWriteTokenDetails == nil {
+		return 0
+	}
+	return details.CachedWriteTokenDetails.CachedWriteTokens5m
+}
+
+func cachedWriteTokens1h(details *ChatPromptTokensDetails) int {
+	if details == nil || details.CachedWriteTokenDetails == nil {
+		return 0
+	}
+	return details.CachedWriteTokenDetails.CachedWriteTokens1h
+}
+
+func sumOptionalInts(base, add *int) *int {
+	if base == nil && add == nil {
+		return nil
+	}
+	sum := 0
+	if base != nil {
+		sum += *base
+	}
+	if add != nil {
+		sum += *add
+	}
+	return &sum
+}
+
+// InputCostDetails breaks InputCost down by category; sub-fields sum to InputCost.
+type InputCostDetails struct {
+	TextCost        float64 `json:"text_cost,omitempty"`
+	AudioCost       float64 `json:"audio_cost,omitempty"`
+	ImageCost       float64 `json:"image_cost,omitempty"`
+	CachedReadCost  float64 `json:"cached_read_cost,omitempty"`
+	CachedWriteCost float64 `json:"cached_write_cost,omitempty"`
+	// RequestCost is a flat per-request surcharge (also OCR per-page and
+	// container per-session), folded into the input side since it maps to no
+	// token category.
+	RequestCost float64 `json:"request_cost,omitempty"`
+}
+
+// OutputCostDetails breaks OutputCost down by category; sub-fields sum to OutputCost.
+type OutputCostDetails struct {
+	TextCost          float64 `json:"text_cost,omitempty"`
+	AudioCost         float64 `json:"audio_cost,omitempty"`
+	ImageCost         float64 `json:"image_cost,omitempty"`
+	ReasoningCost     float64 `json:"reasoning_cost,omitempty"`
+	CitationCost      float64 `json:"citation_cost,omitempty"`
+	SearchQueriesCost float64 `json:"search_queries_cost,omitempty"`
+}
+
+// AdditionalCostDetails breaks AdditionalCost down by category; sub-fields sum to
+// AdditionalCost. These are internal sidecar costs with no input/output token
+// category. Extend with new fields as more such cost sources are billed.
+type AdditionalCostDetails struct {
+	GuardrailCost     float64 `json:"guardrail_cost,omitempty"`      // Guardrail judge-call cost
+	MCPCost           float64 `json:"mcp_cost,omitempty"`            // MCP tool-execution cost
+	SemanticCacheCost float64 `json:"semantic_cache_cost,omitempty"` // Semantic-cache embedding-lookup cost
+	// RoutingCost is the cost of the internal classification calls the routing
+	// plugin makes for a request, covering every such call the request opted into
+	// budget attribution — today the semantic classification embed. It matches the
+	// AdditionalCost those calls contribute.
+	RoutingCost float64 `json:"routing_cost,omitempty"`
+}
+
+// UnmarshalJSON implements custom JSON unmarshalling for BifrostCost. It accepts
+// a bare float (treated as the total), the current nested shape, and the legacy
+// flat shape (input_tokens_cost, output_tokens_cost, ...) still emitted by
+// Perplexity and present in logs written before the nested shape existed.
 func (bc *BifrostCost) UnmarshalJSON(data []byte) error {
 	// First, try to unmarshal as a direct float
 	var costFloat float64
@@ -1710,16 +2800,330 @@ func (bc *BifrostCost) UnmarshalJSON(data []byte) error {
 		return nil
 	}
 
-	// Try to unmarshal as a full BifrostCost struct
-	// Use a type alias to avoid infinite recursion
+	// Nested shape. Use a type alias to avoid infinite recursion.
 	type Alias BifrostCost
-	var costStruct Alias
-	if err := Unmarshal(data, &costStruct); err == nil {
-		*bc = BifrostCost(costStruct)
+	var nested Alias
+	if err := Unmarshal(data, &nested); err != nil {
+		return fmt.Errorf("cost field is neither a float nor an object: %w", err)
+	}
+	*bc = BifrostCost(nested)
+
+	// Legacy flat shape backfill, only when the nested keys were absent.
+	if bc.InputCost == 0 && bc.OutputCost == 0 && bc.InputCostDetails == nil && bc.OutputCostDetails == nil {
+		var legacy legacyBifrostCost
+		if err := Unmarshal(data, &legacy); err == nil {
+			legacy.mergeInto(bc)
+		}
+	}
+	return nil
+}
+
+// legacyBifrostCost is the pre-nested flat cost shape, kept for deserializing
+// older logs and Perplexity's response. Pointers distinguish absent from zero.
+type legacyBifrostCost struct {
+	InputTokensCost     *float64 `json:"input_tokens_cost"`
+	OutputTokensCost    *float64 `json:"output_tokens_cost"`
+	CacheReadTokensCost *float64 `json:"cache_read_tokens_cost"`
+	ReasoningTokensCost *float64 `json:"reasoning_tokens_cost"`
+	CitationTokensCost  *float64 `json:"citation_tokens_cost"`
+	SearchQueriesCost   *float64 `json:"search_queries_cost"`
+	RequestCost         *float64 `json:"request_cost"`
+}
+
+// mergeInto maps the flat fields onto the nested shape: the per-request
+// surcharge folds into the input side; search/reasoning/citation are output-side
+// categories. TotalCost is left untouched (its "total_cost" key is unchanged).
+func (l legacyBifrostCost) mergeInto(bc *BifrostCost) {
+	if l.InputTokensCost == nil && l.OutputTokensCost == nil && l.RequestCost == nil &&
+		l.CacheReadTokensCost == nil && l.ReasoningTokensCost == nil &&
+		l.CitationTokensCost == nil && l.SearchQueriesCost == nil {
+		return // no legacy keys present
+	}
+	val := func(p *float64) float64 {
+		if p != nil {
+			return *p
+		}
+		return 0
+	}
+	inTok, outTok := val(l.InputTokensCost), val(l.OutputTokensCost)
+	cacheRead, request := val(l.CacheReadTokensCost), val(l.RequestCost)
+	reasoning, citation, search := val(l.ReasoningTokensCost), val(l.CitationTokensCost), val(l.SearchQueriesCost)
+
+	bc.InputCost = inTok + request
+	bc.OutputCost = outTok + reasoning + citation + search
+	if bc.InputCost != 0 || cacheRead != 0 {
+		bc.InputCostDetails = &InputCostDetails{
+			TextCost:       inTok - cacheRead,
+			CachedReadCost: cacheRead,
+			RequestCost:    request,
+		}
+	}
+	if bc.OutputCost != 0 {
+		bc.OutputCostDetails = &OutputCostDetails{
+			TextCost:          outTok,
+			ReasoningCost:     reasoning,
+			CitationCost:      citation,
+			SearchQueriesCost: search,
+		}
+	}
+}
+
+// DeepCopy returns a copy whose detail pointers are all cloned, so a caller can
+// edit any category without mutating a cost shared with the client-facing
+// response. Returns nil for a nil receiver.
+//
+// Every field is copied explicitly. TestBifrostCost_DeepCopyCoversEveryField
+// fails when a field is added to BifrostCost or any of its detail structs
+// without being added here.
+func (bc *BifrostCost) DeepCopy() *BifrostCost {
+	if bc == nil {
 		return nil
 	}
+	return &BifrostCost{
+		InputCost:             bc.InputCost,
+		InputCostDetails:      bc.InputCostDetails.deepCopy(),
+		OutputCost:            bc.OutputCost,
+		OutputCostDetails:     bc.OutputCostDetails.deepCopy(),
+		AdditionalCost:        bc.AdditionalCost,
+		AdditionalCostDetails: bc.AdditionalCostDetails.deepCopy(),
+		TotalCost:             bc.TotalCost,
+	}
+}
 
-	return fmt.Errorf("cost field is neither a float nor an object")
+func (a *InputCostDetails) deepCopy() *InputCostDetails {
+	if a == nil {
+		return nil
+	}
+	return &InputCostDetails{
+		TextCost:        a.TextCost,
+		AudioCost:       a.AudioCost,
+		ImageCost:       a.ImageCost,
+		CachedReadCost:  a.CachedReadCost,
+		CachedWriteCost: a.CachedWriteCost,
+		RequestCost:     a.RequestCost,
+	}
+}
+
+func (a *OutputCostDetails) deepCopy() *OutputCostDetails {
+	if a == nil {
+		return nil
+	}
+	return &OutputCostDetails{
+		TextCost:          a.TextCost,
+		AudioCost:         a.AudioCost,
+		ImageCost:         a.ImageCost,
+		ReasoningCost:     a.ReasoningCost,
+		CitationCost:      a.CitationCost,
+		SearchQueriesCost: a.SearchQueriesCost,
+	}
+}
+
+func (a *AdditionalCostDetails) deepCopy() *AdditionalCostDetails {
+	if a == nil {
+		return nil
+	}
+	return &AdditionalCostDetails{
+		GuardrailCost:     a.GuardrailCost,
+		MCPCost:           a.MCPCost,
+		SemanticCacheCost: a.SemanticCacheCost,
+		RoutingCost:       a.RoutingCost,
+	}
+}
+
+// Add returns the component-wise sum of two cost breakdowns, treating a nil
+// operand as zero. Returns nil only when both are nil.
+func (bc *BifrostCost) Add(other *BifrostCost) *BifrostCost {
+	if bc == nil {
+		return other
+	}
+	if other == nil {
+		return bc
+	}
+	return &BifrostCost{
+		InputCost:             bc.InputCost + other.InputCost,
+		InputCostDetails:      bc.InputCostDetails.add(other.InputCostDetails),
+		OutputCost:            bc.OutputCost + other.OutputCost,
+		OutputCostDetails:     bc.OutputCostDetails.add(other.OutputCostDetails),
+		AdditionalCost:        bc.AdditionalCost + other.AdditionalCost,
+		AdditionalCostDetails: bc.AdditionalCostDetails.add(other.AdditionalCostDetails),
+		TotalCost:             bc.TotalCost + other.TotalCost,
+	}
+}
+
+func (a *InputCostDetails) add(b *InputCostDetails) *InputCostDetails {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	return &InputCostDetails{
+		TextCost:        a.TextCost + b.TextCost,
+		AudioCost:       a.AudioCost + b.AudioCost,
+		ImageCost:       a.ImageCost + b.ImageCost,
+		CachedReadCost:  a.CachedReadCost + b.CachedReadCost,
+		CachedWriteCost: a.CachedWriteCost + b.CachedWriteCost,
+		RequestCost:     a.RequestCost + b.RequestCost,
+	}
+}
+
+func (a *OutputCostDetails) add(b *OutputCostDetails) *OutputCostDetails {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	return &OutputCostDetails{
+		TextCost:          a.TextCost + b.TextCost,
+		AudioCost:         a.AudioCost + b.AudioCost,
+		ImageCost:         a.ImageCost + b.ImageCost,
+		ReasoningCost:     a.ReasoningCost + b.ReasoningCost,
+		CitationCost:      a.CitationCost + b.CitationCost,
+		SearchQueriesCost: a.SearchQueriesCost + b.SearchQueriesCost,
+	}
+}
+
+func (a *AdditionalCostDetails) add(b *AdditionalCostDetails) *AdditionalCostDetails {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	return &AdditionalCostDetails{
+		GuardrailCost:     a.GuardrailCost + b.GuardrailCost,
+		MCPCost:           a.MCPCost + b.MCPCost,
+		SemanticCacheCost: a.SemanticCacheCost + b.SemanticCacheCost,
+		RoutingCost:       a.RoutingCost + b.RoutingCost,
+	}
+}
+
+// xAI reports request cost as cost_in_usd_ticks, where TICKS_IN_USD_CENT = 100_000_000, so 1 USD = 1e10 ticks.
+const usdTicksPerUSD = 1e10
+
+// costFromUSDTicks converts a tick count to a cost object, nil for missing or non-positive ticks.
+func costFromUSDTicks(ticks *int64) *BifrostCost {
+	if ticks == nil || *ticks <= 0 {
+		return nil
+	}
+	return &BifrostCost{TotalCost: float64(*ticks) / usdTicksPerUSD}
+}
+
+// NormalizeProviderCost derives the neutral Cost object from a provider-reported
+// cost_in_usd_ticks so cost calculation only ever reads Cost. No-op when the
+// provider already sent a cost or reported no ticks.
+func (u *BifrostLLMUsage) NormalizeProviderCost() {
+	if u == nil || u.Cost != nil {
+		return
+	}
+	u.Cost = costFromUSDTicks(u.CostInUsdTicks)
+}
+
+// AddTokenCounts adds the token counters of other, details included, to u, for a total built from the
+// generations of one response. Cost, tool usage and the cache-write breakdown are not summed.
+func (u *BifrostLLMUsage) AddTokenCounts(other *BifrostLLMUsage) {
+	if other == nil {
+		return
+	}
+	u.PromptTokens += other.PromptTokens
+	u.CompletionTokens += other.CompletionTokens
+	u.TotalTokens += other.TotalTokens
+	if d := other.PromptTokensDetails; d != nil {
+		if u.PromptTokensDetails == nil {
+			u.PromptTokensDetails = &ChatPromptTokensDetails{}
+		}
+		u.PromptTokensDetails.TextTokens += d.TextTokens
+		u.PromptTokensDetails.AudioTokens += d.AudioTokens
+		u.PromptTokensDetails.ImageTokens += d.ImageTokens
+		u.PromptTokensDetails.CachedReadTokens += d.CachedReadTokens
+		u.PromptTokensDetails.CachedWriteTokens += d.CachedWriteTokens
+		u.PromptTokensDetails.StandardSpeechAudioTokens += d.StandardSpeechAudioTokens
+		u.PromptTokensDetails.CustomSpeechAudioTokens += d.CustomSpeechAudioTokens
+	}
+	if d := other.CompletionTokensDetails; d != nil {
+		if u.CompletionTokensDetails == nil {
+			u.CompletionTokensDetails = &ChatCompletionTokensDetails{}
+		}
+		u.CompletionTokensDetails.TextTokens += d.TextTokens
+		u.CompletionTokensDetails.AudioTokens += d.AudioTokens
+		u.CompletionTokensDetails.ReasoningTokens += d.ReasoningTokens
+		u.CompletionTokensDetails.AcceptedPredictionTokens += d.AcceptedPredictionTokens
+		u.CompletionTokensDetails.RejectedPredictionTokens += d.RejectedPredictionTokens
+		u.CompletionTokensDetails.StandardSpeechAudioTokens += d.StandardSpeechAudioTokens
+		u.CompletionTokensDetails.CustomSpeechAudioTokens += d.CustomSpeechAudioTokens
+	}
+}
+
+// DeepCopy returns a copy whose mutable pointer children are all cloned, so a
+// caller can attach cost or edit any nested field without mutating a usage shared
+// with the client-facing response. Returns nil for a nil receiver.
+func (u *BifrostLLMUsage) DeepCopy() *BifrostLLMUsage {
+	if u == nil {
+		return nil
+	}
+	c := *u
+	if u.Estimation != nil {
+		e := *u.Estimation
+		c.Estimation = &e
+	}
+	if u.PromptTokensDetails != nil {
+		pd := *u.PromptTokensDetails
+		if u.PromptTokensDetails.CachedWriteTokenDetails != nil {
+			cw := *u.PromptTokensDetails.CachedWriteTokenDetails
+			pd.CachedWriteTokenDetails = &cw
+		}
+		c.PromptTokensDetails = &pd
+	}
+	if u.CompletionTokensDetails != nil {
+		cd := *u.CompletionTokensDetails
+		cd.CitationTokens = copyIntPtr(u.CompletionTokensDetails.CitationTokens)
+		cd.NumSearchQueries = copyIntPtr(u.CompletionTokensDetails.NumSearchQueries)
+		cd.ImageTokens = copyIntPtr(u.CompletionTokensDetails.ImageTokens)
+		c.CompletionTokensDetails = &cd
+	}
+	if u.SearchUnits != nil {
+		su := *u.SearchUnits
+		c.SearchUnits = &su
+	}
+	c.ToolUsage = u.ToolUsage.DeepCopy()
+	c.Cost = u.Cost.DeepCopy()
+	if u.CostInUsdTicks != nil {
+		t := *u.CostInUsdTicks
+		c.CostInUsdTicks = &t
+	}
+	if u.Speed != nil {
+		s := *u.Speed
+		c.Speed = &s
+	}
+	c.StateTokens = copyIntPtr(u.StateTokens)
+	c.StateTokensDropped = copyIntPtr(u.StateTokensDropped)
+	if u.Truncated != nil {
+		tr := *u.Truncated
+		c.Truncated = &tr
+	}
+	if u.TruncatedQuestions != nil {
+		c.TruncatedQuestions = append([]string(nil), u.TruncatedQuestions...)
+	}
+	if u.InferenceGeo != nil {
+		g := *u.InferenceGeo
+		c.InferenceGeo = &g
+	}
+	if u.ServerSideFallbackModel != nil {
+		m := *u.ServerSideFallbackModel
+		c.ServerSideFallbackModel = &m
+	}
+	return &c
+}
+
+// copyIntPtr returns an independent copy of an *int (nil-safe), for deep-copying
+// the optional token-detail counters.
+func copyIntPtr(p *int) *int {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
 }
 
 type SearchResult struct {

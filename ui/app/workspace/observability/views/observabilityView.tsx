@@ -1,10 +1,13 @@
 import FullPageLoader from "@/components/fullPageLoader";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { useIsMobile } from "@/hooks/use-mobile";
 import { setSelectedPlugin, useAppDispatch, useGetPluginsQuery } from "@/lib/store";
 import { cn } from "@/lib/utils";
 import { useTheme } from "next-themes";
+import { ArrowLeft } from "lucide-react";
 import { useQueryState } from "nuqs";
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import BigQueryView from "./plugins/bigqueryView";
 import DatadogView from "./plugins/datadogView";
 import KafkaView from "./plugins/kafkaView";
@@ -13,6 +16,9 @@ import NewrelicView from "./plugins/newRelicView";
 import OtelView from "./plugins/otelView";
 import PrometheusView from "./plugins/prometheusView";
 import PubSubView from "./plugins/pubsubView";
+import SplunkView from "./plugins/splunkView";
+import { useTranslation } from "react-i18next";
+import { withBasePath } from "@/lib/utils/basePath";
 
 type SupportedPlatform = {
 	id: string;
@@ -22,6 +28,7 @@ type SupportedPlatform = {
 	disabled?: boolean;
 };
 
+/** Observability connectors shown in the picker, with icons matching resolvedTheme. */
 const supportedPlatformsList = (resolvedTheme: string): SupportedPlatform[] => [
 	{
 		id: "otel",
@@ -41,33 +48,46 @@ const supportedPlatformsList = (resolvedTheme: string): SupportedPlatform[] => [
 	},
 	{
 		id: "prometheus",
-		name: "Prometheus",
-		icon: <img alt="Prometheus" src="/images/prometheus-logo.svg" width={21} height={21} className="-ml-0.5" />,
+		name: "Prometheus", // i18n-ignore: brand name
+		icon: <img alt="Prometheus" src={withBasePath("/images/prometheus-logo.svg")} width={21} height={21} className="-ml-0.5" />,
 	},
 	{
 		id: "maxim",
-		name: "Maxim",
-		icon: <img alt="Maxim" src={`/maxim-logo${resolvedTheme === "dark" ? "-dark" : ""}.webp`} width={19} height={19} />,
+		name: "Maxim", // i18n-ignore: brand name
+		icon: <img alt="Maxim" src={withBasePath(`/maxim-logo${resolvedTheme === "dark" ? "-dark" : ""}.webp`)} width={19} height={19} />,
 	},
 	{
 		id: "datadog",
-		name: "Datadog",
-		icon: <img alt="Datadog" src="/images/datadog-logo.webp" width={32} height={32} className="-ml-0.5" />,
+		name: "Datadog", // i18n-ignore: brand name
+		icon: <img alt="Datadog" src={withBasePath("/images/datadog-logo.webp")} width={32} height={32} className="-ml-0.5" />,
 	},
 	{
 		id: "bigquery",
-		name: "BigQuery",
-		icon: <img alt="BigQuery" src="/images/bigquery-logo.svg" width={21} height={21} className="-ml-0.5" />,
+		name: "BigQuery", // i18n-ignore: brand name
+		icon: <img alt="BigQuery" src={withBasePath("/images/bigquery-logo.svg")} width={21} height={21} className="-ml-0.5" />,
 	},
 	{
 		id: "kafka",
-		name: "Kafka",
-		icon: <img alt="Kafka" src="/images/kafka-logo.svg" width={21} height={21} className="-ml-0.5" />,
+		name: "Kafka", // i18n-ignore: brand name
+		icon: <img alt="Kafka" src={withBasePath("/images/kafka-logo.svg")} width={21} height={21} className="-ml-0.5" />,
 	},
 	{
 		id: "pubsub",
 		name: "Pub/Sub",
-		icon: <img alt="Pub/Sub" src="/images/pubsub-logo.svg" width={21} height={21} className="-ml-0.5" />,
+		icon: <img alt="Pub/Sub" src={withBasePath("/images/pubsub-logo.svg")} width={21} height={21} className="-ml-0.5" />,
+	},
+	{
+		id: "splunk",
+		name: "Splunk",
+		icon: (
+			<img // i18n-ignore: brand name
+				alt="Splunk"
+				src={withBasePath(`/images/splunk-${resolvedTheme === "dark" ? "white" : "black"}.png`)}
+				width={21}
+				height={21}
+				className="-ml-0.5"
+			/>
+		),
 	},
 	{
 		id: "newrelic",
@@ -84,10 +104,13 @@ const supportedPlatformsList = (resolvedTheme: string): SupportedPlatform[] => [
 ];
 
 export default function ObservabilityView() {
+	const { t } = useTranslation("observability");
+	const isMobile = useIsMobile();
 	const dispatch = useAppDispatch();
 	const { data: plugins, isLoading } = useGetPluginsQuery();
 	const [selectedPluginId, setSelectedPluginId] = useQueryState("plugin");
 	const { resolvedTheme } = useTheme();
+	const [mobileDetailOpen, setMobileDetailOpen] = useState(false);
 
 	const supportedPlatforms = useMemo(() => supportedPlatformsList(resolvedTheme || "light"), [resolvedTheme]);
 
@@ -133,12 +156,12 @@ export default function ObservabilityView() {
 	}
 
 	return (
-		<div className="flex h-full flex-row gap-4">
-			<div className="flex flex-col">
-				<div className="flex w-[270px] flex-col gap-2 pb-10">
+		<div className="flex h-full min-w-0 flex-col gap-4 p-4 md:flex-row">
+			<div className={cn("w-full flex-col md:flex md:w-[270px]", mobileDetailOpen ? "hidden" : "flex")}>
+				<div className="flex w-full flex-col gap-2 pb-10">
 					<div className="rounded-md bg-zinc-100/10 p-4 dark:bg-zinc-800/20">
 						<div className="flex flex-col gap-1">
-							<div className="text-muted-foreground mb-2 text-xs font-medium">Providers</div>
+							<div className="text-muted-foreground mb-2 text-xs font-medium">{t("connectors.providers")}</div>
 							{supportedPlatforms.map((tab) => (
 								<button
 									type="button"
@@ -148,7 +171,7 @@ export default function ObservabilityView() {
 									aria-disabled={tab.disabled ? true : undefined}
 									aria-current={selectedPluginId === tab.id ? "page" : undefined}
 									className={cn(
-										"mb-1 flex max-h-[32px] w-full items-center gap-2 rounded-sm border px-3 py-1.5 text-sm",
+										"mb-1 flex w-full items-center gap-2 rounded-sm border px-3 py-1.5 text-sm",
 										tab.disabled ? "opacity-50" : "",
 										selectedPluginId === tab.id
 											? "bg-secondary opacity-100 hover:opacity-100"
@@ -161,9 +184,11 @@ export default function ObservabilityView() {
 											return;
 										}
 										setSelectedPluginId(tab.id ?? supportedPlatforms[0].id);
+										if (isMobile) setMobileDetailOpen(true);
 									}}
 								>
-									<div className="w-[24px]">{tab.icon}</div> {tab.name}
+									<div className="w-[24px] shrink-0">{tab.icon}</div>
+									<span className="min-w-0 truncate">{tab.name}</span>
 									{tab.tag && (
 										<Badge variant="secondary" className="text-muted-foreground ml-auto text-[10px] font-medium">
 											{tab.tag.toUpperCase()}
@@ -171,7 +196,7 @@ export default function ObservabilityView() {
 									)}
 									{tab.disabled && (
 										<Badge variant="secondary" className="text-muted-foreground ml-auto text-[10px] font-medium">
-											{"Coming soon".toUpperCase()}
+											{t("connectors.comingSoon").toUpperCase()}
 										</Badge>
 									)}
 								</button>
@@ -180,7 +205,11 @@ export default function ObservabilityView() {
 					</div>
 				</div>
 			</div>
-			<div className="w-full pt-4">
+			<div className={cn("min-w-0 w-full pt-4", mobileDetailOpen ? "block" : "hidden md:block")}>
+				<Button variant="ghost" size="sm" className="mb-2 md:hidden" onClick={() => setMobileDetailOpen(false)}>
+					<ArrowLeft className="size-4" />
+					{t("connectors.providers")}
+				</Button>
 				{selectedPluginId === "prometheus" && <PrometheusView />}
 				{selectedPluginId === "otel" && <OtelView />}
 				{selectedPluginId === "maxim" && <MaximView />}
@@ -188,6 +217,7 @@ export default function ObservabilityView() {
 				{selectedPluginId === "datadog" && <DatadogView />}
 				{selectedPluginId === "bigquery" && <BigQueryView />}
 				{selectedPluginId === "pubsub" && <PubSubView />}
+				{selectedPluginId === "splunk" && <SplunkView />}
 				{selectedPluginId === "newrelic" && <NewrelicView />}
 			</div>
 		</div>

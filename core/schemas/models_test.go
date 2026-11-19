@@ -115,3 +115,128 @@ func TestKeyStatusMarshalJSON_PreservesErrorFields(t *testing.T) {
 	assert.Contains(t, dataStr, `"original_model_requested":"gpt-4"`)
 	assert.Contains(t, dataStr, `"status_code":401`)
 }
+
+// TestModelReasoningRoundTrip verifies that provider list-models payloads
+// carrying an OpenRouter-style `reasoning` object survive decode/encode
+// through schemas.Model, including partial shapes with no effort levels.
+func TestModelReasoningRoundTrip(t *testing.T) {
+	payload := []byte(`{
+		"id": "google/gemini-3.6-flash",
+		"supported_parameters": ["reasoning", "include_reasoning"],
+		"reasoning": {
+			"mandatory": true,
+			"default_enabled": true,
+			"supported_efforts": ["high", "medium", "low", "minimal"],
+			"default_effort": "medium"
+		}
+	}`)
+
+	var model Model
+	require.NoError(t, json.Unmarshal(payload, &model))
+	require.NotNil(t, model.Reasoning)
+	assert.Equal(t, Ptr(true), model.Reasoning.Mandatory)
+	assert.Equal(t, Ptr(true), model.Reasoning.DefaultEnabled)
+	assert.Equal(t, []string{"high", "medium", "low", "minimal"}, model.Reasoning.SupportedEfforts)
+	assert.Equal(t, Ptr("medium"), model.Reasoning.DefaultEffort)
+
+	encoded, err := json.Marshal(model)
+	require.NoError(t, err)
+	var decoded Model
+	require.NoError(t, json.Unmarshal(encoded, &decoded))
+	assert.Equal(t, model.Reasoning, decoded.Reasoning)
+
+	// Partial shape: reasoning supported but no selectable effort.
+	var partial Model
+	require.NoError(t, json.Unmarshal([]byte(`{"id":"x","reasoning":{"mandatory":false,"default_enabled":true}}`), &partial))
+	require.NotNil(t, partial.Reasoning)
+	assert.Nil(t, partial.Reasoning.SupportedEfforts)
+	assert.Nil(t, partial.Reasoning.DefaultEffort)
+
+	// No reasoning object → field stays nil and is omitted on encode.
+	var absent Model
+	require.NoError(t, json.Unmarshal([]byte(`{"id":"x"}`), &absent))
+	assert.Nil(t, absent.Reasoning)
+	encoded, err = json.Marshal(absent)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "reasoning")
+}
+
+func pageModels(ids ...string) *BifrostListModelsResponse {
+	data := make([]Model, len(ids))
+	for i, id := range ids {
+		data[i] = Model{ID: id}
+	}
+	return &BifrostListModelsResponse{Data: data}
+}
+
+func modelIDs(r *BifrostListModelsResponse) []string {
+	ids := make([]string, len(r.Data))
+	for i, m := range r.Data {
+		ids[i] = m.ID
+	}
+	return ids
+}
+
+// collectAllPages pages through each successive listing (one per page request),
+// mimicking ListAllModels re-fetching the provider listing for every page.
+func collectAllPages(pageSize int, listings ...*BifrostListModelsResponse) []string {
+	var got []string
+	token := ""
+	for _, l := range listings {
+		page := l.ApplyPagination(pageSize, token)
+		got = append(got, modelIDs(page)...)
+		token = page.NextPageToken
+		if token == "" {
+			break
+		}
+	}
+	return got
+}
+
+func TestApplyPagination_ResumesAfterLastIDWhenListingShifts(t *testing.T) {
+	first := pageModels("a", "b", "c", "d", "e").ApplyPagination(2, "")
+	require.Equal(t, []string{"a", "b"}, modelIDs(first))
+
+	t.Run("row inserted before cursor", func(t *testing.T) {
+		next := pageModels("a", "a2", "b", "c", "d", "e").ApplyPagination(2, first.NextPageToken)
+		assert.Equal(t, []string{"c", "d"}, modelIDs(next))
+	})
+
+	t.Run("row removed before cursor", func(t *testing.T) {
+		next := pageModels("b", "c", "d", "e").ApplyPagination(2, first.NextPageToken)
+		assert.Equal(t, []string{"c", "d"}, modelIDs(next))
+	})
+
+	t.Run("cursor row itself removed", func(t *testing.T) {
+		next := pageModels("a", "c", "d", "e").ApplyPagination(2, first.NextPageToken)
+		assert.Equal(t, []string{"c", "d"}, modelIDs(next))
+	})
+
+	t.Run("unsorted listing resumes after cursor row new index", func(t *testing.T) {
+		next := pageModels("z", "a", "b", "q", "r").ApplyPagination(2, first.NextPageToken)
+		assert.Equal(t, []string{"q", "r"}, modelIDs(next))
+	})
+
+	t.Run("unsorted listing with cursor row gone keeps offset", func(t *testing.T) {
+		next := pageModels("z", "y", "x", "w", "v").ApplyPagination(2, first.NextPageToken)
+		assert.Equal(t, []string{"x", "w"}, modelIDs(next))
+	})
+}
+
+func TestApplyPagination_CollectsEveryRowOnceAcrossShiftingListings(t *testing.T) {
+	got := collectAllPages(2,
+		pageModels("a", "b", "c", "d", "e", "f"),
+		pageModels("a", "a2", "b", "c", "d", "e", "f"),
+		pageModels("a", "a2", "b", "c", "c2", "d", "e", "f"),
+		pageModels("a", "a2", "b", "c", "c2", "d", "e", "f"),
+		pageModels("a", "a2", "b", "c", "c2", "d", "e", "f"),
+	)
+	// a2 and c2 were inserted behind an already-issued cursor, so a cursor scheme
+	// cannot emit them; every other row must appear exactly once and in order.
+	assert.Equal(t, []string{"a", "b", "c", "d", "e", "f"}, got)
+}
+
+func TestApplyPagination_StableListingUnchanged(t *testing.T) {
+	l := pageModels("a", "b", "c", "d", "e")
+	assert.Equal(t, []string{"a", "b", "c", "d", "e"}, collectAllPages(2, l, l, l))
+}

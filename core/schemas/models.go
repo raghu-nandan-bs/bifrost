@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"sort"
 )
 
 // DefaultPageSize is the default page size for listing models
@@ -51,6 +52,18 @@ type BifrostListModelsRequest struct {
 	// Unfiltered: If true, the response will include all models for the provider, regardless of the allowed models (internal bifrost use only, not sent to the provider)
 	Unfiltered bool `json:"-"`
 
+	// KeyID: If non-nil, scope the call to a single key (matched by Key.ID).
+	// Lets callers cache list-models output per-key for fine-grained
+	// invalidation. Internal bifrost use only; not sent to the provider.
+	//
+	// Matching runs against the already-filtered set of supported keys for the
+	// provider — keys that are disabled (Enabled == false) or fail validation
+	// are excluded before the lookup, so a KeyID referring to such a key
+	// produces the same "no key found" error as a KeyID that does not exist
+	// at all. Callers needing to distinguish those cases must check the raw
+	// account configuration themselves.
+	KeyID *string `json:"-"`
+
 	// ExtraParams: Additional provider-specific query parameters
 	// This allows for flexibility to pass any custom parameters that specific providers might support
 	ExtraParams map[string]interface{} `json:"-"`
@@ -89,8 +102,9 @@ func (response *BifrostListModelsResponse) ApplyPagination(pageSize int, pageTok
 
 	// Validate cursor integrity if LastID is present
 	if cursor.LastID != "" && !validatePaginationCursor(cursor, response.Data) {
-		// Invalid cursor: reset to beginning
-		offset = 0
+		// Listing shifted since the cursor was issued: continue after the last
+		// returned ID rather than re-emitting earlier rows.
+		offset = resumeOffsetAfterLastID(response.Data, cursor.LastID, offset)
 	}
 
 	if offset >= totalItems {
@@ -134,22 +148,37 @@ func (response *BifrostListModelsResponse) ApplyPagination(pageSize int, pageTok
 	return paginatedResponse
 }
 
+// BifrostModelRetrieveRequest retrieves a single model's metadata (OpenAI GET /v1/models/{model}).
+type BifrostModelRetrieveRequest struct {
+	Provider ModelProvider `json:"provider"`
+	Model    string        `json:"model"`
+}
+
+// BifrostModelRetrieveResponse carries the retrieved model inline, alongside the usual extra fields.
+type BifrostModelRetrieveResponse struct {
+	Model
+	ExtraFields BifrostResponseExtraFields `json:"extra_fields"`
+}
+
 type Model struct {
 	ID                  string             `json:"id"`
 	CanonicalSlug       *string            `json:"canonical_slug,omitempty"`
 	Name                *string            `json:"name,omitempty"`
 	NormalizedName      *string            `json:"normalized_name,omitempty"` // Human-readable name derived from the datasheet base_model (e.g. "Claude Sonnet 4.5")
-	Alias               *string            `json:"alias,omitempty"` // Provider API identifier this model alias maps to (e.g. Azure deployment name, Bedrock ARN)
+	Alias               *string            `json:"alias,omitempty"`           // Provider API identifier this model alias maps to (e.g. Azure deployment name, Bedrock ARN)
 	Created             *int64             `json:"created,omitempty"`
 	ContextLength       *int               `json:"context_length,omitempty"`
 	MaxInputTokens      *int               `json:"max_input_tokens,omitempty"`
 	MaxOutputTokens     *int               `json:"max_output_tokens,omitempty"`
 	Architecture        *Architecture      `json:"architecture,omitempty"`
+	IsDeprecated        bool               `json:"is_deprecated,omitempty"`
+	ShutdownDate        *string            `json:"shutdown_date,omitempty"` // Provider-announced retirement date
 	Pricing             *Pricing           `json:"pricing,omitempty"`
 	TopProvider         *TopProvider       `json:"top_provider,omitempty"`
 	PerRequestLimits    *PerRequestLimits  `json:"per_request_limits,omitempty"`
 	SupportedParameters []string           `json:"supported_parameters,omitempty"`
 	DefaultParameters   *DefaultParameters `json:"default_parameters,omitempty"`
+	Reasoning           *ModelReasoning    `json:"reasoning,omitempty"`
 	HuggingFaceID       *string            `json:"hugging_face_id,omitempty"`
 	Description         *string            `json:"description,omitempty"`
 
@@ -200,6 +229,17 @@ type DefaultParameters struct {
 	Temperature      *float64 `json:"temperature,omitempty"`
 	TopP             *float64 `json:"top_p,omitempty"`
 	FrequencyPenalty *float64 `json:"frequency_penalty,omitempty"`
+}
+
+// ModelReasoning describes a model's reasoning capabilities as advertised by
+// the provider's list-models API (e.g. OpenRouter's per-model `reasoning`
+// object). All fields are optional — providers omit `supported_efforts` /
+// `default_effort` for models whose reasoning has no selectable effort level.
+type ModelReasoning struct {
+	Mandatory        *bool    `json:"mandatory,omitempty"`
+	DefaultEnabled   *bool    `json:"default_enabled,omitempty"`
+	SupportedEfforts []string `json:"supported_efforts,omitempty"`
+	DefaultEffort    *string  `json:"default_effort,omitempty"`
 }
 
 // paginationCursor represents the internal cursor structure for pagination.
@@ -272,4 +312,23 @@ func validatePaginationCursor(cursor paginationCursor, data []Model) bool {
 	}
 
 	return true
+}
+
+// resumeOffsetAfterLastID returns the index at which to resume a page after lastID
+// when the listing changed since the cursor was issued. For ID-sorted data it finds the
+// first ID greater than lastID (which also handles a removed cursor row). For unsorted
+// data it resumes after lastID's new index, or keeps fallback (clamped) if the row is gone.
+func resumeOffsetAfterLastID(data []Model, lastID string, fallback int) int {
+	if sort.SliceIsSorted(data, func(i, j int) bool { return data[i].ID < data[j].ID }) {
+		return sort.Search(len(data), func(i int) bool { return data[i].ID > lastID })
+	}
+	for i := range data {
+		if data[i].ID == lastID {
+			return i + 1
+		}
+	}
+	if fallback > len(data) {
+		return len(data)
+	}
+	return fallback
 }

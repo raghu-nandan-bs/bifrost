@@ -36,7 +36,7 @@ type entrypoint struct {
 
 var entrypoints = []entrypoint{
 	{
-		pkg:        "github.com/maximhq/bifrost/transports/bifrost-http/lib",
+		pkg:        "github.com/maximhq/bifrost/transports/v2/bifrost-http/lib",
 		typeName:   "ConfigData",
 		schemaPath: "", // root schema node — collectProperties will find .properties
 		moduleDir:  "transports",
@@ -53,11 +53,11 @@ var ignoreSchemaProps = map[string]string{
 	"/properties/governance/properties/virtual_keys/items/properties/provider_configs": "gorm fk slice; user-submittable",
 	"/properties/governance/properties/virtual_keys/items/properties/mcp_configs":      "gorm fk slice; user-submittable",
 	"/properties/governance/properties/routing_rules/items/properties/targets":         "gorm fk slice; user-submittable",
-	// MCP headers map<string, EnvVar> — documented escape hatch is envFrom:
+	// MCP headers map<string, SecretVar> — documented escape hatch is envFrom:
 	// plus env.X references in values; no chart-native secretRef.
 	"/properties/mcp/properties/client_configs/items/properties/headers/additionalProperties": "documented envFrom pattern",
 	// Object-storage identity fields (bucket/region/endpoint/project_id) are
-	// EnvVar-typed for flexibility but are not inherently secret. Operators
+	// SecretVar-typed for flexibility but are not inherently secret. Operators
 	// can write `env.MY_VAR` in values and use envFrom to inject. Access
 	// keys, session tokens, and credentials DO have chart-native secret
 	// support via `storage.logsStore.objectStorage.existingSecret`.
@@ -67,13 +67,14 @@ var ignoreSchemaProps = map[string]string{
 	"/properties/logs_store/properties/object_storage/properties/project_id": "not a secret; env.X + envFrom pattern",
 	// Enterprise-only top-level fields: schema documents them for enterprise
 	// deployments; OSS ConfigData struct does not carry these fields.
-	"/properties/access_profiles":            "enterprise-only; defined in bifrost-enterprise/lib/config.go",
-	"/properties/audit_logs":                 "enterprise-only; defined in bifrost-enterprise/lib/config.go",
-	"/properties/cluster_config":             "enterprise-only; defined in bifrost-enterprise/lib/config.go",
-	"/properties/guardrails_config":          "enterprise-only; defined in bifrost-enterprise/lib/config.go",
-	"/properties/large_payload_optimization": "enterprise-only; defined in bifrost-enterprise/lib/config.go",
-	"/properties/load_balancer_config":       "enterprise-only; defined in bifrost-enterprise/lib/config.go",
-	"/properties/scim_config":                "enterprise-only; defined in bifrost-enterprise/lib/config.go",
+	"/properties/access_profiles":            "enterprise-only; defined in bifrost-enterprise/transports/bifrost-http/lib/config.go",
+	"/properties/audit_logs":                 "enterprise-only; defined in bifrost-enterprise/transports/bifrost-http/lib/config.go",
+	"/properties/cluster_config":             "enterprise-only; defined in bifrost-enterprise/transports/bifrost-http/lib/config.go",
+	"/properties/guardrails_config":          "enterprise-only; defined in bifrost-enterprise/transports/bifrost-http/lib/config.go",
+	"/properties/large_payload_optimization": "enterprise-only; defined in bifrost-enterprise/transports/bifrost-http/lib/config.go",
+	"/properties/load_balancer_config":       "enterprise-only; defined in bifrost-enterprise/transports/bifrost-http/lib/config.go",
+	"/properties/scim_config":                "enterprise-only; defined in bifrost-enterprise/transports/bifrost-http/lib/config.go",
+	"/properties/circuit_breaker_config":     "enterprise-only; defined in bifrost-enterprise/transports/bifrost-http/lib/config.go",
 	// Enterprise governance extensions not yet in OSS structs.
 	"/properties/governance/properties/business_units":                          "enterprise-only; business unit governance",
 	"/properties/governance/properties/teams/items/properties/business_unit_id": "enterprise-only; team→business unit association",
@@ -82,18 +83,96 @@ var ignoreSchemaProps = map[string]string{
 	"/properties/governance/properties/teams/items/properties/budget_id": "stale; teams use budgets[] relation not budget_id",
 	// MCP tool groups are an enterprise governance feature; OSS MCPConfig has no tool_groups field.
 	"/properties/mcp/properties/tool_groups": "enterprise-only; MCP tool group governance",
+	// Enterprise-only blocks parsed by bifrost-enterprise/transports/bifrost-http/lib/config.go.
+	"/properties/config_store/properties/vault_store": "enterprise-only; parsed by bootstrapVault in bifrost-enterprise/transports/bifrost-http/lib/config.go",
+	"/properties/governance/properties/roles":         "enterprise-only; GovernanceConfigExtension.Roles in bifrost-enterprise/transports/bifrost-http/lib/config.go",
+	"/properties/governance/properties/projects":      "enterprise-only; GovernanceConfigExtension.Projects in bifrost-enterprise/transports/bifrost-http/lib/config.go",
+	"/properties/alerting":                            "enterprise-only; enterpriseConfigScaffold.AlertingConfig in bifrost-enterprise/transports/bifrost-http/lib/config.go",
+	// OSS deprecated/compat spellings accepted by validators or custom UnmarshalJSON; no struct field survives.
+	"/properties/governance/properties/auth_config/properties/disable_auth_on_inference":                                   "deprecated & ignored; kept for backward-compatible validation (use client.enforce_auth_on_inference)",
+	"/properties/governance/properties/complexity_analyzer_config/properties/tier_boundaries/properties/complex_reasoning": "deprecated compat field; only on the unexported persisted row shape, ignored by the runtime",
+	"/properties/governance/properties/complexity_analyzer_config/properties/keywords/properties/code_keywords":            "deprecated four-list spelling; folded onto the canonical tiers by ComplexityEditableKeywordConfig.UnmarshalJSON",
+	"/properties/governance/properties/complexity_analyzer_config/properties/keywords/properties/reasoning_keywords":       "deprecated four-list spelling; folded onto the canonical tiers by ComplexityEditableKeywordConfig.UnmarshalJSON",
+	"/properties/governance/properties/complexity_analyzer_config/properties/keywords/properties/technical_keywords":       "deprecated four-list spelling; folded onto the canonical tiers by ComplexityEditableKeywordConfig.UnmarshalJSON",
+	"/properties/mcp/properties/client_configs/items/properties/allow_on_all_virtual_keys":                                 "deprecated alias of allow_by_default; read by MCPClientConfig.UnmarshalJSON, no dedicated struct field",
+	// Same class as the gorm fk entries above: schemasync's gorm filter hides the Go field.
+	"/properties/governance/properties/customers/items/properties/budgets": "gorm fk slice; user-submittable",
+	// Stale reverted feature kept deprecated in schema (virtual_keys items are additionalProperties:false,
+	// so removal would break validation of older config files that still carry it).
+	"/properties/governance/properties/virtual_keys/items/properties/access_profile_id": "stale; reverted in v1.5.9 (#3669/#3670), kept deprecated for backward-compatible validation",
+	// SecretVar-typed for env flexibility, not credentials.
+	"/properties/client/properties/oauth2_server_config/properties/issuer_url": "not a secret; env.X + envFrom pattern",
+	"/properties/client/properties/mcp_external_client_url":                    "not a secret; env.X + envFrom pattern",
+	"/properties/client/properties/mcp_client_metadata_url":                    "not a secret; env.X + envFrom pattern",
+	// CA certificates are trust anchors, not private keys; bulky values ride env.X + envFrom.
+	"/properties/governance/properties/providers/items/properties/network_config/properties/ca_cert_pem": "CA trust anchor, not a credential; env.X + envFrom pattern",
+	"/properties/governance/properties/providers/items/properties/proxy_config/properties/ca_cert_pem":   "CA trust anchor, not a credential; env.X + envFrom pattern",
+	"/properties/mcp/properties/client_configs/items/properties/tls_config/properties/ca_cert_pem":       "CA trust anchor, not a credential; env.X + envFrom pattern",
+	// Webhook auth header values are credentials, but like MCP headers the documented
+	// escape hatch is envFrom: plus env.X references in values.
+	"/properties/webhooks/items/properties/headers/additionalProperties": "documented envFrom pattern",
+	// Intentionally NOT ignored (visible warnings until the chart grows secretRef/existingSecret knobs):
+	// governance.virtual_keys[].value, mcp token_exchange.client_secret, mcp oauth_config.client_secret,
+	// governance providers[].proxy_config.url.
 }
 
 // ignoreGoFields keys are "schemaPath|fieldName"; value is the reason.
 var ignoreGoFields = map[string]string{
 	"|auth_config": "deprecated; moved to governance.auth_config",
+	// The client columns store the MCP instruction caps, but config.json sets them only under
+	// mcp.tool_manager_config (applyToolManagerToClientConfig); the schema deliberately has no
+	// client-level twin. Mirrors excludedGoFields in transports/bifrost-http/lib/config_test.go.
+	"/properties/client|mcp_max_instructions_per_client": "storage column; configured only via mcp.tool_manager_config.max_instructions_per_client",
+	"/properties/client|mcp_max_instructions_total":      "storage column; configured only via mcp.tool_manager_config.max_instructions_total",
+	// Same shape: the client column stores the global MCP protocol cap, which config.json sets
+	// only as mcp.max_protocol_version (applyMCPMaxProtocolVersion).
+	"/properties/client|mcp_max_protocol_version":        "storage column; configured only via mcp.max_protocol_version",
+	"/properties/client|mcp_server_max_protocol_version": "storage column; configured only via mcp.server_max_protocol_version",
 	// provider_key_id is the internal DB column resolved from provider_key_name at config load time;
 	// schema documents only the human-readable provider_key_name alias.
 	"/properties/governance/properties/pricing_overrides/items|provider_key_id": "internal DB column; config uses provider_key_name alias instead",
+	// governance.providers decodes into TableProvider for budget and rate-limit wiring only;
+	// injected_tools is read from providers.<name>, so the schema must not advertise it here
+	// (TestValidateConfigSchema_InjectedTools pins that).
+	"/properties/governance/properties/providers/items|injected_tools": "gorm:\"-\" field never read from governance.providers; configured under providers.<name>.injected_tools",
+	"/properties/governance/properties/providers/items|passthrough":    "gorm:\"-\" field never read from governance.providers; configured under providers.<name>.passthrough",
+
+	// Phrase suggestions are set per model router (model_routers[].suggestions);
+	// the global complexity analyzer config refuses them, so the schema leaves them out.
+	// Mirrors excludedGoFields in transports/bifrost-http/lib/config_test.go.
+	"/properties/governance/properties/complexity_analyzer_config|suggestions": "set per model router; refused on the global complexity analyzer config",
 	// oauth_client_id / oauth_client_secret are response-only fields on MCPClientConfig:
 	// populated on GET from the oauth_configs table, never accepted as config.json input.
 	"/properties/mcp/properties/client_configs/items|oauth_client_id":     "response-only; populated on GET from oauth_configs, not user-configurable via config.json",
 	"/properties/mcp/properties/client_configs/items|oauth_client_secret": "response-only; populated on GET from oauth_configs, not user-configurable via config.json",
+	// oauth_authorize_url / oauth_token_url / oauth_registration_url / oauth_scopes /
+	// oauth_resource are the remaining response-only OAuth fields on MCPClientConfig:
+	// populated on GET (not stored here) so the full oauth_config can be reviewed/edited,
+	// never accepted as config.json input. Inline OAuth input goes through oauth_config.
+	"/properties/mcp/properties/client_configs/items|oauth_authorize_url":    "response-only; populated on GET (not stored here), not user-configurable via config.json",
+	"/properties/mcp/properties/client_configs/items|oauth_token_url":        "response-only; populated on GET (not stored here), not user-configurable via config.json",
+	"/properties/mcp/properties/client_configs/items|oauth_registration_url": "response-only; populated on GET (not stored here), not user-configurable via config.json",
+	"/properties/mcp/properties/client_configs/items|oauth_scopes":           "response-only; populated on GET (not stored here), not user-configurable via config.json",
+	"/properties/mcp/properties/client_configs/items|oauth_resource":         "response-only; populated on GET (not stored here), not user-configurable via config.json",
+	// oauth_config_id is a server-managed reference to the oauth_configs row, minted by the
+	// admin verification flow; config.go clears any value supplied via config.json.
+	"/properties/mcp/properties/client_configs/items|oauth_config_id": "server-managed oauth_configs reference; config.go clears any config.json-supplied value",
+	// The inline oauth_config block (schemas.OAuth2Config) carries four fields beyond the
+	// user-facing set the UI form / config.schema.json document (client_id, client_secret,
+	// authorize_url, token_url, registration_url, scopes, resource). These four are managed /
+	// derived / deprecated and are never authored in the inline config.json oauth_config block.
+	"/properties/mcp/properties/client_configs/items/properties/oauth_config|id":            "server-generated oauth_configs row id; not authored in the inline oauth_config block",
+	"/properties/mcp/properties/client_configs/items/properties/oauth_config|redirect_uri":  "computed by Bifrost (MCP OAuth callback URI); not authored in config.json",
+	"/properties/mcp/properties/client_configs/items/properties/oauth_config|server_url":    "derived from the client connection_string for OAuth discovery; not authored in config.json",
+	"/properties/mcp/properties/client_configs/items/properties/oauth_config|use_discovery": "deprecated; discovery is automatic when URLs are missing",
+	// openapi_config (schemas.MCPOpenAPIConfig) carries five fields the server computes from the
+	// parsed spec at write time and returns on read; they are never authored in config.json, and
+	// the schema's additionalProperties: false on openapi_config keeps them out deliberately.
+	"/properties/mcp/properties/client_configs/items/properties/openapi_config|spec_size":       "server-computed from the parsed spec; informational on read, not user-configurable via config.json",
+	"/properties/mcp/properties/client_configs/items/properties/openapi_config|spec_hash":       "server-computed from the parsed spec; informational on read, not user-configurable via config.json",
+	"/properties/mcp/properties/client_configs/items/properties/openapi_config|spec_title":      "server-computed from the parsed spec; informational on read, not user-configurable via config.json",
+	"/properties/mcp/properties/client_configs/items/properties/openapi_config|openapi_version": "server-computed from the parsed spec; informational on read, not user-configurable via config.json",
+	"/properties/mcp/properties/client_configs/items/properties/openapi_config|operation_count": "server-computed from the parsed spec; informational on read, not user-configurable via config.json",
 	// source_id is a stable external identifier for teams provisioned by an
 	// integrating system (PR #3395). It is assigned through the API by that
 	// system, never authored in config.json.
@@ -101,6 +180,22 @@ var ignoreGoFields = map[string]string{
 	// created_by_user_id is DB ownership metadata set by the API/session layer,
 	// never authored in config.json.
 	"/properties/governance/properties/virtual_keys/items|created_by_user_id": "DB ownership metadata; set by API/session layer, not authored in config.json",
+	// Rotation timestamps are runtime grace-period state, never config.json input.
+	"/properties/governance/properties/virtual_keys/items|previous_value_expires_at": "runtime rotation grace-period expiry; not user-configurable via config.json",
+	"/properties/governance/properties/virtual_keys/items|rotated_at":                "runtime rotation timestamp; not user-configurable via config.json",
+	// scope_name is a non-persisted (gorm:"-"), API-only display label populated by the
+	// HTTP layer on read (the scope target's human-readable name); never config.json input.
+	"/properties/governance/properties/model_configs/items|scope_name": "response-only; populated on GET as the scope target's display name, not user-configurable via config.json",
+	// virtual_key_count is a non-persisted (gorm:"-"), derived count populated by the
+	// read paths so list responses can report it without loading the full VirtualKeys
+	// relation; never config.json input.
+	"/properties/governance/properties/customers/items|virtual_key_count": "response-only; derived count populated on read (TableCustomer.VirtualKeyCount), not user-configurable via config.json",
+	// team_count is the same class: a non-persisted (gorm:"-") count the customer list read
+	// path sets so the table can show it without loading the Teams relation.
+	"/properties/governance/properties/customers/items|team_count": "response-only; derived count populated on read (TableCustomer.TeamCount), not user-configurable via config.json",
+	// business_unit is a non-persisted (gorm:"-") display object the governance read paths fill
+	// from the enterprise resolver; config.json links a key to a unit through business_unit_id.
+	"/properties/governance/properties/virtual_keys/items|business_unit": "response-only; resolved on read from business_unit_id (TableVirtualKey.BusinessUnit), not user-configurable via config.json",
 }
 
 // ignoreGoFieldNames are field names (regardless of parent path) that are
@@ -113,17 +208,53 @@ var ignoreGoFieldNames = map[string]string{
 	"state":       "runtime-derived",
 }
 
-// opaqueLeafTypes are named Go types that have custom JSON marshalling and
-// should be treated as leaves. The walker does NOT recurse into their fields,
-// and they are collected for downstream checks (e.g., EnvVar → helm secret).
-var opaqueLeafTypes = map[string]string{
-	"github.com/maximhq/bifrost/core/schemas.EnvVar": "env-aware string; custom JSON",
+// ignoreEnumPaths are schema paths whose Go type is a named const string type
+// (e.g. schemas.ModelProvider) but whose schema node intentionally has no enum:
+// the field also accepts operator-defined custom provider names, which a closed
+// enum would reject.
+var ignoreEnumPaths = map[string]string{
+	"/properties/governance/properties/complexity_analyzer_config/properties/semantic/properties/provider": "accepts custom provider names; enum would reject them",
+	"/properties/governance/properties/complexity_analyzer_config/properties/llm/properties/provider":      "accepts custom provider names; enum would reject them",
+	"/properties/governance/properties/complexity_analyzer_config/properties/decision/properties/provider": "accepts custom provider names (Laya, Nimble, Clef); enum would reject them",
 }
 
-// envVarLocation records where an EnvVar-typed field appears in config.json
+// narrowedEnumPaths are schema paths whose enum intentionally omits some of the Go
+// type's consts, because the Go type is shared with a feature that accepts more values
+// than this config path does. Only the listed consts are excused; any new Go const
+// still surfaces as enum drift.
+var narrowedEnumPaths = map[string]struct {
+	excluded []string
+	reason   string
+}{
+	"/properties/proxy_config/properties/type": {
+		excluded: []string{"socks5", "tcp"},
+		reason:   "global proxy rejects socks5/tcp at load (lib/configproxy.go) and on the API; only http is supported today",
+	},
+	"/properties/agents/items/properties/discovery_auth/properties/type": {
+		excluded: []string{"per_user_headers", "per_user_oauth", "token_exchange"},
+		reason:   "UpstreamAuth reuses MCPAuthType; Agent Gateway accepts only none, headers, and oauth (agent.validateUpstreamAuth)",
+	},
+	"/properties/agents/items/properties/runtime_auth/properties/type": {
+		excluded: []string{"per_user_headers", "per_user_oauth", "token_exchange"},
+		reason:   "UpstreamAuth reuses MCPAuthType; Agent Gateway accepts only none, headers, and oauth (agent.validateUpstreamAuth)",
+	},
+	"/properties/governance/properties/providers/items/properties/custom_provider_config/properties/base_provider_type": {
+		excluded: []string{"baseten", "byteplus", "kimchi", "machgen", "minimax", "sagemaker", "soniox"},
+		reason:   "not in schemas.SupportedBaseProviders; IsSupportedBaseProvider rejects them as a custom provider base at load",
+	},
+}
+
+// opaqueLeafTypes are named Go types that have custom JSON marshalling and
+// should be treated as leaves. The walker does NOT recurse into their fields,
+// and they are collected for downstream checks (e.g., SecretVar → helm secret).
+var opaqueLeafTypes = map[string]string{
+	"github.com/maximhq/bifrost/core/schemas.SecretVar": "env-aware string; custom JSON",
+}
+
+// secretVarLocation records where an SecretVar-typed field appears in config.json
 // so a downstream pass can confirm the helm chart supports Secret-backed
 // injection (existingSecret / secretRef / env.BIFROST_*) for that path.
-type envVarLocation struct {
+type secretVarLocation struct {
 	schemaPath string
 	goPath     string
 }
@@ -145,15 +276,15 @@ type checker struct {
 	enumConsts map[string][]string
 	// visited type names to break cycles
 	visited map[string]bool
-	// envVarFields records where EnvVar types occur, for downstream checks
-	envVarFields []envVarLocation
-	findings     []Finding
+	// secretVarFields records where SecretVar types occur, for downstream checks
+	secretVarFields []secretVarLocation
+	findings        []Finding
 }
 
 func main() {
 	schemaFlag := flag.String("schema", "transports/config.schema.json", "path to config.schema.json")
 	pkgDir := flag.String("pkg-root", ".", "repo root used as packages.Load dir")
-	helmValuesFlag := flag.String("helm-values", "helm-charts/bifrost/values.schema.json", "path to helm values.schema.json (for EnvVar secret-support check)")
+	helmValuesFlag := flag.String("helm-values", "helm-charts/bifrost/values.schema.json", "path to helm values.schema.json (for SecretVar secret-support check)")
 	helmHelpersFlag := flag.String("helm-helpers", "helm-charts/bifrost/templates/_helpers.tpl", "path to helm _helpers.tpl (for env.BIFROST_* emission detection)")
 	flag.Parse()
 
@@ -252,12 +383,12 @@ func main() {
 		c.walkType(named, e.schemaPath, fmt.Sprintf("%s.%s", e.pkg, e.typeName))
 	}
 
-	// EnvVar → helm-chart secret-support pass. For each Go field typed as
-	// schemas.EnvVar, the helm chart must either (a) emit an env.BIFROST_*
+	// SecretVar → helm-chart secret-support pass. For each Go field typed as
+	// schemas.SecretVar, the helm chart must either (a) emit an env.BIFROST_*
 	// placeholder for that JSON path via _helpers.tpl, or (b) expose a
 	// secretRef/existingSecret knob in values.schema.json at the equivalent
 	// camelCase location. If neither, warn.
-	c.checkEnvVarHelmSupport(*helmValuesFlag, *helmHelpersFlag)
+	c.checkSecretVarHelmSupport(*helmValuesFlag, *helmHelpersFlag)
 
 	printReport(os.Stderr, c.findings)
 	errCount := c.countErrs()
@@ -288,7 +419,7 @@ func printReport(w interface{ Write([]byte) (int, error) }, findings []Finding) 
 		"missing-in-go":         "Missing in Go (schema has property, ConfigData doesn't) — WARNINGS",
 		"enum-drift":            "Enum drift (Go constants vs schema enum array)",
 		"enum-no-schema":        "Go enum types with no schema `enum` constraint — WARNINGS",
-		"envvar-no-secret":      "EnvVar fields lacking chart-native Secret support — WARNINGS",
+		"envvar-no-secret":      "SecretVar fields lacking chart-native Secret support — WARNINGS",
 		"schema-path-not-found": "Schema path not found for a walked Go type — ERRORS",
 		"entrypoint":            "Entrypoint problems — ERRORS",
 	}
@@ -392,7 +523,7 @@ func renderTable(w interface{ Write([]byte) (int, error) }, headers []string, ro
 	}
 }
 
-// checkEnvVarHelmSupport verifies that every Go field of type schemas.EnvVar
+// checkSecretVarHelmSupport verifies that every Go field of type schemas.SecretVar
 // has a way to be sourced from a Kubernetes secret via the helm chart. Proof
 // of support is any of:
 //
@@ -403,10 +534,10 @@ func renderTable(w interface{ Write([]byte) (int, error) }, headers []string, ro
 //
 // Neither heuristic is perfect — this is a structural review aid, not a
 // proof. Treat misses as warnings so they don't block CI on borderline cases.
-func (c *checker) checkEnvVarHelmSupport(valuesPath, helpersPath string) {
+func (c *checker) checkSecretVarHelmSupport(valuesPath, helpersPath string) {
 	helpersBytes, err := os.ReadFile(helpersPath)
 	if err != nil {
-		c.add(Finding{Category: "envvar-no-secret", Severity: "WARN", Detail: fmt.Sprintf("could not read helm helpers %s: %v — skipping EnvVar helm-support check", helpersPath, err)})
+		c.add(Finding{Category: "envvar-no-secret", Severity: "WARN", Detail: fmt.Sprintf("could not read helm helpers %s: %v — skipping SecretVar helm-support check", helpersPath, err)})
 		return
 	}
 	helpers := string(helpersBytes)
@@ -441,9 +572,9 @@ func (c *checker) checkEnvVarHelmSupport(valuesPath, helpersPath string) {
 		_ = json.Unmarshal(valuesBytes, &valuesSchema)
 	}
 
-	for _, loc := range c.envVarFields {
+	for _, loc := range c.secretVarFields {
 		// Heuristic 1: any env.BIFROST_* is present in helpers — broad acceptance.
-		// We can't easily map a specific EnvVar field to a specific env var
+		// We can't easily map a specific SecretVar field to a specific env var
 		// without per-field config, so we just check that the helpers file
 		// has AT LEAST ONE envBifrost mention that maps to this field's path.
 		// To make this stricter, we look for a helpers line mentioning either
@@ -695,10 +826,10 @@ func (c *checker) walkType(t types.Type, schemaPath, goPath string) {
 	named, _ := t.(*types.Named)
 	if named != nil {
 		key := named.Obj().Pkg().Path() + "." + named.Obj().Name()
-		// Treat opaque types (like schemas.EnvVar) as leaves.
+		// Treat opaque types (like schemas.SecretVar) as leaves.
 		if _, isOpaque := opaqueLeafTypes[key]; isOpaque {
-			if key == "github.com/maximhq/bifrost/core/schemas.EnvVar" {
-				c.envVarFields = append(c.envVarFields, envVarLocation{schemaPath, goPath})
+			if key == "github.com/maximhq/bifrost/core/schemas.SecretVar" {
+				c.secretVarFields = append(c.secretVarFields, secretVarLocation{schemaPath, goPath})
 			}
 			return
 		}
@@ -802,8 +933,8 @@ func (c *checker) walkField(t types.Type, schemaNode map[string]any, schemaPath,
 	if named, ok := t.(*types.Named); ok {
 		key := named.Obj().Pkg().Path() + "." + named.Obj().Name()
 		if _, isOpaque := opaqueLeafTypes[key]; isOpaque {
-			if key == "github.com/maximhq/bifrost/core/schemas.EnvVar" {
-				c.envVarFields = append(c.envVarFields, envVarLocation{schemaPath, goPath})
+			if key == "github.com/maximhq/bifrost/core/schemas.SecretVar" {
+				c.secretVarFields = append(c.secretVarFields, secretVarLocation{schemaPath, goPath})
 			}
 			return // do not recurse into opaque types
 		}
@@ -888,6 +1019,9 @@ func (c *checker) checkEnum(goVals []string, schemaNode map[string]any, schemaPa
 	node := c.resolveRef(schemaNode)
 	rawEnum, ok := node["enum"]
 	if !ok {
+		if _, ignored := ignoreEnumPaths[schemaPath]; ignored {
+			return
+		}
 		c.add(Finding{
 			Category: "enum-no-schema",
 			Severity: "WARN",
@@ -912,9 +1046,15 @@ func (c *checker) checkEnum(goVals []string, schemaNode map[string]any, schemaPa
 	for _, v := range goVals {
 		goSet[v] = true
 	}
+	excused := map[string]bool{}
+	if narrowed, ok := narrowedEnumPaths[schemaPath]; ok {
+		for _, v := range narrowed.excluded {
+			excused[v] = true
+		}
+	}
 	var missingInSchema, extraInSchema []string
 	for v := range goSet {
-		if !schemaSet[v] {
+		if !schemaSet[v] && !excused[v] {
 			missingInSchema = append(missingInSchema, v)
 		}
 	}

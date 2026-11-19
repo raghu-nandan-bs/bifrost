@@ -39,7 +39,8 @@ func ToReplicateChatRequest(bifrostReq *schemas.BifrostChatRequest) (*ReplicateP
 				input.InputItemList = responsesMessages
 			}
 		} else {
-			input.Messages = bifrostReq.Input
+			// An OpenAI model on Replicate takes text only in a tool message, as on OpenAI.
+			input.Messages = schemas.FlattenToolMessagesMedia(bifrostReq.Input)
 		}
 	} else {
 		// Extract system prompt and build conversation prompt
@@ -181,6 +182,20 @@ func ToReplicateChatRequest(bifrostReq *schemas.BifrostChatRequest) (*ReplicateP
 					input.Tools = responsesTools
 				}
 			}
+			// gpt-5-structured takes its schema as the `json_schema` input, in
+			// the Responses text-config shape. Without this mapping a chat
+			// request reaches the model with no structured output at all, while
+			// the same request on the Responses path gets one.
+			//
+			// Only a json_schema format belongs here. The converter returns a non-nil
+			// format for every recognized response_format.type, but for "text" and
+			// "json_object" that format carries Type alone -- assigning it sent a
+			// schema-less structured-output config the model can reject.
+			if format := schemas.ResponsesTextConfigFormatFromChatResponseFormat(params.ResponseFormat); format != nil {
+				if format.Type == "json_schema" && format.JSONSchema != nil {
+					input.JsonSchema = &schemas.ResponsesTextConfig{Format: format}
+				}
+			}
 		}
 
 		if params.ExtraParams != nil {
@@ -295,6 +310,8 @@ func (response *ReplicatePredictionResponse) ToBifrostChatResponse() *schemas.Bi
 }
 
 // supportsSystemPrompt checks if a model supports the system_prompt field.
+// Prefers the datasheet's supports_system_messages, falling back to the model
+// list above. Callers fold the text into the prompt when this is false.
 func supportsSystemPrompt(model string) bool {
 	// Normalize model name to lowercase for comparison
 	modelLower := strings.ToLower(model)
@@ -306,10 +323,8 @@ func supportsSystemPrompt(model string) bool {
 	}
 
 	// All deepseek models don't support system prompt
-	if strings.HasPrefix(modelIdentifier, "deepseek-ai/deepseek") {
-		return false
-	}
+	fallback := !strings.HasPrefix(modelIdentifier, "deepseek-ai/deepseek") &&
+		!slices.Contains(unsupportedSystemPromptModels, modelIdentifier)
 
-	isUnsupported := slices.Contains(unsupportedSystemPromptModels, modelIdentifier)
-	return !isUnsupported
+	return schemas.ResolveModelCaps(schemas.Replicate, modelIdentifier).SupportsSystemMessages(fallback)
 }

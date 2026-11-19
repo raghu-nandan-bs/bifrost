@@ -1,6 +1,6 @@
 import { ColumnPinningState, VisibilityState } from "@tanstack/react-table";
 import { parseAsString, useQueryState } from "nuqs";
-import { useCallback, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 
 export interface ColumnConfigEntry {
 	id: string;
@@ -15,6 +15,45 @@ interface UseColumnConfigOptions {
 	paramName?: string;
 	/** Columns excluded from configuration (always visible, always in position) */
 	fixedColumns?: { left?: string[]; right?: string[] };
+	/**
+	 * localStorage key for persisting the config across sessions. When set, the
+	 * stored config seeds the table on load if the URL param is empty (URL wins).
+	 */
+	storageKey?: string;
+	/** Configurable column IDs that should be hidden by default (when not in URL/localStorage). */
+	defaultHidden?: string[];
+}
+
+/**
+ * A saved config merged with the table's current columns: saved columns keep their order and flags,
+ * removed ones are dropped, and a column added since the config was saved goes right after the
+ * column that precedes it in the default order, so it lands where a fresh table shows it rather
+ * than at the far end.
+ */
+export function mergeColumnEntries(
+	saved: ColumnConfigEntry[],
+	configurableIds: string[],
+	defaultHidden: ReadonlySet<string>,
+): ColumnConfigEntry[] {
+	const result: ColumnConfigEntry[] = [];
+	const seen = new Set<string>();
+	for (const entry of saved) {
+		if (configurableIds.includes(entry.id) && !seen.has(entry.id)) {
+			result.push(entry);
+			seen.add(entry.id);
+		}
+	}
+	configurableIds.forEach((id, i) => {
+		if (seen.has(id)) return;
+		const before = configurableIds
+			.slice(0, i)
+			.reverse()
+			.find((prev) => seen.has(prev));
+		const at = before === undefined ? 0 : result.findIndex((e) => e.id === before) + 1;
+		result.splice(at, 0, { id, visible: !defaultHidden.has(id), pinned: false });
+		seen.add(id);
+	});
+	return result;
 }
 
 // URL format: col1,col2:h,col3:l,col4:r
@@ -45,7 +84,18 @@ function deserialize(str: string): ColumnConfigEntry[] {
 	});
 }
 
-export function useColumnConfig({ columnIds, paramName = "cols", fixedColumns }: UseColumnConfigOptions) {
+function isSerializedConfigValid(str: string): boolean {
+	try {
+		return str.split(",").every((part) => {
+			const [rawId, flags = ""] = part.split(":");
+			return rawId !== "" && decodeURIComponent(rawId) !== "" && /^[hlr]*$/.test(flags) && !(flags.includes("l") && flags.includes("r"));
+		});
+	} catch {
+		return false;
+	}
+}
+
+export function useColumnConfig({ columnIds, paramName = "cols", fixedColumns, storageKey, defaultHidden }: UseColumnConfigOptions) {
 	const [raw, setRaw] = useQueryState(paramName, parseAsString.withDefault(""));
 
 	const fixedLeft = fixedColumns?.left ?? [];
@@ -54,29 +104,34 @@ export function useColumnConfig({ columnIds, paramName = "cols", fixedColumns }:
 
 	const configurableIds = useMemo(() => columnIds.filter((id) => !fixedSet.has(id)), [columnIds, fixedSet]);
 
+	const defaultHiddenSet = useMemo(() => new Set(defaultHidden ?? []), [defaultHidden]);
+
+	// Seed from localStorage once on mount when the URL has no config (URL wins).
+	const hydratedRef = useRef(false);
+	useEffect(() => {
+		if (hydratedRef.current || !storageKey) return;
+		hydratedRef.current = true;
+		if (raw) return; // explicit URL config takes precedence
+		try {
+			const stored = localStorage.getItem(storageKey);
+			if (stored) {
+				if (isSerializedConfigValid(stored)) {
+					setRaw(stored);
+				} else {
+					localStorage.removeItem(storageKey);
+				}
+			}
+		} catch {
+			// localStorage unavailable (SSR, privacy mode) — keep default.
+		}
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, []);
+
 	// Merge URL config with available columns (handles added/removed columns)
-	const entries = useMemo(() => {
-		const parsed = deserialize(raw);
-		const result: ColumnConfigEntry[] = [];
-		const seen = new Set<string>();
-
-		// Columns present in URL config that still exist
-		for (const entry of parsed) {
-			if (configurableIds.includes(entry.id) && !seen.has(entry.id)) {
-				result.push(entry);
-				seen.add(entry.id);
-			}
-		}
-
-		// New columns not yet in URL config
-		for (const id of configurableIds) {
-			if (!seen.has(id)) {
-				result.push({ id, visible: true, pinned: false });
-			}
-		}
-
-		return result;
-	}, [raw, configurableIds]);
+	const entries = useMemo(
+		() => mergeColumnEntries(deserialize(raw), configurableIds, defaultHiddenSet),
+		[raw, configurableIds, defaultHiddenSet],
+	);
 
 	// TanStack table state
 	const columnOrder = useMemo(() => [...fixedLeft, ...entries.map((e) => e.id), ...fixedRight], [entries, fixedLeft, fixedRight]);
@@ -101,8 +156,16 @@ export function useColumnConfig({ columnIds, paramName = "cols", fixedColumns }:
 		(newEntries: ColumnConfigEntry[]) => {
 			const serialized = serialize(newEntries);
 			setRaw(serialized || null);
+			if (storageKey) {
+				try {
+					if (serialized) localStorage.setItem(storageKey, serialized);
+					else localStorage.removeItem(storageKey);
+				} catch {
+					// localStorage unavailable — preference won't persist.
+				}
+			}
 		},
-		[setRaw],
+		[setRaw, storageKey],
 	);
 
 	const toggleVisibility = useCallback(
@@ -128,7 +191,14 @@ export function useColumnConfig({ columnIds, paramName = "cols", fixedColumns }:
 
 	const reset = useCallback(() => {
 		setRaw(null);
-	}, [setRaw]);
+		if (storageKey) {
+			try {
+				localStorage.removeItem(storageKey);
+			} catch {
+				// localStorage unavailable — nothing to clear.
+			}
+		}
+	}, [setRaw, storageKey]);
 
 	return {
 		entries,

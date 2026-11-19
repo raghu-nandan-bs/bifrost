@@ -72,7 +72,7 @@ func (a *Accumulator) processAccumulatedAudioStreamingChunks(requestID string, b
 	data.EndTimestamp = accumulator.FinalTimestamp
 	data.AudioOutput = completeMessage
 	data.ErrorDetails = bifrostErr
-	// Update metadata from the chunk with highest index (contains TokenUsage, Cost, CacheDebug)
+	// Update metadata from the chunk with highest index (contains token usage, cost, and cache metadata).
 	if lastChunk := accumulator.getLastAudioChunkLocked(); lastChunk != nil {
 		if lastChunk.TokenUsage != nil {
 			data.TokenUsage = &schemas.BifrostLLMUsage{
@@ -181,6 +181,7 @@ func (a *Accumulator) processAudioStreamingResponse(ctx *schemas.BifrostContext,
 			StreamType:     StreamTypeAudio,
 			RequestedModel: requestedModel,
 			ResolvedModel:  resolvedModel,
+			RoutingInfo:    bifrost.GetResponseRoutingInfo(result, bifrostErr),
 			Provider:       provider,
 			Data:           data,
 			RawRequest:     &rawRequest,
@@ -193,6 +194,7 @@ func (a *Accumulator) processAudioStreamingResponse(ctx *schemas.BifrostContext,
 		StreamType:     StreamTypeAudio,
 		RequestedModel: requestedModel,
 		ResolvedModel:  resolvedModel,
+		RoutingInfo:    bifrost.GetResponseRoutingInfo(result, bifrostErr),
 		Provider:       provider,
 		Data:           nil,
 	}, nil

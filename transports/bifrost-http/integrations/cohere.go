@@ -7,7 +7,7 @@ import (
 	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/providers/cohere"
 	"github.com/maximhq/bifrost/core/schemas"
-	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
+	"github.com/maximhq/bifrost/transports/v2/bifrost-http/lib"
 	"github.com/valyala/fasthttp"
 )
 
@@ -63,26 +63,10 @@ type CohereRouter struct {
 }
 
 // NewCohereRouter creates a new CohereRouter with the given bifrost client.
-func NewCohereRouter(client *bifrost.Bifrost, handlerStore lib.HandlerStore, logger schemas.Logger) *CohereRouter {
+func NewCohereRouter(client *bifrost.Bifrost, handlerStore lib.HandlerStore, accessResolver AccessResolver, logger schemas.Logger) *CohereRouter {
 	return &CohereRouter{
-		GenericRouter: NewGenericRouter(client, handlerStore, CreateCohereRouteConfigs("/cohere"), nil, logger),
+		GenericRouter: NewGenericRouter(client, handlerStore, accessResolver, CreateCohereRouteConfigs("/cohere"), nil, logger),
 	}
-}
-
-// cohereModelGetter extracts the model field from any Cohere integration request type.
-// It is called after body parsing, so req is fully populated.
-func cohereModelGetter(_ *fasthttp.RequestCtx, req interface{}) (string, error) {
-	switch r := req.(type) {
-	case *cohere.CohereChatRequest:
-		return r.Model, nil
-	case *cohere.CohereEmbeddingRequest:
-		return r.Model, nil
-	case *cohere.CohereRerankRequest:
-		return r.Model, nil
-	case *cohere.CohereCountTokensRequest:
-		return r.Model, nil
-	}
-	return "", nil
 }
 
 // CreateCohereRouteConfigs creates route configurations for Cohere API endpoints.
@@ -101,7 +85,6 @@ func CreateCohereRouteConfigs(pathPrefix string) []RouteConfig {
 		GetRequestTypeInstance: func(ctx context.Context) interface{} {
 			return &cohere.CohereChatRequest{}
 		},
-		GetRequestModel: cohereModelGetter,
 		RequestConverter: func(ctx *schemas.BifrostContext, req interface{}) (*schemas.BifrostRequest, error) {
 			if cohereReq, ok := req.(*cohere.CohereChatRequest); ok {
 				return &schemas.BifrostRequest{
@@ -116,10 +99,10 @@ func CreateCohereRouteConfigs(pathPrefix string) []RouteConfig {
 					return resp.ExtraFields.RawResponse, nil
 				}
 			}
-			return resp, nil
+			return cohere.ToCohereChatResponse(resp), nil
 		},
 		ErrorConverter: func(ctx *schemas.BifrostContext, err *schemas.BifrostError) interface{} {
-			return err
+			return cohere.ToCohereError(err)
 		},
 		StreamConfig: &StreamConfig{
 			ChatStreamResponseConverter: func(ctx *schemas.BifrostContext, resp *schemas.BifrostChatResponse) (string, interface{}, error) {
@@ -131,7 +114,7 @@ func CreateCohereRouteConfigs(pathPrefix string) []RouteConfig {
 				return "", resp, nil
 			},
 			ErrorConverter: func(ctx *schemas.BifrostContext, err *schemas.BifrostError) interface{} {
-				return err
+				return cohere.ToCohereError(err)
 			},
 		},
 	})
@@ -148,11 +131,14 @@ func CreateCohereRouteConfigs(pathPrefix string) []RouteConfig {
 		GetRequestTypeInstance: func(ctx context.Context) interface{} {
 			return &cohere.CohereEmbeddingRequest{}
 		},
-		GetRequestModel: cohereModelGetter,
 		RequestConverter: func(ctx *schemas.BifrostContext, req interface{}) (*schemas.BifrostRequest, error) {
 			if cohereReq, ok := req.(*cohere.CohereEmbeddingRequest); ok {
+				embReq, err := cohereReq.ToBifrostEmbeddingRequest(ctx)
+				if err != nil {
+					return nil, err
+				}
 				return &schemas.BifrostRequest{
-					EmbeddingRequest: cohereReq.ToBifrostEmbeddingRequest(ctx),
+					EmbeddingRequest: embReq,
 				}, nil
 			}
 			return nil, errors.New("invalid embedding request type")
@@ -163,10 +149,10 @@ func CreateCohereRouteConfigs(pathPrefix string) []RouteConfig {
 					return resp.ExtraFields.RawResponse, nil
 				}
 			}
-			return resp, nil
+			return cohere.ToCohereEmbeddingResponse(resp), nil
 		},
 		ErrorConverter: func(ctx *schemas.BifrostContext, err *schemas.BifrostError) interface{} {
-			return err
+			return cohere.ToCohereError(err)
 		},
 	})
 
@@ -182,7 +168,6 @@ func CreateCohereRouteConfigs(pathPrefix string) []RouteConfig {
 		GetRequestTypeInstance: func(ctx context.Context) interface{} {
 			return &cohere.CohereRerankRequest{}
 		},
-		GetRequestModel: cohereModelGetter,
 		RequestConverter: func(ctx *schemas.BifrostContext, req interface{}) (*schemas.BifrostRequest, error) {
 			if cohereReq, ok := req.(*cohere.CohereRerankRequest); ok {
 				return &schemas.BifrostRequest{
@@ -192,15 +177,15 @@ func CreateCohereRouteConfigs(pathPrefix string) []RouteConfig {
 			return nil, errors.New("invalid rerank request type")
 		},
 		RerankResponseConverter: func(ctx *schemas.BifrostContext, resp *schemas.BifrostRerankResponse) (interface{}, error) {
-			if resp.ExtraFields.Provider == schemas.Cohere {
-				if resp.ExtraFields.RawResponse != nil {
-					return resp.ExtraFields.RawResponse, nil
-				}
+			// Only return raw response for native Cohere calls
+			// For cross-provider routing, always convert to Cohere format
+			if resp.ExtraFields.RawResponse != nil && resp.ExtraFields.Provider == schemas.Cohere {
+				return resp.ExtraFields.RawResponse, nil
 			}
-			return resp, nil
+			return cohere.ToCohereRerankResponse(resp), nil
 		},
 		ErrorConverter: func(ctx *schemas.BifrostContext, err *schemas.BifrostError) interface{} {
-			return err
+			return cohere.ToCohereError(err)
 		},
 	})
 
@@ -216,7 +201,6 @@ func CreateCohereRouteConfigs(pathPrefix string) []RouteConfig {
 		GetRequestTypeInstance: func(ctx context.Context) interface{} {
 			return &cohere.CohereCountTokensRequest{}
 		},
-		GetRequestModel: cohereModelGetter,
 		RequestConverter: func(ctx *schemas.BifrostContext, req interface{}) (*schemas.BifrostRequest, error) {
 			if cohereReq, ok := req.(*cohere.CohereCountTokensRequest); ok {
 				return &schemas.BifrostRequest{
@@ -234,7 +218,7 @@ func CreateCohereRouteConfigs(pathPrefix string) []RouteConfig {
 			return resp, nil
 		},
 		ErrorConverter: func(ctx *schemas.BifrostContext, err *schemas.BifrostError) interface{} {
-			return err
+			return cohere.ToCohereError(err)
 		},
 	})
 

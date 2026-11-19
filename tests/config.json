@@ -1,6 +1,10 @@
 {
   "$schema": "https://www.getbifrost.ai/schema",
+  "setup_token": "bifrost-e2e-setup-token",
   "mcp": {
+    "tool_manager_config": {
+      "oauth_private_allowlist": ["localhost", "127.0.0.1", "::1"]
+    },
     "client_configs": [
       {
         "name": "sse_mcp",
@@ -59,6 +63,22 @@
         "default_request_timeout_in_seconds": 300
       }
     },
+    "cloudflare": {
+      "keys": [
+        {
+          "name": "Cloudflare API Key",
+          "value": "env.CLOUDFLARE_API_TOKEN",
+          "weight": 1,
+          "models": ["*"],
+          "cloudflare_key_config": {
+            "account_id": "env.CLOUDFLARE_ACCOUNT_ID"
+          }
+        }
+      ],
+      "network_config": {
+        "default_request_timeout_in_seconds": 300
+      }
+    },
     "huggingface": {
       "keys": [
         {
@@ -111,7 +131,18 @@
             "auth_credentials": "env.VERTEX_CREDENTIALS"
           },
           "weight": 1,
-          "models": ["*"]
+          "models": ["*"],
+          "blacklisted_models": ["claude-sonnet-4-6", "claude-opus-4-8", "moonshotai/kimi-k2-thinking-maas", "minimaxai/minimax-m2-maas"]
+        },
+        {
+          "name": "Vertex Global (Claude)",
+          "vertex_key_config": {
+            "project_id": "env.VERTEX_PROJECT_ID",
+            "region": "global",
+            "auth_credentials": "env.VERTEX_CREDENTIALS"
+          },
+          "weight": 1,
+          "models": ["claude-sonnet-4-6", "claude-opus-4-8", "moonshotai/kimi-k2-thinking-maas", "minimaxai/minimax-m2-maas"]
         }
       ],
       "network_config": {
@@ -280,6 +311,18 @@
         {
           "name": "Runway API Key",
           "value": "env.RUNWAY_API_KEY",
+          "weight": 1
+        }
+      ],
+      "network_config": {
+        "default_request_timeout_in_seconds": 300
+      }
+    },
+    "machgen": {
+      "keys": [
+        {
+          "name": "MachGen API Key",
+          "value": "env.MACHGEN_API_KEY",
           "weight": 1
         }
       ],

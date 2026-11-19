@@ -3,6 +3,13 @@
 // maintain by hand in the checked-in Postman collection.
 
 import { readFileSync, writeFileSync } from "node:fs";
+import { buildTokenParityMatrix } from "./lib/token-parity-matrix.mjs";
+import { buildPromptCachingHitVerificationItems } from "./lib/prompt-caching-extension.mjs";
+import { buildMidConvSystemCacheParityFolder } from "./lib/midconv-system-cache-parity.mjs";
+import { buildCrossProviderCacheMatrixFolder } from "./lib/crossprovider-cache-matrix.mjs";
+import { buildDirectCacheParityFolder } from "./lib/direct-cache-parity.mjs";
+import { injectChainedVarGuards } from "./lib/chained-vars.mjs";
+import { routeScriptCallsThroughSetupToken } from "./lib/setup-token.mjs";
 
 const args = Object.fromEntries(
   process.argv.slice(2).reduce((acc, cur, i, arr) => {
@@ -83,7 +90,7 @@ const genaiItem = ({ name, model, body }) => ({
 const effortModels = [
   { label: "openai/gpt-5", model: "openai/gpt-5" },
   { label: "openai/gpt-5-mini", model: "openai/gpt-5-mini" },
-  { label: "openai/o3-mini", model: "openai/o3-mini" },
+  { label: "openai/gpt-5.4-mini", model: "openai/gpt-5.4-mini" },
   { label: "anthropic/claude-opus-4-7", model: "anthropic/claude-opus-4-7", maxTokens: 4096 },
   { label: "anthropic/claude-sonnet-4-6", model: "anthropic/claude-sonnet-4-6", maxTokens: 4096 },
   { label: "bedrock/claude-opus-4-7", model: "bedrock/global.anthropic.claude-opus-4-7", maxTokens: 4096 },
@@ -324,6 +331,10 @@ const generatedFolders = [
     description: "Generated at harness runtime. Ensures each interactive feature bucket has streaming coverage where the request shape supports stream:true.",
     item: streamingFeatureItems,
   },
+  buildTokenParityMatrix(),
+  buildMidConvSystemCacheParityFolder(),
+  buildCrossProviderCacheMatrixFolder(),
+  buildDirectCacheParityFolder(),
 ];
 
 const findFolder = (items, name) => {
@@ -345,6 +356,61 @@ const generatedNames = new Set(generatedFolders.map((f) => f.name));
 backlog.item = (backlog.item || []).filter((entry) => !generatedNames.has(entry.name));
 backlog.item.push(...generatedFolders);
 
+// Extends the existing hand-written Round 16 folder in place (not a new generated folder -
+// see prompt-caching-extension.mjs for why) with real cache-hit verification rows. Idempotent
+// regen: strip any rows this generator previously added (by name prefix) before re-adding, same
+// pattern as the generatedFolders replace-by-name above, just at row granularity instead of
+// folder granularity since we're appending into someone else's folder, not owning it outright.
+const cachingFolder = findFolder(collection.item, "Cross-Cut Round 16: Prompt Caching Matrix");
+if (!cachingFolder) {
+  console.error("[augment-provider-harness] Cross-Cut Round 16 folder not found");
+  process.exit(1);
+}
+const cachingItems = buildPromptCachingHitVerificationItems();
+const CACHING_PREFIX = "Prompt caching hit-verification:";
+cachingFolder.item = (cachingFolder.item || []).filter((entry) => !(entry.name || "").startsWith(CACHING_PREFIX));
+cachingFolder.item.push(...cachingItems);
+
+// Last pass, over hand-written and generated items alike: any request whose raw body OR URL drops
+// in a variable that an EARLIER request's test script computed gets a pre-request guard. Without
+// it an unset variable leaves the literal "{{var}}" in place - a 400 "Invalid JSON" from a body,
+// or a percent-encoded "%7B%7Bid%7D%7D" path segment the provider rejects as a malformed id -
+// which reads as a defect in the consumer rather than in whatever actually broke upstream.
+// See lib/chained-vars.mjs.
+const guardedCount = injectChainedVarGuards(collection);
+
+// OSS setup lock: while dashboard auth is not active, the gateway refuses every /api call
+// that lacks the operator's setup token. Management rows (routing rules, is-auth-enabled,
+// ...) run against the python profile, which sets setup_token and has no admin account, so
+// every row carries the header. The value defaults to that profile's token; override it
+// with `--env-var setupToken=...`. Inference routes ignore the header, and so does /api once
+// dashboard auth is enabled. Lockout rows remove it in their own prerequest, which runs
+// after this collection-level one.
+const SETUP_TOKEN_VAR = "setupToken";
+collection.variable = Array.isArray(collection.variable) ? collection.variable : [];
+if (!collection.variable.some((v) => v.key === SETUP_TOKEN_VAR)) {
+  collection.variable.push({ key: SETUP_TOKEN_VAR, value: process.env.BIFROST_SETUP_TOKEN || "bifrost-e2e-setup-token" });
+}
+collection.event = Array.isArray(collection.event) ? collection.event : [];
+collection.event.unshift({
+  listen: "prerequest",
+  script: {
+    type: "text/javascript",
+    exec: [
+      `var __setupToken = pm.variables.get('${SETUP_TOKEN_VAR}');`,
+      "if (__setupToken) {",
+      "  pm.request.headers.upsert({ key: 'X-Bifrost-Setup-Token', value: __setupToken });",
+      "}",
+    ],
+  },
+});
+
+// That prerequest reaches only each row's own request. A call a script sends itself through
+// pm.sendRequest - creating a run-scoped provider, key, virtual key or rule, or reading /api/logs -
+// is a separate request, so those scripts are routed through a helper that adds the token to
+// calls aimed at this gateway's /api. See lib/setup-token.mjs.
+const tokenRoutedScripts = routeScriptCallsThroughSetupToken(collection, SETUP_TOKEN_VAR);
+
 writeFileSync(out, `${JSON.stringify(collection, null, 2)}\n`);
-const generatedCount = generatedFolders.reduce((sum, folder) => sum + folder.item.length, 0);
-console.error(`[augment-provider-harness] wrote ${out} with ${generatedCount} generated requests`);
+const generatedCount = generatedFolders.reduce((sum, folder) => sum + folder.item.length, 0) + cachingItems.length;
+console.error(`[augment-provider-harness] wrote ${out} with ${generatedCount} generated requests, ${guardedCount} chained-var guards, ${tokenRoutedScripts} scripts sending the setup token`);

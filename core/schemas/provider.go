@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"slices"
+	"strings"
 	"time"
 )
 
@@ -13,21 +15,30 @@ const (
 	DefaultMaxRetries                 = 0
 	DefaultRetryBackoffInitial        = 500 * time.Millisecond
 	DefaultRetryBackoffMax            = 5 * time.Second
-	DefaultRequestTimeoutInSeconds    = 30
+	DefaultRequestTimeoutInSeconds    = 300
 	DefaultMaxConnDurationInSeconds   = 300 // 5 minutes — forces connection recycling to prevent stale connections from NAT/LB silent drops
 	DefaultBufferSize                 = 5000
 	DefaultConcurrency                = 1000
 	DefaultStreamBufferSize           = 256
-	DefaultStreamIdleTimeoutInSeconds = 60 // Idle timeout per stream chunk — if no data for this many seconds, bifrost closes the connection
+	DefaultStreamIdleTimeoutInSeconds = 120 // Idle timeout per stream chunk — if no data for this many seconds, bifrost closes the connection
+	DefaultKeepAliveTimeoutInSeconds  = 30  // Idle keep-alive for pooled connections — how long an idle connection is kept for reuse before being closed
 	DefaultMaxConnsPerHost            = 5000
 	MaxConnsPerHostUpperBound         = 10000
 	DefaultMaxIdleConnsPerHost        = 40
+	// HTTP2PingIntervalUpperBoundSeconds matches the sibling *_in_seconds fields
+	// on NetworkConfig (StreamIdleTimeoutInSeconds, KeepAliveTimeoutInSeconds),
+	// which cap at 3600 in config.schema.json — a sensible range for this field
+	// and, incidentally, nowhere near where the * time.Second conversion in the
+	// Bedrock transport could overflow int64 (math.MaxInt64 / time.Second).
+	HTTP2PingIntervalUpperBoundSeconds = 3600
 )
 
 // Pre-defined errors for provider operations
 const (
-	ErrProviderRequestTimedOut      = "request timed out (default is 30 seconds). You can increase it by setting the default_request_timeout_in_seconds in the network_config or in UI - Providers > Provider Name > Network Config."
+	ErrProviderRequestTimedOut      = "request timed out (default is 300 seconds). You can increase it by setting the default_request_timeout_in_seconds in the network_config or in UI - Providers > Provider Name > Network Config."
 	ErrRequestCancelled             = "request cancelled by caller"
+	ErrStreamFirstTokenTimeout      = "TTFT timeout: stream produced no first token before the deadline"
+	FirstTokenTimeoutErrorCode      = "ttft_timeout"
 	ErrRequestBodyConversion        = "failed to convert bifrost request to the expected provider request body"
 	ErrProviderRequestMarshal       = "failed to marshal request body to JSON"
 	ErrProviderCreateRequest        = "failed to create HTTP request to provider API"
@@ -40,6 +51,7 @@ const (
 	ErrProviderRawRequestUnmarshal  = "failed to unmarshal raw request from provider API"
 	ErrProviderRawResponseUnmarshal = "failed to unmarshal raw response from provider API"
 	ErrProviderResponseDecompress   = "failed to decompress provider's response"
+	ErrProviderStreamTruncated      = "provider closed the stream before sending a completion marker (upstream connection ended mid-stream)"
 )
 
 // NetworkConfig represents the network configuration for provider connections.
@@ -50,19 +62,23 @@ const (
 //   - Duration string: "500ms", "5s", "1m" — parsed via time.ParseDuration (preferred)
 //   - Integer: treated as milliseconds (legacy format, e.g. 500 means 500ms)
 type NetworkConfig struct {
-	// BaseURL is supported for OpenAI, Anthropic, Cohere, Mistral, and Ollama providers (required for Ollama)
-	BaseURL                        string            `json:"base_url,omitempty"`                       // Base URL for the provider (optional)
-	ExtraHeaders                   map[string]string `json:"extra_headers,omitempty"`                  // Additional headers to include in requests (optional)
-	DefaultRequestTimeoutInSeconds int               `json:"default_request_timeout_in_seconds"`       // Default timeout for requests
-	MaxRetries                     int               `json:"max_retries"`                              // Maximum number of retries
-	RetryBackoffInitial            time.Duration     `json:"retry_backoff_initial"`                    // Initial backoff duration (stored as nanoseconds, JSON as milliseconds)
-	RetryBackoffMax                time.Duration     `json:"retry_backoff_max"`                        // Maximum backoff duration (stored as nanoseconds, JSON as milliseconds)
-	InsecureSkipVerify             bool              `json:"insecure_skip_verify,omitempty"`           // Disables TLS certificate verification for provider connections
-	CACertPEM                      *EnvVar           `json:"ca_cert_pem,omitempty"`                    // PEM-encoded CA certificate to trust for provider endpoint connections (supports env.*)
-	StreamIdleTimeoutInSeconds     int               `json:"stream_idle_timeout_in_seconds,omitempty"` // Idle timeout per stream chunk (0 = use default 60s)
-	MaxConnsPerHost                int               `json:"max_conns_per_host,omitempty"`             // Max TCP connections per provider host (default: 5000)
-	EnforceHTTP2                   bool              `json:"enforce_http2,omitempty"`                  // Force HTTP/2 on provider connections (relevant for net/http-based providers like Bedrock)
-	BetaHeaderOverrides            map[string]bool   `json:"beta_header_overrides,omitempty"`          // Override default beta header support per provider (keys are prefixes like "redact-thinking-")
+	// BaseURL is supported for OpenAI, Anthropic, Cohere, Mistral, and Ollama providers (required for Ollama).
+	// Bedrock uses only its host, as the bedrock-runtime host for all inference.
+	BaseURL                        string               `json:"base_url,omitempty"`                       // Base URL for the provider (optional)
+	ExtraHeaders                   map[string]SecretVar `json:"extra_headers,omitempty"`                  // Additional headers to include in requests (optional; values support env.* and vault.* references)
+	DefaultRequestTimeoutInSeconds int                  `json:"default_request_timeout_in_seconds"`       // Default timeout for requests
+	MaxRetries                     int                  `json:"max_retries"`                              // Maximum number of retries
+	RetryBackoffInitial            time.Duration        `json:"retry_backoff_initial"`                    // Initial backoff duration (stored as nanoseconds, JSON as milliseconds)
+	RetryBackoffMax                time.Duration        `json:"retry_backoff_max"`                        // Maximum backoff duration (stored as nanoseconds, JSON as milliseconds)
+	InsecureSkipVerify             bool                 `json:"insecure_skip_verify,omitempty"`           // Disables TLS certificate verification for provider connections
+	CACertPEM                      *SecretVar           `json:"ca_cert_pem,omitempty"`                    // PEM-encoded CA certificate to trust for provider endpoint connections (supports env.*)
+	StreamIdleTimeoutInSeconds     int                  `json:"stream_idle_timeout_in_seconds,omitempty"` // Idle timeout per stream chunk (0 = use default 60s)
+	KeepAliveTimeoutInSeconds      int                  `json:"keep_alive_timeout_in_seconds,omitempty"`  // Idle keep-alive for pooled connections; set below the upstream server's keep-alive to avoid reusing connections it has already closed. Default: 30s
+	MaxConnsPerHost                int                  `json:"max_conns_per_host,omitempty"`             // Max TCP connections per provider host (default: 5000)
+	EnforceHTTP2                   bool                 `json:"enforce_http2,omitempty"`                  // Force HTTP/2 on provider connections (relevant for net/http-based providers like Bedrock)
+	HTTP2PingIntervalInSeconds     int                  `json:"http2_ping_interval_in_seconds,omitempty"` // Seconds of stream idle before an HTTP/2 keepalive PING (0 = disabled; only when enforce_http2)
+	BetaHeaderOverrides            map[string]bool      `json:"beta_header_overrides,omitempty"`          // Override default beta header support per provider (keys are prefixes like "redact-thinking-")
+	AllowPrivateNetwork            bool                 `json:"allow_private_network,omitempty"`          // Allow connections to RFC 1918 private IPs (for k8s pods, LAN deployments). Link-local (169.254.x.x) is always blocked.
 }
 
 // UnmarshalJSON customizes JSON unmarshaling for NetworkConfig.
@@ -74,18 +90,21 @@ type NetworkConfig struct {
 func (nc *NetworkConfig) UnmarshalJSON(data []byte) error {
 	// Use an alias type to avoid infinite recursion
 	type NetworkConfigAlias struct {
-		BaseURL                        string            `json:"base_url,omitempty"`
-		ExtraHeaders                   map[string]string `json:"extra_headers,omitempty"`
-		DefaultRequestTimeoutInSeconds int               `json:"default_request_timeout_in_seconds"`
-		MaxRetries                     int               `json:"max_retries"`
-		RetryBackoffInitial            json.RawMessage   `json:"retry_backoff_initial"` // string ("500ms") or int (milliseconds)
-		RetryBackoffMax                json.RawMessage   `json:"retry_backoff_max"`     // string ("5s") or int (milliseconds)
-		InsecureSkipVerify             bool              `json:"insecure_skip_verify,omitempty"`
-		CACertPEM                      *EnvVar           `json:"ca_cert_pem,omitempty"`
-		StreamIdleTimeoutInSeconds     int               `json:"stream_idle_timeout_in_seconds,omitempty"`
-		MaxConnsPerHost                int               `json:"max_conns_per_host,omitempty"`
-		EnforceHTTP2                   bool              `json:"enforce_http2,omitempty"`
-		BetaHeaderOverrides            map[string]bool   `json:"beta_header_overrides,omitempty"`
+		BaseURL                        string               `json:"base_url,omitempty"`
+		ExtraHeaders                   map[string]SecretVar `json:"extra_headers,omitempty"`
+		DefaultRequestTimeoutInSeconds int                  `json:"default_request_timeout_in_seconds"`
+		MaxRetries                     int                  `json:"max_retries"`
+		RetryBackoffInitial            json.RawMessage      `json:"retry_backoff_initial"` // string ("500ms") or int (milliseconds)
+		RetryBackoffMax                json.RawMessage      `json:"retry_backoff_max"`     // string ("5s") or int (milliseconds)
+		InsecureSkipVerify             bool                 `json:"insecure_skip_verify,omitempty"`
+		CACertPEM                      *SecretVar           `json:"ca_cert_pem,omitempty"`
+		StreamIdleTimeoutInSeconds     int                  `json:"stream_idle_timeout_in_seconds,omitempty"`
+		KeepAliveTimeoutInSeconds      int                  `json:"keep_alive_timeout_in_seconds,omitempty"`
+		MaxConnsPerHost                int                  `json:"max_conns_per_host,omitempty"`
+		EnforceHTTP2                   bool                 `json:"enforce_http2,omitempty"`
+		HTTP2PingIntervalInSeconds     int                  `json:"http2_ping_interval_in_seconds,omitempty"`
+		BetaHeaderOverrides            map[string]bool      `json:"beta_header_overrides,omitempty"`
+		AllowPrivateNetwork            bool                 `json:"allow_private_network,omitempty"`
 	}
 
 	var alias NetworkConfigAlias
@@ -101,9 +120,12 @@ func (nc *NetworkConfig) UnmarshalJSON(data []byte) error {
 	nc.InsecureSkipVerify = alias.InsecureSkipVerify
 	nc.CACertPEM = alias.CACertPEM
 	nc.StreamIdleTimeoutInSeconds = alias.StreamIdleTimeoutInSeconds
+	nc.KeepAliveTimeoutInSeconds = alias.KeepAliveTimeoutInSeconds
 	nc.MaxConnsPerHost = alias.MaxConnsPerHost
 	nc.EnforceHTTP2 = alias.EnforceHTTP2
+	nc.HTTP2PingIntervalInSeconds = alias.HTTP2PingIntervalInSeconds
 	nc.BetaHeaderOverrides = alias.BetaHeaderOverrides
+	nc.AllowPrivateNetwork = alias.AllowPrivateNetwork
 
 	// Parse RetryBackoffInitial: string → ParseDuration, integer → milliseconds (legacy)
 	if len(alias.RetryBackoffInitial) > 0 && string(alias.RetryBackoffInitial) != "null" {
@@ -157,6 +179,21 @@ func parseNetworkBackoffDuration(data json.RawMessage, fieldName string) (time.D
 	return time.Duration(ms) * time.Millisecond, nil
 }
 
+// extraHeadersAsStrings serializes header values the way CACertPEM is: an env.* or
+// vault.* reference stays a reference and a literal stays literal. This keeps the
+// stored and API shape a plain string map, so existing config.json files and DB rows
+// load unchanged and a resolved secret never leaves the process.
+func extraHeadersAsStrings(headers map[string]SecretVar) map[string]string {
+	if headers == nil {
+		return nil
+	}
+	out := make(map[string]string, len(headers))
+	for name, value := range headers {
+		out[name] = SecretVarAsString(&value)
+	}
+	return out
+}
+
 // MarshalJSON customizes JSON marshaling for NetworkConfig.
 // RetryBackoffInitial and RetryBackoffMax are converted from time.Duration (nanoseconds)
 // to milliseconds (integers) in JSON.
@@ -172,14 +209,17 @@ func (nc NetworkConfig) MarshalJSON() ([]byte, error) {
 		InsecureSkipVerify             bool              `json:"insecure_skip_verify,omitempty"`
 		CACertPEM                      string            `json:"ca_cert_pem,omitempty"`
 		StreamIdleTimeoutInSeconds     int               `json:"stream_idle_timeout_in_seconds,omitempty"`
+		KeepAliveTimeoutInSeconds      int               `json:"keep_alive_timeout_in_seconds,omitempty"`
 		MaxConnsPerHost                int               `json:"max_conns_per_host,omitempty"`
 		EnforceHTTP2                   bool              `json:"enforce_http2,omitempty"`
+		HTTP2PingIntervalInSeconds     int               `json:"http2_ping_interval_in_seconds,omitempty"`
 		BetaHeaderOverrides            map[string]bool   `json:"beta_header_overrides,omitempty"`
+		AllowPrivateNetwork            bool              `json:"allow_private_network,omitempty"`
 	}
 
 	alias := NetworkConfigAlias{
 		BaseURL:                        nc.BaseURL,
-		ExtraHeaders:                   nc.ExtraHeaders,
+		ExtraHeaders:                   extraHeadersAsStrings(nc.ExtraHeaders),
 		DefaultRequestTimeoutInSeconds: nc.DefaultRequestTimeoutInSeconds,
 		MaxRetries:                     nc.MaxRetries,
 		// Convert time.Duration (nanoseconds) to milliseconds
@@ -187,18 +227,25 @@ func (nc NetworkConfig) MarshalJSON() ([]byte, error) {
 		RetryBackoffMax:            int64(nc.RetryBackoffMax / time.Millisecond),
 		InsecureSkipVerify:         nc.InsecureSkipVerify,
 		StreamIdleTimeoutInSeconds: nc.StreamIdleTimeoutInSeconds,
+		KeepAliveTimeoutInSeconds:  nc.KeepAliveTimeoutInSeconds,
 		MaxConnsPerHost:            nc.MaxConnsPerHost,
 		EnforceHTTP2:               nc.EnforceHTTP2,
+		HTTP2PingIntervalInSeconds: nc.HTTP2PingIntervalInSeconds,
 		BetaHeaderOverrides:        nc.BetaHeaderOverrides,
+		AllowPrivateNetwork:        nc.AllowPrivateNetwork,
 	}
 	if nc.CACertPEM != nil {
-		alias.CACertPEM = EnvVarAsString(nc.CACertPEM)
+		alias.CACertPEM = SecretVarAsString(nc.CACertPEM)
 	}
 
 	return json.Marshal(alias)
 }
 
-// Redacted returns a redacted copy of the network configuration with CACertPEM masked.
+// Redacted returns a redacted copy of the network configuration with CACertPEM and
+// every ExtraHeaders value masked. Header values are masked regardless of name, since
+// operators put client secrets and bearer tokens under arbitrary names, and fully
+// rather than prefix/suffix, since a short credential would otherwise expose most of
+// itself. env/vault headers keep their reference, which is what serializes.
 func (nc *NetworkConfig) Redacted() *NetworkConfig {
 	if nc == nil {
 		return nil
@@ -207,7 +254,44 @@ func (nc *NetworkConfig) Redacted() *NetworkConfig {
 	if nc.CACertPEM != nil && nc.CACertPEM.IsSet() {
 		redacted.CACertPEM = nc.CACertPEM.Redacted()
 	}
+	if nc.ExtraHeaders != nil {
+		redacted.ExtraHeaders = make(map[string]SecretVar, len(nc.ExtraHeaders))
+		for name, value := range nc.ExtraHeaders {
+			redacted.ExtraHeaders[name] = *value.FullyRedacted()
+		}
+	}
 	return &redacted
+}
+
+// RestoreRedactedExtraHeaders returns incoming with every masked literal value replaced by
+// the stored value of the same header name, so saving a form that echoed the redacted
+// config keeps the real secrets. Edited values and env/vault references are kept as sent.
+// A masked value with no stored header of that name (a new or renamed header) is an
+// error, since saving it would send the mask upstream as the header value.
+func RestoreRedactedExtraHeaders(incoming, stored map[string]SecretVar) (map[string]SecretVar, error) {
+	if incoming == nil {
+		return nil, nil
+	}
+	restored := make(map[string]SecretVar, len(incoming))
+	var unrestorable []string
+	for name, value := range incoming {
+		// Only the exact FullyRedacted placeholder counts; a literal like "*" is a real value.
+		if !value.IsFromSecret() && strings.EqualFold(value.GetValue(), "<REDACTED>") {
+			storedValue, ok := stored[name]
+			if !ok {
+				unrestorable = append(unrestorable, name)
+				continue
+			}
+			restored[name] = storedValue
+			continue
+		}
+		restored[name] = value
+	}
+	if len(unrestorable) > 0 {
+		slices.Sort(unrestorable)
+		return nil, fmt.Errorf("masked value for extra header %s cannot be restored because no stored header has that name; re-enter the value", strings.Join(unrestorable, ", "))
+	}
+	return restored, nil
 }
 
 // DefaultNetworkConfig is the default network configuration for provider connections.
@@ -217,6 +301,7 @@ var DefaultNetworkConfig = NetworkConfig{
 	RetryBackoffInitial:            DefaultRetryBackoffInitial,
 	RetryBackoffMax:                DefaultRetryBackoffMax,
 	StreamIdleTimeoutInSeconds:     DefaultStreamIdleTimeoutInSeconds,
+	KeepAliveTimeoutInSeconds:      DefaultKeepAliveTimeoutInSeconds,
 	MaxConnsPerHost:                DefaultMaxConnsPerHost,
 }
 
@@ -248,15 +333,28 @@ const (
 
 // ProxyConfig holds the configuration for proxy settings.
 type ProxyConfig struct {
-	Type      ProxyType `json:"type"`        // Type of proxy to use
-	URL       *EnvVar   `json:"url"`         // URL of the proxy server (supports env.*)
-	Username  *EnvVar   `json:"username"`    // Username for proxy authentication (supports env.*)
-	Password  *EnvVar   `json:"password"`    // Password for proxy authentication (supports env.*)
-	CACertPEM *EnvVar   `json:"ca_cert_pem"` // PEM-encoded CA certificate to trust for TLS connections through the proxy (supports env.*)
+	Type      ProxyType  `json:"type"`        // Type of proxy to use
+	URL       *SecretVar `json:"url"`         // URL of the proxy server (supports env.*)
+	Username  *SecretVar `json:"username"`    // Username for proxy authentication (supports env.*)
+	Password  *SecretVar `json:"password"`    // Password for proxy authentication (supports env.*)
+	CACertPEM *SecretVar `json:"ca_cert_pem"` // PEM-encoded CA certificate to trust for TLS connections through the proxy, and for the proxy itself when its URL is https:// (supports env.*)
+
+	// NoProxy is a comma-separated list of hosts that connect directly instead of
+	// through the proxy (".example.com" for a domain and its subdomains, "*.example.com"
+	// for subdomains only, "*" for everything). Runtime-only: it is filled in when a
+	// provider inherits the global proxy, whose no_proxy list it carries, and is never
+	// serialized with the provider's own config.
+	NoProxy string `json:"-"`
+
+	// SkipTLSVerify skips verifying the proxy's certificate for an https:// proxy URL
+	// (and, like the global setting it comes from, every TLS session through the
+	// proxy). Runtime-only: it is filled in when a provider inherits a global proxy
+	// with skip_tls_verify on, and is never serialized with the provider's own config.
+	SkipTLSVerify bool `json:"-"`
 }
 
 // MarshalForStorage serializes proxy settings for persistence (e.g. proxy_config_json).
-// EnvVar fields are stored as plain strings (env.* token or literal). For HTTP API responses
+// SecretVar fields are stored as plain strings (env.* token or literal). For HTTP API responses
 // use json.Marshal on *ProxyConfig so clients receive value/env_var/from_env objects.
 func (pc *ProxyConfig) MarshalForStorage() ([]byte, error) {
 	if pc == nil {
@@ -271,16 +369,16 @@ func (pc *ProxyConfig) MarshalForStorage() ([]byte, error) {
 	}
 	alias := proxyConfigStorage{Type: pc.Type}
 	if pc.URL != nil {
-		alias.URL = EnvVarAsString(pc.URL)
+		alias.URL = SecretVarAsString(pc.URL)
 	}
 	if pc.Username != nil {
-		alias.Username = EnvVarAsString(pc.Username)
+		alias.Username = SecretVarAsString(pc.Username)
 	}
 	if pc.Password != nil {
-		alias.Password = EnvVarAsString(pc.Password)
+		alias.Password = SecretVarAsString(pc.Password)
 	}
 	if pc.CACertPEM != nil {
-		alias.CACertPEM = EnvVarAsString(pc.CACertPEM)
+		alias.CACertPEM = SecretVarAsString(pc.CACertPEM)
 	}
 	return json.Marshal(alias)
 }
@@ -311,15 +409,22 @@ func (pc *ProxyConfig) Redacted() *ProxyConfig {
 // A non-nil value only allows fields set to true; omitted or false fields are disallowed.
 type AllowedRequests struct {
 	ListModels            bool `json:"list_models"`
+	ModelRetrieve         bool `json:"model_retrieve"`
 	TextCompletion        bool `json:"text_completion"`
 	TextCompletionStream  bool `json:"text_completion_stream"`
 	ChatCompletion        bool `json:"chat_completion"`
 	ChatCompletionStream  bool `json:"chat_completion_stream"`
 	Responses             bool `json:"responses"`
 	ResponsesStream       bool `json:"responses_stream"`
+	ResponsesRetrieve     bool `json:"responses_retrieve"`
+	ResponsesDelete       bool `json:"responses_delete"`
+	ResponsesCancel       bool `json:"responses_cancel"`
+	ResponsesInputItems   bool `json:"responses_input_items"`
 	CountTokens           bool `json:"count_tokens"`
+	Compaction            bool `json:"compaction"`
 	Embedding             bool `json:"embedding"`
 	Rerank                bool `json:"rerank"`
+	Decision              bool `json:"decisions"`
 	OCR                   bool `json:"ocr"`
 	Speech                bool `json:"speech"`
 	SpeechStream          bool `json:"speech_stream"`
@@ -331,6 +436,7 @@ type AllowedRequests struct {
 	ImageEditStream       bool `json:"image_edit_stream"`
 	ImageVariation        bool `json:"image_variation"`
 	VideoGeneration       bool `json:"video_generation"`
+	VideoEdit             bool `json:"video_edit"`
 	VideoRetrieve         bool `json:"video_retrieve"`
 	VideoDownload         bool `json:"video_download"`
 	VideoDelete           bool `json:"video_delete"`
@@ -360,6 +466,7 @@ type AllowedRequests struct {
 	PassthroughStream     bool `json:"passthrough_stream"`
 	WebSocketResponses    bool `json:"websocket_responses"`
 	Realtime              bool `json:"realtime"`
+	Live                  bool `json:"live"`
 	CachedContentCreate   bool `json:"cached_content_create"`
 	CachedContentList     bool `json:"cached_content_list"`
 	CachedContentRetrieve bool `json:"cached_content_retrieve"`
@@ -376,6 +483,8 @@ func (ar *AllowedRequests) IsOperationAllowed(operation RequestType) bool {
 	switch operation {
 	case ListModelsRequest:
 		return ar.ListModels
+	case ModelRetrieveRequest:
+		return ar.ModelRetrieve
 	case TextCompletionRequest:
 		return ar.TextCompletion
 	case TextCompletionStreamRequest:
@@ -388,12 +497,24 @@ func (ar *AllowedRequests) IsOperationAllowed(operation RequestType) bool {
 		return ar.Responses
 	case ResponsesStreamRequest:
 		return ar.ResponsesStream
+	case ResponsesRetrieveRequest, ResponsesRetrieveStreamRequest:
+		return ar.ResponsesRetrieve
+	case ResponsesDeleteRequest:
+		return ar.ResponsesDelete
+	case ResponsesCancelRequest:
+		return ar.ResponsesCancel
+	case ResponsesInputItemsRequest:
+		return ar.ResponsesInputItems
 	case CountTokensRequest:
 		return ar.CountTokens
+	case CompactionRequest:
+		return ar.Compaction
 	case EmbeddingRequest:
 		return ar.Embedding
 	case RerankRequest:
 		return ar.Rerank
+	case DecisionRequest:
+		return ar.Decision
 	case OCRRequest:
 		return ar.OCR
 	case SpeechRequest:
@@ -416,6 +537,8 @@ func (ar *AllowedRequests) IsOperationAllowed(operation RequestType) bool {
 		return ar.ImageVariation
 	case VideoGenerationRequest:
 		return ar.VideoGeneration
+	case VideoEditRequest:
+		return ar.VideoEdit
 	case VideoRetrieveRequest:
 		return ar.VideoRetrieve
 	case VideoDownloadRequest:
@@ -474,6 +597,12 @@ func (ar *AllowedRequests) IsOperationAllowed(operation RequestType) bool {
 		return ar.WebSocketResponses
 	case RealtimeRequest:
 		return ar.Realtime
+	case LiveRequest:
+		return ar.Live
+	case LiveContentRequest:
+		return ar.Live
+	case LiveSidebandRequest:
+		return ar.Live
 	case CachedContentCreateRequest:
 		return ar.CachedContentCreate
 	case CachedContentListRequest:
@@ -489,12 +618,15 @@ func (ar *AllowedRequests) IsOperationAllowed(operation RequestType) bool {
 	}
 }
 
+// CustomProviderConfig represent custom provider config
 type CustomProviderConfig struct {
-	CustomProviderKey    string                 `json:"-"`                                // Custom provider key, internally set by Bifrost
-	IsKeyLess            bool                   `json:"is_key_less"`                      // Whether the custom provider requires a key (not allowed for Bedrock)
-	BaseProviderType     ModelProvider          `json:"base_provider_type"`               // Base provider type
-	AllowedRequests      *AllowedRequests       `json:"allowed_requests,omitempty"`       // Allowed requests for the custom provider
-	RequestPathOverrides map[RequestType]string `json:"request_path_overrides,omitempty"` // Mapping of request type to its custom path which will override the default path of the provider (not allowed for Bedrock)
+	CustomProviderKey     string                 `json:"-"`                                // Custom provider key, internally set by Bifrost
+	IsKeyLess             bool                   `json:"is_key_less"`                      // Whether the custom provider requires a key (not allowed for Bedrock)
+	BaseProviderType      ModelProvider          `json:"base_provider_type"`               // Base provider type
+	AllowedRequests       *AllowedRequests       `json:"allowed_requests,omitempty"`       // Allowed requests for the custom provider
+	RequestPathOverrides  map[RequestType]string `json:"request_path_overrides,omitempty"` // Mapping of request type to its custom path which will override the default path of the provider (not allowed for Bedrock)
+	DoesNotSendDoneMarker bool                   `json:"does_not_send_done_marker"`        // Upstream ends its SSE stream after finish_reason without sending data: [DONE]
+	WaitForUsage          bool                   `json:"wait_for_usage"`                   // With DoesNotSendDoneMarker, keep reading past finish_reason so the trailing usage-only chunk is not dropped (#7143). A silent upstream then ends on network_config.stream_idle_timeout_in_seconds
 }
 
 // IsOperationAllowed checks if a specific operation is allowed for this custom provider
@@ -517,13 +649,79 @@ type ProviderConfig struct {
 	SendBackRawRequest      bool                  `json:"send_back_raw_request"`      // Send raw request back in the bifrost response (default: false)
 	SendBackRawResponse     bool                  `json:"send_back_raw_response"`     // Send raw response back in the bifrost response (default: false)
 	StoreRawRequestResponse bool                  `json:"store_raw_request_response"` // Capture raw request/response for internal logging only; strip from API responses returned to clients (default: false)
+	IgnoreProviderCost      bool                  `json:"ignore_provider_cost"`       // Ignore provider-reported usage.cost and price the request from Bifrost's catalog and overrides (default: false)
 	CustomProviderConfig    *CustomProviderConfig `json:"custom_provider_config,omitempty"`
 	OpenAIConfig            *OpenAIConfig         `json:"openai_config,omitempty"`
+	PromptCache             *PromptCacheConfig    `json:"prompt_cache,omitempty"`
+	InjectedTools           []InjectedTool        `json:"injected_tools,omitempty"`
+	Passthrough             *PassthroughPolicy    `json:"passthrough,omitempty"` // Routes the HTTP passthrough endpoints may forward; nil forwards every route
 }
 
-// OpenAIConfig holds OpenAI-specific provider configuration.
+// PromptCacheConfig opts a provider into synthesizing prompt-cache breakpoints for
+// requests that carry none.
+//
+// Agentic clients (Codex above all) send no cache markers, so providers that default
+// to implicit caching slide the cached prefix onto the latest message: every turn
+// rewrites the whole growing prompt at the cache-write rate and reads almost nothing
+// back. On Anthropic models nothing caches at all without an explicit marker.
+//
+// This is off by default and deliberately so. Bifrost otherwise never invents a
+// breakpoint - the four-marker ceiling is scarce and spending one the caller did not
+// ask for is a cost decision that belongs to the operator, not to the gateway. See
+// clampAnthropicCacheBreakpoints in core/providers/anthropic/utils.go.
+type PromptCacheConfig struct {
+	// AutoInject marks the first cacheable content block when the caller supplied no
+	// markers of its own. The first block is the prefix an agent loop replays verbatim
+	// every turn, which is what makes turn 2 onward a cache read rather than a write.
+	AutoInject bool `json:"auto_inject"`
+	// TTL is the lifetime requested for injected markers ("1h"). Empty means the
+	// provider default (5m on Anthropic). Providers that cannot carry a TTL ignore it.
+	TTL *string `json:"ttl,omitempty"`
+	// InjectionPoints targets specific messages instead of the first cacheable block.
+	// When non-empty it REPLACES the AutoInject strategy rather than adding to it.
+	// Mirrors LiteLLM's cache_control_injection_points.
+	InjectionPoints []CacheControlInjectionPoint `json:"cache_control_injection_points,omitempty"`
+}
+
+// CacheControlInjectionPoint names one place to mark. A point must carry at least one
+// of Role or Index; a point with neither matches nothing and is skipped.
+type CacheControlInjectionPoint struct {
+	// Location is "message". Reserved for future targets (tools, system) so the config
+	// shape does not have to change when they arrive.
+	Location string `json:"location"`
+	// Role matches messages by role ("system", "user", "assistant", "developer").
+	// "user" also matches tool results: Responses function_call_output items and Chat
+	// tool messages are the client-supplied turn that follows a tool call.
+	Role *string `json:"role,omitempty"`
+	// Index matches by position. Negative values count from the end, so -1 is the last
+	// message. Out-of-range indices match nothing rather than erroring - a conversation
+	// shorter than the configured index is normal, not a misconfiguration.
+	Index *int `json:"index,omitempty"`
+}
+
+// CacheControlInjectionLocationMessage is the only Location value currently honoured.
+const CacheControlInjectionLocationMessage = "message"
+
+// InjectedTool is one MCP tool that Bifrost adds to every chat and responses request
+// served by a provider and executes server side when the model calls it.
+//
+// Name is the tool name the model sees; Bifrost maps a call to it back to the MCP
+// tool. The name also decides whether the tool is added or replaces one: it replaces
+// any client tool of the same name, and the name InjectedToolNameWebSearch also
+// replaces native web search (hosted web_search tools, web_search_options), so one
+// search backend serves every model on the provider.
+type InjectedTool struct {
+	Name          string `json:"name"`            // tool name exposed to the model
+	MCPClientName string `json:"mcp_client_name"` // configured MCP client that provides the tool
+	ToolName      string `json:"tool_name"`       // tool name on the MCP server, without the "<client>-" prefix
+}
+
+// InjectedToolNameWebSearch is the injected tool name that replaces native web search.
+const InjectedToolNameWebSearch = "web_search"
+
+// OpenAIConfig holds OpenAI Responses API configuration, honoured by the OpenAI and Fireworks providers.
 type OpenAIConfig struct {
-	DisableStore bool `json:"disable_store"` // When true, forces store=false on all outgoing OpenAI requests (default: false)
+	DisableStore bool `json:"disable_store"` // When true, forces store=false on outgoing OpenAI and Fireworks Responses requests (default: false)
 }
 
 func (config *ProviderConfig) CheckAndSetDefaults() {
@@ -555,15 +753,25 @@ func (config *ProviderConfig) CheckAndSetDefaults() {
 		config.NetworkConfig.StreamIdleTimeoutInSeconds = DefaultStreamIdleTimeoutInSeconds
 	}
 
+	if config.NetworkConfig.KeepAliveTimeoutInSeconds <= 0 {
+		config.NetworkConfig.KeepAliveTimeoutInSeconds = DefaultKeepAliveTimeoutInSeconds
+	}
+
 	if config.NetworkConfig.MaxConnsPerHost <= 0 {
 		config.NetworkConfig.MaxConnsPerHost = DefaultMaxConnsPerHost
 	} else if config.NetworkConfig.MaxConnsPerHost > MaxConnsPerHostUpperBound {
 		config.NetworkConfig.MaxConnsPerHost = MaxConnsPerHostUpperBound
 	}
 
+	// Clamp before the seconds-to-time.Duration conversion in the Bedrock
+	// transport (* time.Second) can silently overflow int64.
+	if config.NetworkConfig.HTTP2PingIntervalInSeconds > HTTP2PingIntervalUpperBoundSeconds {
+		config.NetworkConfig.HTTP2PingIntervalInSeconds = HTTP2PingIntervalUpperBoundSeconds
+	}
+
 	// Create a defensive copy of ExtraHeaders to prevent data races
 	if config.NetworkConfig.ExtraHeaders != nil {
-		headersCopy := make(map[string]string, len(config.NetworkConfig.ExtraHeaders))
+		headersCopy := make(map[string]SecretVar, len(config.NetworkConfig.ExtraHeaders))
 		maps.Copy(headersCopy, config.NetworkConfig.ExtraHeaders)
 		config.NetworkConfig.ExtraHeaders = headersCopy
 	}
@@ -578,12 +786,21 @@ func (config *ProviderConfig) CheckAndSetDefaults() {
 
 type PostHookRunner func(ctx *BifrostContext, result *BifrostResponse, err *BifrostError) (*BifrostResponse, *BifrostError)
 
+// FileSourceUploader is implemented by providers whose FileUpload streams
+// BifrostFileUploadRequest.FileSource. For any other provider Bifrost reads FileSource into
+// File before calling FileUpload, so providers that need the bytes keep working unchanged.
+type FileSourceUploader interface {
+	UploadsFileSource()
+}
+
 // Provider defines the interface for AI model providers.
 type Provider interface {
 	// GetProviderKey returns the provider's identifier
 	GetProviderKey() ModelProvider
 	// ListModels performs a list models request
 	ListModels(ctx *BifrostContext, keys []Key, request *BifrostListModelsRequest) (*BifrostListModelsResponse, *BifrostError)
+	// ModelRetrieve retrieves a single model's metadata (OpenAI-only; other providers return unsupported)
+	ModelRetrieve(ctx *BifrostContext, key Key, request *BifrostModelRetrieveRequest) (*BifrostModelRetrieveResponse, *BifrostError)
 	// TextCompletion performs a text completion request
 	TextCompletion(ctx *BifrostContext, key Key, request *BifrostTextCompletionRequest) (*BifrostTextCompletionResponse, *BifrostError)
 	// TextCompletionStream performs a text completion stream request.
@@ -601,10 +818,14 @@ type Provider interface {
 	ResponsesStream(ctx *BifrostContext, postHookRunner PostHookRunner, postHookSpanFinalizer func(context.Context), key Key, request *BifrostResponsesRequest) (chan *BifrostStreamChunk, *BifrostError)
 	// CountTokens performs a count tokens request
 	CountTokens(ctx *BifrostContext, key Key, request *BifrostResponsesRequest) (*BifrostCountTokensResponse, *BifrostError)
+	// Compaction compacts a conversation context window (OpenAI-only; other providers return unsupported)
+	Compaction(ctx *BifrostContext, key Key, request *BifrostCompactionRequest) (*BifrostCompactionResponse, *BifrostError)
 	// Embedding performs an embedding request
 	Embedding(ctx *BifrostContext, key Key, request *BifrostEmbeddingRequest) (*BifrostEmbeddingResponse, *BifrostError)
 	// Rerank performs a rerank request to reorder documents by relevance to a query
 	Rerank(ctx *BifrostContext, key Key, request *BifrostRerankRequest) (*BifrostRerankResponse, *BifrostError)
+	// Decision performs an decision request against an annotated function-tool definition (Typesafe-only; other providers return unsupported)
+	Decision(ctx *BifrostContext, key Key, request *BifrostDecisionRequest) (*BifrostDecisionResponse, *BifrostError)
 	// OCR performs an optical character recognition request on a document
 	OCR(ctx *BifrostContext, key Key, request *BifrostOCRRequest) (*BifrostOCRResponse, *BifrostError)
 	// Speech performs a text to speech request
@@ -630,6 +851,8 @@ type Provider interface {
 	ImageVariation(ctx *BifrostContext, key Key, request *BifrostImageVariationRequest) (*BifrostImageGenerationResponse, *BifrostError)
 	// VideoGeneration performs a video generation request
 	VideoGeneration(ctx *BifrostContext, key Key, request *BifrostVideoGenerationRequest) (*BifrostVideoGenerationResponse, *BifrostError)
+	// VideoEdit edits an existing video, returning a job in the same shape as video generation
+	VideoEdit(ctx *BifrostContext, key Key, request *BifrostVideoEditRequest) (*BifrostVideoEditResponse, *BifrostError)
 	// VideoRetrieve retrieves a video from the provider
 	VideoRetrieve(ctx *BifrostContext, key Key, request *BifrostVideoRetrieveRequest) (*BifrostVideoGenerationResponse, *BifrostError)
 	// VideoDownload downloads a video from the provider
@@ -694,6 +917,29 @@ type Provider interface {
 	Passthrough(ctx *BifrostContext, key Key, req *BifrostPassthroughRequest) (*BifrostPassthroughResponse, *BifrostError)
 	// PassthroughStream executes a streaming passthrough, forwarding raw response bytes as BifrostStreamChunks.
 	PassthroughStream(ctx *BifrostContext, postHookRunner PostHookRunner, postHookSpanFinalizer func(context.Context), key Key, req *BifrostPassthroughRequest) (chan *BifrostStreamChunk, *BifrostError)
+}
+
+// ResponsesLifecycleProvider is an optional interface for OpenAI-style Responses API
+// secondary verbs (retrieve, delete, cancel, list input items). Checked via type assertion
+// in core dispatch; providers that do not implement it return unsupported_operation.
+type ResponsesLifecycleProvider interface {
+	ResponsesRetrieve(ctx *BifrostContext, key Key, req *BifrostResponsesRetrieveRequest) (*BifrostResponsesResponse, *BifrostError)
+	// ResponsesRetrieveStream replays a stored response as an SSE stream (OpenAI GET /v1/responses/{id}?stream=true).
+	ResponsesRetrieveStream(ctx *BifrostContext, postHookRunner PostHookRunner, postHookSpanFinalizer func(context.Context), key Key, req *BifrostResponsesRetrieveRequest) (chan *BifrostStreamChunk, *BifrostError)
+	ResponsesDelete(ctx *BifrostContext, key Key, req *BifrostResponsesDeleteRequest) (*BifrostResponsesDeleteResponse, *BifrostError)
+	ResponsesCancel(ctx *BifrostContext, key Key, req *BifrostResponsesCancelRequest) (*BifrostResponsesResponse, *BifrostError)
+	ResponsesInputItems(ctx *BifrostContext, key Key, req *BifrostResponsesInputItemsRequest) (*BifrostResponsesInputItemsResponse, *BifrostError)
+}
+
+// ResponsesNamespaceToolProvider is an optional interface for providers whose
+// support for OpenAI Responses `namespace` tools depends on how the attempt is
+// routed, not on the provider key alone. Bedrock is the case: a gpt model goes to
+// the Mantle OpenAI-compatible endpoint, which accepts namespaces, while Claude goes
+// to Converse or the Anthropic Messages surface, which do not. Checked via type
+// assertion in core dispatch before namespace tools are flattened; providers that do
+// not implement it fall back to a per-provider default in core/providers/utils.
+type ResponsesNamespaceToolProvider interface {
+	SupportsResponsesNamespaceTools(ctx *BifrostContext, key Key, model string) bool
 }
 
 // WebSocketCapableProvider is an optional interface that providers can implement

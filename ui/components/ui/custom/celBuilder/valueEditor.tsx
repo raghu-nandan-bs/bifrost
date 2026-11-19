@@ -3,21 +3,17 @@
  * Smart input component that adapts based on operator and field type
  */
 
-import { AsyncMultiSelect } from "@/components/ui/asyncMultiselect";
+import { ComboboxSelect, ComboboxSelectOption } from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
-import { ModelMultiselect } from "@/components/ui/modelMultiselect";
-import { Option } from "@/components/ui/multiselectUtils";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { ModelSelector } from "@/components/ui/modelSelector";
+import { ProviderSelector } from "@/components/ui/providerSelector";
 import { Textarea } from "@/components/ui/textarea";
-import { ProviderIconType, RenderProviderIcon } from "@/lib/constants/icons";
-import { getProviderLabel } from "@/lib/constants/logs";
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { ValueEditorProps, ValueEditorType } from "react-querybuilder";
 
 type CELValueEditorContext = {
 	validateRegex?: (pattern: string) => string | null;
-	menuPosition?: "absolute" | "fixed";
-	menuPortalTarget?: HTMLElement | null;
 };
 
 export function ValueEditor({
@@ -28,14 +24,13 @@ export function ValueEditor({
 	type,
 	context,
 }: ValueEditorProps & { context?: CELValueEditorContext }) {
+	const { t } = useTranslation("observability");
 	// Compute all conditions upfront before any early returns
 	const isArrayOperator = operator === "in" || operator === "notIn";
 	const isRegexOperator = operator === "matches";
 	const isNullOperator = operator === "null" || operator === "notNull";
 
 	const validateRegex = context?.validateRegex;
-	const menuPosition = context?.menuPosition;
-	const menuPortalTarget = context?.menuPortalTarget;
 
 	// Get valueEditorType, handling both string and function types
 	const valueEditorType =
@@ -95,7 +90,7 @@ export function ValueEditor({
 		}
 	};
 
-	// Handle model field with ModelMultiselect
+	// Handle model field with ModelSelector
 	const isModelField = fieldData?.name === "model";
 	if (isModelField && isSelectType) {
 		// For array operators (in, notIn), use multi-select
@@ -120,14 +115,14 @@ export function ValueEditor({
 			};
 
 			return (
-				<ModelMultiselect
+				<ModelSelector
+					multiple
 					value={selectedModels}
 					onChange={handleMultiModelChange}
-					placeholder="Select models..."
-					loadModelsOnEmptyProvider
+					placeholder={t("celBuilder.selectModels")}
+					allowCustomModel
+					unfiltered
 					className="!min-h-9 w-[360px]"
-					menuPosition={menuPosition}
-					menuPortalTarget={menuPortalTarget}
 				/>
 			);
 		}
@@ -147,22 +142,31 @@ export function ValueEditor({
 
 		// For single operators (=, !=), use single select
 		return (
-			<ModelMultiselect
+			<ModelSelector
 				value={valueToUse || ""}
 				onChange={handleOnChange}
-				placeholder="Search for a model..."
-				isSingleSelect
-				clearable={true}
-				loadModelsOnEmptyProvider
+				placeholder={t("celBuilder.searchModel")}
+				allowCustomModel
+				unfiltered
 				className="border-input w-[360px]"
-				menuPosition={menuPosition}
-				menuPortalTarget={menuPortalTarget}
 			/>
 		);
 	}
 
 	// Handle select type (for provider dropdown)
 	if (isSelectType && fieldData?.values) {
+		const isProviderField = fieldData?.name === "provider";
+		const options: ComboboxSelectOption[] = (fieldData.values as any[])
+			.filter((option) => !("options" in option) && (option as any).name)
+			.map((option) => {
+				const optName = (option as any).name || "";
+				return {
+					value: optName,
+					label: (option as any).label || optName,
+					disabled: (option as any).disabled || false,
+				};
+			});
+
 		// For array operators with provider, use multi-select dropdown
 		if (isArrayOperator) {
 			// Parse comma-separated or JSON array value
@@ -183,77 +187,53 @@ export function ValueEditor({
 				}
 			}
 
-			const selectedOptions: Option<string>[] = selectedValues.map((val) => ({
-				value: val,
-				label: (fieldData.values as any[]).find((opt) => (opt as any).name === val)?.label || val,
-			}));
-
-			const allOptions: Option<string>[] = (fieldData.values as any[])
-				.filter((opt) => !("options" in opt) && (opt as any).name)
-				.map((opt) => ({
-					value: (opt as any).name,
-					label: (opt as any).label,
-				}));
-
-			const handleMultiselectChange = (selected: Option<string>[]) => {
-				const values = selected.map((opt) => opt.value);
+			const handleMultiselectChange = (values: string[]) => {
 				handleOnChange(values.length > 0 ? JSON.stringify(values) : "");
 			};
 
-			return (
-				<AsyncMultiSelect
-					value={selectedOptions}
+			return isProviderField ? (
+				<ProviderSelector
+					multiple
+					source="values"
+					values={options}
+					value={selectedValues}
 					onChange={handleMultiselectChange}
-					defaultOptions={allOptions}
-					isNonAsync={true}
-					isClearable={false}
-					placeholder="Select providers..."
+					placeholder={t("celBuilder.selectProviders")}
 					className="w-[360px]"
-					triggerClassName="!shadow-none !border-border h-10"
-					menuClassName="!z-[100] w-full cursor-pointer"
+					noPortal
+				/>
+			) : (
+				<ComboboxSelect
+					multiple
+					value={selectedValues}
+					onValueChange={handleMultiselectChange}
+					options={options}
+					placeholder={t("celBuilder.selectProviders")}
+					className="h-9 w-[360px]"
+					noPortal
 				/>
 			);
 		}
 
-		// Check if this is a provider field to render icons in trigger
-		const isProviderField = fieldData?.name === "provider";
-
-		return (
-			<Select value={value || ""} onValueChange={handleOnChange}>
-				<SelectTrigger className="w-[360px]">
-					{isProviderField && value ? (
-						<div className="flex items-center gap-2">
-							<RenderProviderIcon provider={value as ProviderIconType} size="sm" className="h-4 w-4" />
-							<span>{getProviderLabel(value)}</span>
-						</div>
-					) : (
-						<SelectValue placeholder={fieldData.placeholder || "Select..."} />
-					)}
-				</SelectTrigger>
-				<SelectContent>
-					{fieldData.values.map((option) => {
-						if ("options" in option) return null; // Skip option groups
-						const optName = (option as any).name || "";
-						if (!optName) return null; // Skip empty values — SelectItem requires non-empty value
-						const optLabel = (option as any).label || optName;
-						const optDisabled = (option as any).disabled || false;
-
-						let iconElement: React.ReactNode | undefined;
-						let displayLabel = optLabel;
-
-						if (isProviderField) {
-							iconElement = <RenderProviderIcon provider={optName as ProviderIconType} size="sm" className="h-4 w-4" />;
-							displayLabel = getProviderLabel(optName);
-						}
-
-						return (
-							<SelectItem key={optName} value={optName} disabled={optDisabled} icon={iconElement}>
-								{displayLabel}
-							</SelectItem>
-						);
-					})}
-				</SelectContent>
-			</Select>
+		return isProviderField ? (
+			<ProviderSelector
+				source="values"
+				values={options}
+				value={value || ""}
+				onChange={(newValue: string) => handleOnChange(newValue)}
+				placeholder={fieldData.placeholder || t("celBuilder.selectPlaceholder")}
+				className="w-[360px]"
+				noPortal
+			/>
+		) : (
+			<ComboboxSelect
+				value={value || null}
+				onValueChange={(newValue) => handleOnChange(newValue ?? "")}
+				options={options}
+				placeholder={fieldData.placeholder || t("celBuilder.selectPlaceholder")}
+				className="h-9 w-[360px]"
+				noPortal
+			/>
 		);
 	}
 
@@ -265,7 +245,7 @@ export function ValueEditor({
 				type="text"
 				value={keyValuePair.value}
 				onChange={(e) => handleKeyValueValueChange(e.target.value)}
-				placeholder="Value"
+				placeholder={t("celBuilder.value")}
 				className="w-[180px]"
 				data-testid="cel-builder-keyvalue-value-input"
 			/>
@@ -273,10 +253,10 @@ export function ValueEditor({
 	}
 
 	const placeholder = isArrayOperator
-		? "Enter comma-separated values or JSON array"
+		? t("celBuilder.commaSeparated")
 		: isRegexOperator
 			? "e.g., .* (any), openai|anthropic (multiple), ^gpt.* (prefix)"
-			: fieldData?.placeholder || "Enter value...";
+			: fieldData?.placeholder || t("celBuilder.enterValue");
 
 	// Use textarea for array inputs
 	if (isArrayOperator) {

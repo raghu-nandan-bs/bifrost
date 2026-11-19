@@ -1,6 +1,8 @@
 import {
 	AddProviderRequest,
 	CreateProviderKeyRequest,
+	GithubCopilotDeviceCode,
+	GithubCopilotSignInPollResult,
 	ListProviderKeysResponse,
 	ListProvidersResponse,
 	ModelProvider,
@@ -9,7 +11,7 @@ import {
 	UpdateProviderRequest,
 	UpdateProviderKeyRequest,
 } from "@/lib/types/config";
-import { DBKey } from "@/lib/types/governance";
+import { DBKey, PricingOverrideMatchType, PricingOverridePatch, PricingOverrideScopeKind } from "@/lib/types/governance";
 import { baseApi } from "./baseApi";
 
 function sortProviders(a: ModelProvider, b: ModelProvider) {
@@ -23,6 +25,7 @@ function sortProviders(a: ModelProvider, b: ModelProvider) {
 export interface ModelResponse {
 	name: string;
 	provider: string;
+	is_deprecated?: boolean;
 	accessible_by_keys?: string[];
 	additional_attributes?: Record<string, string>;
 }
@@ -41,14 +44,53 @@ export interface ModelDetails {
 	context_length?: number;
 	max_input_tokens?: number;
 	max_output_tokens?: number;
+	input_cost_per_token?: number;
+	output_cost_per_token?: number;
+	cache_creation_input_token_cost?: number;
+	cache_read_input_token_cost?: number;
 	architecture?: unknown;
 	additional_attributes?: Record<string, string>;
 	accessible_by_keys?: string[];
+	// Post-override value of each displayed cost, present only for the fields
+	// the applied override actually changes — render those struck through.
+	overridden_pricing?: ModelOverriddenPricing;
+	// Which override produced overridden_pricing.
+	applied_override_id?: string;
+	// Every override matching this model, including virtual-key/user/provider-key
+	// scoped ones that do NOT affect overridden_pricing (shown informationally).
+	// Resolve against ListModelDetailsResponse.pricing_overrides.
+	pricing_override_ids?: string[];
+}
+
+export interface ModelOverriddenPricing {
+	input_cost_per_token?: number;
+	output_cost_per_token?: number;
+	cache_creation_input_token_cost?: number;
+	cache_read_input_token_cost?: number;
+}
+
+// ModelPricingOverrideSummary mirrors PricingOverride but carries the patch
+// already parsed — /api/models/details returns an object where the governance
+// API returns a JSON string.
+export interface ModelPricingOverrideSummary {
+	id: string;
+	name: string;
+	scope_kind: PricingOverrideScopeKind;
+	user_id?: string;
+	virtual_key_id?: string;
+	provider_id?: string;
+	provider_key_id?: string;
+	match_type: PricingOverrideMatchType;
+	pattern: string;
+	request_types?: string[];
+	patch: PricingOverridePatch;
 }
 
 export interface ListModelDetailsResponse {
 	models: ModelDetails[];
 	total: number;
+	// Overrides referenced by any row, keyed by ID and deduplicated.
+	pricing_overrides?: Record<string, ModelPricingOverrideSummary>;
 }
 
 // ModelPricingAttributesEntry is the body element for PUT /api/models/catalog.
@@ -60,13 +102,95 @@ export interface ModelPricingAttributesEntry {
 	additional_attributes?: Record<string, string>;
 }
 
+// Datasheet editor (/api/models/datasheet). A datasheet override is the
+// user's edit of one synced entry; the server re-applies it after every
+// datasheet sync, so upstream updates never undo it.
+export interface DatasheetPricingRow {
+	model: string;
+	provider: string;
+	mode: string;
+	base_model?: string;
+	context_length?: number;
+	max_input_tokens?: number;
+	max_output_tokens?: number;
+	is_deprecated?: boolean;
+	input_cost_per_token?: number;
+	output_cost_per_token?: number;
+	[key: string]: unknown;
+}
+
+export interface DatasheetOverride {
+	id: string;
+	provider: string;
+	model: string;
+	// Empty applies the pricing patch to every mode of the model.
+	mode: string;
+	is_custom: boolean;
+	pricing_patch?: Record<string, unknown>;
+	params_patch?: Record<string, unknown>;
+	// Upstream value of each patched key when the override was saved.
+	baseline?: { pricing?: Record<string, unknown>; params?: Record<string, unknown> };
+	config_hash?: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface DatasheetEntry {
+	provider: string;
+	model: string;
+	mode: string;
+	is_custom: boolean;
+	upstream: DatasheetPricingRow | null;
+	effective: DatasheetPricingRow | null;
+	overrides?: DatasheetOverride[];
+	// Patched fields whose upstream value changed since the save, as "pricing.<key>" or "params.<key>".
+	drifted_fields?: string[];
+}
+
+export interface DatasheetEntryDetail extends DatasheetEntry {
+	upstream_params?: Record<string, unknown>;
+	effective_params?: Record<string, unknown>;
+}
+
+export interface ListDatasheetEntriesResponse {
+	entries: DatasheetEntry[];
+	count: number;
+	total_count: number;
+	limit: number;
+	offset: number;
+}
+
+export interface GetDatasheetEntriesRequest {
+	query?: string;
+	provider?: string;
+	overridden_only?: boolean;
+	limit?: number;
+	offset?: number;
+}
+
+export interface DatasheetEntryTarget {
+	provider: string;
+	model: string;
+	mode: string;
+}
+
+// An empty pricing_patch and params_patch on a non-custom target removes its override.
+export interface SaveDatasheetOverrideRequest extends DatasheetEntryTarget {
+	is_custom?: boolean;
+	pricing_patch?: Record<string, unknown>;
+	params_patch?: Record<string, unknown>;
+}
+
 export interface GetModelsRequest {
 	query?: string;
 	provider?: string;
 	keys?: string[];
 	vks?: string[];
 	limit?: number;
+	offset?: number;
 	unfiltered?: boolean;
+	/** Lists only models that serve decisions natively. */
+	decisions?: boolean;
 }
 
 export interface GetBaseModelsRequest {
@@ -104,15 +228,19 @@ export interface ListBaseModelsResponse {
 	total: number;
 }
 
-type UpdateProviderMutationArg = UpdateProviderRequest & { name: ModelProviderName };
+type UpdateProviderMutationArg = UpdateProviderRequest & {
+	name: ModelProviderName;
+};
 
+// Used when a model has no datasheet entry (404). Parameter names and help text normally come from the
+// server-provided datasheet in English, so this fallback mirrors it instead of adding a translated variant.
 const DEFAULT_MODEL_PARAMETERS: ModelDatasheetResponse = {
 	mode: "chat",
 	base_model: "default",
 	model_parameters: [
 		{
 			id: "temperature",
-			label: "Temperature",
+			label: "Temperature", // i18n-ignore
 			helpText:
 				"What sampling temperature to use, between 0 and 2. Higher values like 0.8 will make the output more random, while lower values like 0.2 will make it more focused and deterministic.",
 			type: "number",
@@ -120,14 +248,14 @@ const DEFAULT_MODEL_PARAMETERS: ModelDatasheetResponse = {
 		},
 		{
 			id: "max_tokens",
-			label: "Max Tokens",
+			label: "Max Tokens", // i18n-ignore
 			helpText: "The maximum number of tokens that can be generated in the Result.",
 			type: "number",
 			range: { min: 1, max: 8192, step: 1 },
 		},
 		{
 			id: "stream",
-			label: "Stream",
+			label: "Stream", // i18n-ignore
 			helpText:
 				"The stream parameter in the API controls whether the response is sent in incremental updates, like tokenized data as it's generated, or as a complete result in one go.",
 			type: "boolean",
@@ -159,6 +287,20 @@ export const providersApi = baseApi.injectEndpoints({
 		getProviderKey: builder.query<ModelProviderKey, { provider: string; keyId: string }>({
 			query: ({ provider, keyId }) => `/providers/${encodeURIComponent(provider)}/keys/${encodeURIComponent(keyId)}`,
 			providesTags: (result, error, { provider }) => [{ type: "ProviderKeys", id: provider }],
+		}),
+
+		// GitHub Copilot "Sign in with GitHub" (device flow). The gateway talks to GitHub; the UI
+		// shows the code and polls, and puts the returned token in the key's value.
+		startGithubCopilotSignIn: builder.mutation<GithubCopilotDeviceCode, { provider: string }>({
+			query: ({ provider }) => ({ url: `/providers/${encodeURIComponent(provider)}/sign-in`, method: "POST" }),
+		}),
+
+		pollGithubCopilotSignIn: builder.mutation<GithubCopilotSignInPollResult, { provider: string; deviceCode: string }>({
+			query: ({ provider, deviceCode }) => ({
+				url: `/providers/${encodeURIComponent(provider)}/sign-in/poll`,
+				method: "POST",
+				body: { device_code: deviceCode },
+			}),
 		}),
 
 		// Create new provider
@@ -262,7 +404,16 @@ export const providersApi = baseApi.injectEndpoints({
 						providersApi.util.updateQueryData("getAllKeys", undefined, (draft) => {
 							const index = draft.findIndex((k) => k.key_id === keyId);
 							if (index !== -1) {
-								draft[index] = { ...draft[index], name: updatedKey.name, models: updatedKey.models ?? [] };
+								// `enabled` has to ride along: callers filter providers on it
+								// (the complexity router only offers providers with a serving
+								// key), so dropping it leaves a toggled key looking unchanged
+								// here until the next full refetch.
+								draft[index] = {
+									...draft[index],
+									name: updatedKey.name,
+									models: updatedKey.models ?? [],
+									enabled: updatedKey.enabled,
+								};
 							}
 						}),
 					);
@@ -328,6 +479,60 @@ export const providersApi = baseApi.injectEndpoints({
 			},
 		}),
 
+		// Re-run model discovery across every enabled key of a provider. The
+		// catalog otherwise refreshes on the configured interval, so this is how
+		// an operator picks up a newly served model straight away.
+		//
+		// The server answers 409 when a refresh for the same provider is already
+		// running, which the caller surfaces rather than retrying.
+		refreshProviderModels: builder.mutation<ModelProviderKey[], string>({
+			query: (provider) => ({
+				url: `/providers/${encodeURIComponent(provider)}/refresh-models`,
+				method: "POST",
+			}),
+			transformResponse: (response: ListProviderKeysResponse) => response.keys ?? [],
+			// The provider's own key rows come back in the response and are
+			// patched in below. "DBKeys" covers getAllKeys, whose DBKey.models is
+			// the same per-key model list a refresh rewrites; without it the
+			// routing-rule, pricing-override and virtual-key pickers keep showing
+			// the pre-refresh models, since a query only refetches on a tag it
+			// provides itself.
+			invalidatesTags: ["Models", "DBKeys"],
+			async onQueryStarted(provider, { dispatch, queryFulfilled }) {
+				try {
+					const { data: refreshedKeys } = await queryFulfilled;
+					dispatch(providersApi.util.updateQueryData("getProviderKeys", provider, () => refreshedKeys));
+				} catch {}
+			},
+		}),
+
+		// Re-run model discovery for a single key.
+		refreshProviderKeyModels: builder.mutation<ModelProviderKey, { provider: string; keyId: string }>({
+			query: ({ provider, keyId }) => ({
+				url: `/providers/${encodeURIComponent(provider)}/keys/${encodeURIComponent(keyId)}/refresh-models`,
+				method: "POST",
+			}),
+			// See refreshProviderModels above for why "DBKeys" is invalidated
+			// alongside "Models".
+			invalidatesTags: ["Models", "DBKeys"],
+			async onQueryStarted({ provider, keyId }, { dispatch, queryFulfilled }) {
+				try {
+					const { data: refreshedKey } = await queryFulfilled;
+					// Patch in place so the discovery status icon repaints without
+					// a refetch, matching how updateProviderKey behaves.
+					dispatch(
+						providersApi.util.updateQueryData("getProviderKeys", provider, (draft) => {
+							const index = draft.findIndex((key) => key.id === keyId);
+							if (index !== -1) {
+								draft[index] = refreshedKey;
+							}
+						}),
+					);
+					dispatch(providersApi.util.updateQueryData("getProviderKey", { provider, keyId }, () => refreshedKey));
+				} catch {}
+			},
+		}),
+
 		// Get all available keys from all providers for governance selection
 		getAllKeys: builder.query<DBKey[], void>({
 			query: () => "/keys",
@@ -336,14 +541,16 @@ export const providersApi = baseApi.injectEndpoints({
 
 		// Get models with optional filtering
 		getModels: builder.query<ListModelsResponse, GetModelsRequest>({
-			query: ({ query, provider, keys, vks, limit, unfiltered }) => {
+			query: ({ query, provider, keys, vks, limit, offset, unfiltered, decisions }) => {
 				const params = new URLSearchParams();
 				if (query) params.append("query", query);
 				if (provider) params.append("provider", provider);
 				if (keys && keys.length > 0) params.append("keys", keys.join(","));
 				if (vks && vks.length > 0) params.append("vks", vks.join(","));
 				if (limit !== undefined) params.append("limit", limit.toString());
+				if (offset !== undefined) params.append("offset", offset.toString());
 				if (unfiltered !== undefined) params.append("unfiltered", unfiltered.toString());
+				if (decisions) params.append("decisions", "true");
 				return `/models?${params.toString()}`;
 			},
 			providesTags: ["Models"],
@@ -362,6 +569,7 @@ export const providersApi = baseApi.injectEndpoints({
 
 		// Get model parameters (parameters, capabilities) from local API
 		// Falls back to default parameters if the API returns an error (e.g. model not found)
+		// Tagged Datasheet: a datasheet override changes the parameters it returns.
 		getModelParameters: builder.query<ModelDatasheetResponse, string>({
 			queryFn: async (model, _queryApi, _extraOptions, baseQuery) => {
 				const result = await baseQuery(`/models/parameters?model=${encodeURIComponent(model)}`);
@@ -374,6 +582,7 @@ export const providersApi = baseApi.injectEndpoints({
 				}
 				return { data: result.data as ModelDatasheetResponse };
 			},
+			providesTags: ["Datasheet"],
 		}),
 
 		// List models with capability metadata + additional_attributes via the
@@ -381,7 +590,16 @@ export const providersApi = baseApi.injectEndpoints({
 		// Models tab. Server filters by model-name substring (`query`) and by
 		// exact provider; the high default limit covers the typical catalog
 		// size (under 1500 rows).
-		getModelDetails: builder.query<ListModelDetailsResponse, { query?: string; provider?: string; limit?: number; offset?: number; unfiltered?: boolean }>({
+		getModelDetails: builder.query<
+			ListModelDetailsResponse,
+			{
+				query?: string;
+				provider?: string;
+				limit?: number;
+				offset?: number;
+				unfiltered?: boolean;
+			}
+		>({
 			query: ({ query, provider, limit, offset, unfiltered }) => {
 				const params = new URLSearchParams();
 				if (query) params.append("query", query);
@@ -407,6 +625,46 @@ export const providersApi = baseApi.injectEndpoints({
 			}),
 			invalidatesTags: ["Models"],
 		}),
+
+		getDatasheetEntries: builder.query<ListDatasheetEntriesResponse, GetDatasheetEntriesRequest>({
+			query: ({ query, provider, overridden_only, limit, offset }) => ({
+				url: "/models/datasheet",
+				params: {
+					...(query && { query }),
+					...(provider && { provider }),
+					...(overridden_only && { overridden_only: true }),
+					...(limit !== undefined && { limit }),
+					...(offset !== undefined && { offset }),
+				},
+			}),
+			providesTags: ["Datasheet"],
+		}),
+
+		getDatasheetEntry: builder.query<DatasheetEntryDetail, DatasheetEntryTarget>({
+			query: ({ provider, model, mode }) => ({
+				url: "/models/datasheet/entry",
+				params: { provider, model, mode },
+			}),
+			providesTags: ["Datasheet"],
+		}),
+
+		// Overrides change effective prices and limits everywhere models are listed.
+		saveDatasheetOverride: builder.mutation<{ message: string; override: DatasheetOverride | null }, SaveDatasheetOverrideRequest>({
+			query: (body) => ({
+				url: "/models/datasheet/overrides",
+				method: "PUT",
+				body,
+			}),
+			invalidatesTags: ["Datasheet", "Models"],
+		}),
+
+		deleteDatasheetOverride: builder.mutation<{ message: string }, string>({
+			query: (id) => ({
+				url: `/models/datasheet/overrides/${encodeURIComponent(id)}`,
+				method: "DELETE",
+			}),
+			invalidatesTags: ["Datasheet", "Models"],
+		}),
 	}),
 });
 
@@ -420,6 +678,8 @@ export const {
 	useCreateProviderKeyMutation,
 	useUpdateProviderKeyMutation,
 	useDeleteProviderKeyMutation,
+	useRefreshProviderModelsMutation,
+	useRefreshProviderKeyModelsMutation,
 	useDeleteProviderMutation,
 	useGetAllKeysQuery,
 	useGetModelsQuery,
@@ -430,10 +690,15 @@ export const {
 	useLazyGetProviderKeyQuery,
 	useLazyGetAllKeysQuery,
 	useLazyGetModelsQuery,
-	useLazyGetBaseModelsQuery,
 	useGetModelParametersQuery,
 	useLazyGetModelParametersQuery,
 	useGetModelDetailsQuery,
 	useLazyGetModelDetailsQuery,
 	useUpsertModelCatalogEntriesMutation,
+	useStartGithubCopilotSignInMutation,
+	usePollGithubCopilotSignInMutation,
+	useGetDatasheetEntriesQuery,
+	useGetDatasheetEntryQuery,
+	useSaveDatasheetOverrideMutation,
+	useDeleteDatasheetOverrideMutation,
 } = providersApi;

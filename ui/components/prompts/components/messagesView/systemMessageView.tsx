@@ -1,12 +1,19 @@
 import { CodeEditor } from "@/components/ui/codeEditor";
 import { RichTextarea } from "@/components/ui/custom/richTextarea";
-import { Markdown } from "@/components/ui/markdown";
 import { Message, SerializedMessage } from "@/lib/message";
 import { JINJA_VAR_HIGHLIGHT_PATTERNS, JINJA_VAR_REGEX } from "@/lib/message/constant";
 import { isJson } from "@/lib/utils/validation";
 import { PencilIcon, XIcon } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
+import { useTranslation } from "react-i18next";
 import MessageRoleSwitcher from "./messageRoleSwitcher";
+
+const LazyMarkdown = lazy(() => import("@/components/ui/markdown").then((m) => ({ default: m.Markdown })));
+const Markdown = (props: ComponentProps<typeof LazyMarkdown>) => (
+	<Suspense fallback={null}>
+		<LazyMarkdown {...props} />
+	</Suspense>
+);
 
 /**
  * Renders an editable system message block that supports role switching, rich-text editing, JSON editing with buffered changes, Jinja variable highlighting, and optional removal.
@@ -28,6 +35,7 @@ export function SystemMessageView({
 	onChange: (serialized: SerializedMessage) => void;
 	onRemove?: () => void;
 }) {
+	const { t } = useTranslation("config");
 	const [editMode, setEditMode] = useState(false);
 	const containerRef = useRef<HTMLDivElement>(null);
 	const messageRef = useRef(message);
@@ -111,7 +119,7 @@ export function SystemMessageView({
 					{!disabled && (
 						<button
 							type="button"
-							aria-label="Edit message"
+							aria-label={t("promptRepo.editMessageAria")}
 							data-testid="system-msg-edit"
 							onClick={() => setEditMode(true)}
 							className="hover:bg-muted focus:bg-muted rounded-sm p-1 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100 focus:opacity-100"
@@ -122,7 +130,7 @@ export function SystemMessageView({
 					{!disabled && onRemove && (
 						<button
 							type="button"
-							aria-label="Delete message"
+							aria-label={t("promptRepo.deleteMessageAria")}
 							data-testid="system-msg-delete"
 							onClick={onRemove}
 							className="hover:bg-muted focus:bg-muted rounded-sm p-1 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100 focus:opacity-100"
@@ -134,6 +142,7 @@ export function SystemMessageView({
 			</div>
 
 			<div
+				role="presentation"
 				onClick={(e) => {
 					if (!disabled && !editMode && !(e.target as HTMLElement).closest("button, a, [role='button']")) setEditMode(true);
 				}}
@@ -158,7 +167,7 @@ export function SystemMessageView({
 						highlightPatterns={JINJA_VAR_HIGHLIGHT_PATTERNS}
 					/>
 				) : isEmpty ? (
-					<div className="text-muted-foreground min-h-[20px] text-sm italic">Enter system message...</div>
+					<div className="text-muted-foreground min-h-[20px] text-sm italic">{t("promptRepo.enterSystemMessage")}</div>
 				) : contentIsJson ? (
 					<CodeEditor
 						wrap
@@ -187,6 +196,7 @@ export function SystemMessageView({
 					/>
 				) : (
 					<div
+						role="presentation"
 						className={!disabled ? "cursor-text" : undefined}
 						onClick={(e) => {
 							if (disabled || editMode) return;

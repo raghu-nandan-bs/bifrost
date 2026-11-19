@@ -14,12 +14,12 @@ import (
 type DeferredSpanInfo struct {
 	SpanID              string
 	StartTime           time.Time
-	Tracer              schemas.Tracer          // Reference to tracer for completing the span
-	RequestID           string                  // Request ID for accumulator lookup
-	FirstChunkTime      time.Time               // Timestamp of first chunk (for TTFT calculation)
-	ChunkCount          int                     // Count of received streaming chunks (for AttrTotalChunks)
+	Tracer              schemas.Tracer           // Reference to tracer for completing the span
+	RequestID           string                   // Request ID for accumulator lookup
+	FirstChunkTime      time.Time                // Timestamp of first chunk (for TTFT calculation)
+	ChunkCount          int                      // Count of received streaming chunks (for AttrTotalChunks)
 	AccumulatedResponse *schemas.BifrostResponse // Full accumulated response from streaming chunks
-	mu                  sync.Mutex              // Mutex for thread-safe chunk accumulation
+	mu                  sync.Mutex               // Mutex for thread-safe chunk accumulation
 }
 
 // TraceStore manages traces with thread-safe access and object pooling
@@ -29,6 +29,10 @@ type TraceStore struct {
 	tracePool     sync.Pool // Reuse Trace objects to reduce allocations
 	spanPool      sync.Pool // Reuse Span objects to reduce allocations
 	logger        schemas.Logger
+
+	// onExpire exports a trace the sweep is about to discard. Set by the Tracer, which
+	// owns the connector fan-out; nil falls back to releasing without exporting.
+	onExpire func(*schemas.Trace)
 
 	ttl           time.Duration
 	cleanupTicker *time.Ticker
@@ -67,19 +71,27 @@ func NewTraceStore(ttl time.Duration, logger schemas.Logger) *TraceStore {
 	return store
 }
 
-// CreateTrace creates a new trace and stores it, returns trace ID only.
+// CreateTrace creates a new trace and stores it, returns the trace's store key.
 // The inheritedTraceID parameter is the trace ID from an incoming W3C traceparent header.
-// If provided, this trace will use that ID to continue the distributed trace.
-// If empty, a new trace ID will be generated.
+// If provided, the trace's exported TraceID uses that value to continue the
+// distributed trace. If empty, a new trace ID is generated.
+//
+// The returned key is unique per call, NOT the (possibly shared) W3C trace ID:
+// concurrent sibling requests of one distributed trace legitimately carry the
+// same inherited trace ID, and keying the store by it made siblings overwrite
+// each other — the first CompleteTrace stole the entry and the rest flushed
+// nothing (lost log rows, issue #5256). Callers treat the returned value as an
+// opaque handle; the W3C ID lives on trace.TraceID for span export and linking.
 // Note: The parent span ID (for linking to upstream spans) is handled separately
 // via context in StartSpan, not stored on the trace itself.
 func (s *TraceStore) CreateTrace(inheritedTraceID string, requestID ...string) string {
 	trace := s.tracePool.Get().(*schemas.Trace)
 	// Reset and initialize the trace
+	trace.InternalID = generateTraceID()
 	if inheritedTraceID != "" {
 		trace.TraceID = inheritedTraceID
 	} else {
-		trace.TraceID = generateTraceID()
+		trace.TraceID = trace.InternalID
 	}
 	// Note: trace.ParentID is intentionally not set here.
 	// Parent-child relationships are between spans, not traces.
@@ -106,8 +118,11 @@ func (s *TraceStore) CreateTrace(inheritedTraceID string, requestID ...string) s
 		clear(trace.Attributes)
 	}
 
-	s.traces.Store(trace.TraceID, trace)
-	return trace.TraceID
+	// Reset request headers
+	trace.RequestHeaders = nil
+
+	s.traces.Store(trace.InternalID, trace)
+	return trace.InternalID
 }
 
 // GetTrace retrieves a trace by ID
@@ -125,6 +140,24 @@ func (s *TraceStore) SetRequestID(traceID string, requestID string) {
 		return
 	}
 	trace.SetRequestID(requestID)
+}
+
+// SetRequestHeaders sets the captured request headers for the trace
+func (s *TraceStore) SetRequestHeaders(traceID string, headers map[string]string) {
+	trace := s.GetTrace(traceID)
+	if trace == nil {
+		return
+	}
+	trace.SetRequestHeaders(headers)
+}
+
+// SetTraceAttribute sets a trace-level attribute on the trace
+func (s *TraceStore) SetTraceAttribute(traceID string, key string, value any) {
+	trace := s.GetTrace(traceID)
+	if trace == nil {
+		return
+	}
+	trace.SetAttribute(key, value)
 }
 
 // CompleteTrace marks the trace as complete, removes it from store, and returns it for flushing
@@ -166,22 +199,30 @@ func (s *TraceStore) ClearDeferredSpan(traceID string) {
 // accumulation for plugins (logging, maxim). This eliminates storing 1M+ BifrostResponse
 // objects in the old accumulator at high concurrency.
 func (s *TraceStore) AppendStreamingChunk(traceID string, chunk *schemas.BifrostResponse) {
+	s.appendStreamingChunk(traceID, chunk)
+}
+
+// Reports the first-chunk timestamp on the first chunk only, zero after, so the
+// caller derives end-to-end TTFT from the same instant time_to_first_chunk uses.
+func (s *TraceStore) appendStreamingChunk(traceID string, chunk *schemas.BifrostResponse) time.Time {
 	if chunk == nil {
-		return
+		return time.Time{}
 	}
 	info := s.GetDeferredSpan(traceID)
 	if info == nil {
-		return
+		return time.Time{}
 	}
 	info.mu.Lock()
 	defer info.mu.Unlock()
 
+	info.ChunkCount++
+
 	// Track first chunk time for TTFT calculation
 	if info.FirstChunkTime.IsZero() {
 		info.FirstChunkTime = time.Now()
+		return info.FirstChunkTime
 	}
-
-	info.ChunkCount++
+	return time.Time{}
 }
 
 // GetAccumulatedData returns TTFT and chunk count for a deferred span.
@@ -257,9 +298,11 @@ func (s *TraceStore) StartSpan(traceID, name string, kind schemas.SpanKind) *sch
 
 	span := s.spanPool.Get().(*schemas.Span)
 
-	// Reset and initialize the span
+	// Reset and initialize the span. Span.TraceID carries the exported W3C
+	// trace identity (shared across sibling requests of a distributed trace);
+	// store lookups use the unique key passed as traceID, never this field.
 	span.SpanID = generateSpanID()
-	span.TraceID = traceID
+	span.TraceID = trace.TraceID
 	span.Name = name
 	span.Kind = kind
 	span.StartTime = time.Now()
@@ -304,10 +347,11 @@ func (s *TraceStore) StartChildSpan(traceID, parentSpanID, name string, kind sch
 
 	span := s.spanPool.Get().(*schemas.Span)
 
-	// Reset and initialize the span
+	// Reset and initialize the span. As in StartSpan, Span.TraceID carries the
+	// exported W3C trace identity, not the store key.
 	span.SpanID = generateSpanID()
 	span.ParentID = parentSpanID
-	span.TraceID = traceID
+	span.TraceID = trace.TraceID
 	span.Name = name
 	span.Kind = kind
 	span.StartTime = time.Now()
@@ -399,7 +443,7 @@ func (s *TraceStore) startCleanup() {
 	}()
 }
 
-// cleanupOldTraces removes traces that have exceeded the TTL
+// cleanupOldTraces removes traces and deferred spans that have exceeded the TTL
 func (s *TraceStore) cleanupOldTraces() {
 	cutoff := time.Now().Add(-s.ttl)
 	count := 0
@@ -408,15 +452,37 @@ func (s *TraceStore) cleanupOldTraces() {
 		trace := value.(*schemas.Trace)
 		if trace.StartTime.Before(cutoff) {
 			if deleted, ok := s.traces.LoadAndDelete(key); ok {
-				s.ReleaseTrace(deleted.(*schemas.Trace))
+				trace := deleted.(*schemas.Trace)
+				if s.onExpire != nil {
+					s.onExpire(trace)
+				} else {
+					s.ReleaseTrace(trace)
+				}
 				count++
 			}
 		}
 		return true
 	})
 
-	if count > 0 && s.logger != nil {
-		s.logger.Debug("tracing: cleaned up %d orphaned traces", count)
+	// Deferred spans are normally removed by CompleteTrace or ClearDeferredSpan.
+	// A streaming request that never reaches either (e.g. the final chunk send
+	// fails without a cancelled context, or the producer goroutine dies before
+	// the trace completer runs) would otherwise leave its entry — and the
+	// accumulated response it pins — in the map forever.
+	deferredCount := 0
+	s.deferredSpans.Range(func(key, value any) bool {
+		info := value.(*DeferredSpanInfo)
+		if info.StartTime.Before(cutoff) {
+			if _, ok := s.deferredSpans.LoadAndDelete(key); ok {
+				deferredCount++
+			}
+		}
+		return true
+	})
+
+	if (count > 0 || deferredCount > 0) && s.logger != nil {
+		// Not Debug: a trace only expires when its completion never arrived.
+		s.logger.Warn("tracing: swept %d traces and %d deferred spans past the %s TTL; their completion never arrived", count, deferredCount, s.ttl)
 	}
 }
 

@@ -1,19 +1,24 @@
+import { StartTruncatedLabel } from "@/components/ui/truncatedLabel";
+import { useTranslation } from "react-i18next";
 import type { CostHistogramResponse } from "@/lib/types/logs";
 import { formatCurrencyNumber } from "@/lib/utils/numbers";
 import { memo, useMemo } from "react";
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import {
+	computeDisplaySeries,
 	formatCost,
 	formatFullTimestamp,
 	formatTimestamp,
 	getModelColor,
 	OTHER_SERIES_COLOR,
 	OTHER_SERIES_KEY,
-	OTHER_SERIES_LABEL,
-	pickTopSeries,
+	getOtherSeriesLabel,
 } from "../../utils/chartUtils";
+import { CappedBarStack } from "./barShape";
 import { ChartErrorBoundary } from "./chartErrorBoundary";
 import type { ChartType } from "./chartTypeToggle";
+import { NoChartData } from "./noChartData";
+import { useLocale } from "@/lib/i18n/useLocale";
 
 interface CostChartProps {
 	data: CostHistogramResponse | null;
@@ -24,6 +29,7 @@ interface CostChartProps {
 }
 
 function CustomTooltip({ active, payload, selectedModel, displayModels }: any) {
+	const { t } = useTranslation("observability");
 	if (!active || !payload || !payload.length) return null;
 
 	const data = payload[0]?.payload;
@@ -43,15 +49,19 @@ function CustomTooltip({ active, payload, selectedModel, displayModels }: any) {
 								<div key={model} className="flex items-center justify-between gap-4">
 									<span className="flex items-center gap-1.5">
 										<span className="h-2 w-2 rounded-full" style={{ backgroundColor: isOther ? OTHER_SERIES_COLOR : getModelColor(idx) }} />
-										<span className="max-w-[120px] truncate text-zinc-600 dark:text-zinc-400">{isOther ? OTHER_SERIES_LABEL : model}</span>
+										<StartTruncatedLabel className="max-w-[220px] text-zinc-600 dark:text-zinc-400">
+											{isOther ? getOtherSeriesLabel() : model}
+										</StartTruncatedLabel>
 									</span>
-									<span className="font-medium">{formatCost(cost)}</span>
+									<span className="font-medium" style={{ color: isOther ? OTHER_SERIES_COLOR : getModelColor(idx) }}>
+										{formatCost(cost)}
+									</span>
 								</div>
 							);
 						})}
 						<div className="flex items-center justify-between gap-4 border-t border-zinc-200 pt-1 dark:border-zinc-700">
-							<span className="text-zinc-600 dark:text-zinc-400">Total</span>
-							<span className="font-medium">{formatCost(data.total_cost)}</span>
+							<span className="text-zinc-600 dark:text-zinc-400">{t("labels.total")}</span>
+							<span className="font-medium text-zinc-900 dark:text-zinc-100">{formatCost(data.total_cost)}</span>
 						</div>
 					</>
 				) : (
@@ -60,7 +70,7 @@ function CustomTooltip({ active, payload, selectedModel, displayModels }: any) {
 							<span className="h-2 w-2 rounded-full" style={{ backgroundColor: getModelColor(0) }} />
 							<span className="text-zinc-600 dark:text-zinc-400">{selectedModel}</span>
 						</span>
-						<span className="font-medium">{formatCost(data.by_model?.[selectedModel] || 0)}</span>
+						<span className="font-medium text-zinc-900 dark:text-zinc-100">{formatCost(data.by_model?.[selectedModel] || 0)}</span>
 					</div>
 				)}
 			</div>
@@ -69,6 +79,7 @@ function CustomTooltip({ active, payload, selectedModel, displayModels }: any) {
 }
 
 function CostChartImpl({ data, chartType, startTime, endTime, selectedModel }: CostChartProps) {
+	useLocale();
 	const { chartData, displayModels } = useMemo(() => {
 		if (!data?.buckets || !data.bucket_size_seconds) {
 			return { chartData: [], displayModels: [] };
@@ -77,9 +88,8 @@ function CostChartImpl({ data, chartType, startTime, endTime, selectedModel }: C
 		let models: string[];
 		let hasOther = false;
 		if (selectedModel === "all") {
-			const top = pickTopSeries(data.buckets, data.models, (b, m) => b.by_model?.[m] ?? 0);
-			hasOther = top.length < data.models.length;
-			models = hasOther ? [...top, OTHER_SERIES_KEY] : top;
+			models = computeDisplaySeries(data.buckets, data.models, (b, m) => b.by_model?.[m] ?? 0);
+			hasOther = models[models.length - 1] === OTHER_SERIES_KEY;
 		} else {
 			models = [selectedModel];
 		}
@@ -108,7 +118,7 @@ function CostChartImpl({ data, chartType, startTime, endTime, selectedModel }: C
 	}, [data, selectedModel]);
 
 	if (!data?.buckets || chartData.length === 0) {
-		return <div className="text-muted-foreground flex h-full items-center justify-center text-sm">No data available</div>;
+		return <NoChartData />;
 	}
 
 	const commonProps = {
@@ -118,7 +128,7 @@ function CostChartImpl({ data, chartType, startTime, endTime, selectedModel }: C
 
 	return (
 		<ChartErrorBoundary resetKey={`${startTime}-${endTime}-${chartData.length}-${selectedModel}`}>
-			<ResponsiveContainer width="100%" height="100%">
+			<ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 1, height: 1 }}>
 				{chartType === "bar" ? (
 					<BarChart {...commonProps} barCategoryGap={1}>
 						<CartesianGrid strokeDasharray="3 3" vertical={false} className="stroke-zinc-200 dark:stroke-zinc-700" />
@@ -141,19 +151,22 @@ function CostChartImpl({ data, chartType, startTime, endTime, selectedModel }: C
 							domain={[0, (dataMax: number) => Math.max(dataMax, 0.01)]}
 							allowDataOverflow={false}
 						/>
-						<Tooltip content={<CustomTooltip selectedModel={selectedModel} displayModels={displayModels} />} />
-						{displayModels.map((model, idx) => (
-							<Bar
-								isAnimationActive={false}
-								key={model}
-								dataKey={`model_${idx}`}
-								stackId="cost"
-								fill={model === OTHER_SERIES_KEY ? OTHER_SERIES_COLOR : getModelColor(idx)}
-								fillOpacity={0.9}
-								barSize={30}
-								radius={idx === displayModels.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]}
-							/>
-						))}
+						<Tooltip
+							content={<CustomTooltip selectedModel={selectedModel} displayModels={displayModels} />}
+							cursor={{ fill: "#8c8c8f", fillOpacity: 0.15 }}
+						/>
+						<CappedBarStack buckets={chartData.length}>
+							{displayModels.map((model, idx) => (
+								<Bar
+									isAnimationActive={false}
+									key={model}
+									dataKey={`model_${idx}`}
+									fill={model === OTHER_SERIES_KEY ? OTHER_SERIES_COLOR : getModelColor(idx)}
+									fillOpacity={0.9}
+									barSize={30}
+								/>
+							))}
+						</CappedBarStack>
 					</BarChart>
 				) : (
 					<AreaChart {...commonProps}>
@@ -177,7 +190,10 @@ function CostChartImpl({ data, chartType, startTime, endTime, selectedModel }: C
 							domain={[0, (dataMax: number) => Math.max(dataMax, 0.01)]}
 							allowDataOverflow={false}
 						/>
-						<Tooltip content={<CustomTooltip selectedModel={selectedModel} displayModels={displayModels} />} />
+						<Tooltip
+							content={<CustomTooltip selectedModel={selectedModel} displayModels={displayModels} />}
+							cursor={{ fill: "#8c8c8f", fillOpacity: 0.15 }}
+						/>
 						{displayModels.map((model, idx) => {
 							const color = model === OTHER_SERIES_KEY ? OTHER_SERIES_COLOR : getModelColor(idx);
 							return (

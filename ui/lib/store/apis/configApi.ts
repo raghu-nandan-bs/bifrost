@@ -1,3 +1,4 @@
+import i18n from "@/lib/i18n";
 import { BifrostConfig, GlobalProxyConfig, LatestReleaseResponse } from "@/lib/types/config";
 import axios from "axios";
 import { baseApi } from "./baseApi";
@@ -20,6 +21,36 @@ const applyMetadataPatch = (metadata: BifrostConfig["metadata"] | undefined, pat
 
 export const configApi = baseApi.injectEndpoints({
 	endpoints: (builder) => ({
+		getUserAgentMappings: builder.query<{ mappings: UserAgentMapping[] }, void>({
+			query: () => ({
+				url: "/logs/user-agent-mappings",
+			}),
+			providesTags: ["UserAgentMappings"],
+		}),
+		createUserAgentMapping: builder.mutation<UserAgentMapping, UserAgentMappingPayload>({
+			query: (data) => ({
+				url: "/logs/user-agent-mappings",
+				method: "POST",
+				body: data,
+			}),
+			invalidatesTags: ["UserAgentMappings"],
+		}),
+		updateUserAgentMapping: builder.mutation<UserAgentMapping, { id: string; data: UserAgentMappingPayload }>({
+			query: ({ id, data }) => ({
+				url: `/logs/user-agent-mappings/${id}`,
+				method: "PUT",
+				body: data,
+			}),
+			invalidatesTags: ["UserAgentMappings"],
+		}),
+		deleteUserAgentMapping: builder.mutation<{ success: boolean }, string>({
+			query: (id) => ({
+				url: `/logs/user-agent-mappings/${id}`,
+				method: "DELETE",
+			}),
+			invalidatesTags: ["UserAgentMappings"],
+		}),
+
 		// Get core configuration
 		getCoreConfig: builder.query<BifrostConfig, { fromDB?: boolean }>({
 			query: ({ fromDB = false } = {}) => ({
@@ -63,7 +94,7 @@ export const configApi = baseApi.injectEndpoints({
 								error: {
 									status: "TIMEOUT_ERROR",
 									error: "Request timeout",
-									data: { error: { message: "Request timeout" } },
+									data: { error: { message: i18n.t("apiErrors.requestTimeout") } },
 								},
 							};
 						}
@@ -75,7 +106,7 @@ export const configApi = baseApi.injectEndpoints({
 						error: {
 							status: "FETCH_ERROR",
 							error: String(error),
-							data: { error: { message: "Network error" } },
+							data: { error: { message: i18n.t("apiErrors.network") } },
 						},
 					};
 				}
@@ -142,6 +173,29 @@ export const configApi = baseApi.injectEndpoints({
 	}),
 });
 
+export type UserAgentMappingMatchType = "contains" | "starts_with" | "exact" | "regex";
+
+export interface UserAgentMapping {
+	id: string;
+	pattern: string;
+	match_type: UserAgentMappingMatchType;
+	app: string;
+	logo?: string;
+	logo_mime?: string | null;
+	is_active: boolean;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface UserAgentMappingPayload {
+	pattern: string;
+	match_type: UserAgentMappingMatchType;
+	app: string;
+	logo?: string;
+	logo_mime?: string | null;
+	is_active: boolean;
+}
+
 export const {
 	useGetVersionQuery,
 	useGetCoreConfigQuery,
@@ -152,4 +206,8 @@ export const {
 	useLazyGetCoreConfigQuery,
 	useGetLatestReleaseQuery,
 	useLazyGetLatestReleaseQuery,
+	useGetUserAgentMappingsQuery,
+	useCreateUserAgentMappingMutation,
+	useUpdateUserAgentMappingMutation,
+	useDeleteUserAgentMappingMutation,
 } = configApi;

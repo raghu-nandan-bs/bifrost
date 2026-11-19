@@ -5,9 +5,13 @@ import { fillSelect, waitForNetworkIdle } from '../../../core/utils/test-helpers
 
 export interface TeamConfig {
   name: string
-  /** Assign by customer id (from API). Prefer customerName for UI-only flow. */
+  /**
+   * Only `''` is honoured, meaning "clear the assignment". The picker is an
+   * async CustomerSelector that searches server-side and renders names, not
+   * ids, so assigning must go through `customerName`.
+   */
   customerId?: string
-  /** Assign by customer name in the create-team dropdown (UI-only, no API). */
+  /** Assign by customer name in the create-team customer picker (UI-only, no API). */
   customerName?: string
   budget?: { maxLimit: number; resetDuration?: string }
   rateLimit?: {
@@ -47,7 +51,7 @@ export class GovernancePage extends BasePage {
 
     this.teamsCreateBtn = page.getByTestId('create-team-btn').or(page.getByTestId('team-button-add'))
     this.teamsTable = page.getByTestId('teams-table')
-    this.teamDialog = page.getByTestId('team-dialog-content')
+    this.teamDialog = page.getByTestId('team-sheet-content')
     this.teamNameInput = page.getByTestId('team-name-input')
 
     this.customersCreateBtn = page.getByTestId('customer-button-create')
@@ -80,6 +84,30 @@ export class GovernancePage extends BasePage {
     return (await row.count()) > 0
   }
 
+  /**
+   * Drives the team sheet's CustomerSelector. Search is server-side, so the
+   * name is typed rather than picked from a preloaded option list.
+   */
+  private async selectTeamCustomer(customerName: string): Promise<void> {
+    const selector = this.page.getByTestId('team-customer-selector')
+    await selector.getByRole('combobox').click()
+
+    const search = this.page.getByPlaceholder('Search customers...')
+    await search.waitFor({ state: 'visible', timeout: 5000 })
+    await search.fill(customerName)
+
+    const option = this.page.getByRole('option').filter({ hasText: customerName }).first()
+    await option.waitFor({ state: 'visible', timeout: 5000 })
+    await option.click()
+  }
+
+  private async clearTeamCustomer(): Promise<void> {
+    const clearBtn = this.page.getByTestId('team-customer-clear-btn')
+    if (await clearBtn.isVisible().catch(() => false)) {
+      await clearBtn.click()
+    }
+  }
+
   async createTeam(config: TeamConfig): Promise<void> {
     await this.teamsCreateBtn.click()
     await expect(this.teamDialog).toBeVisible({ timeout: 5000 })
@@ -87,27 +115,15 @@ export class GovernancePage extends BasePage {
 
     await this.teamNameInput.fill(config.name)
 
-    if (config.customerId !== undefined || config.customerName !== undefined) {
-      const trigger = this.page.getByTestId('team-customer-select-trigger')
-      await trigger.click()
-      if (config.customerId === '') {
-        await this.page.getByTestId('team-customer-option-none').click()
-      } else if (config.customerName !== undefined) {
-        const customerOption = this.page
-          .locator('[data-testid^="team-customer-option-"]')
-          .filter({ hasText: config.customerName })
-        await customerOption.waitFor({ state: 'visible', timeout: 5000 })
-        await customerOption.click()
-      } else if (config.customerId !== undefined && config.customerId !== '') {
-        const customerOption = this.page.getByTestId(`team-customer-option-${config.customerId}`)
-        await customerOption.waitFor({ state: 'visible', timeout: 5000 })
-        await customerOption.click()
-      }
+    if (config.customerId === '') {
+      await this.clearTeamCustomer()
+    } else if (config.customerName !== undefined) {
+      await this.selectTeamCustomer(config.customerName)
     }
 
     if (config.budget?.maxLimit !== undefined) {
-      const budgetInput = this.page.getByTestId('budget-max-limit-input')
-      await budgetInput.fill(String(config.budget.maxLimit))
+      await this.teamDialog.getByTestId('team-add-budget-btn').click()
+      await this.teamDialog.getByTestId('budget-max-limit-input-0').fill(String(config.budget.maxLimit))
     }
 
     const saveBtn = this.teamDialog.getByRole('button', { name: /Create Team/i })
@@ -118,8 +134,8 @@ export class GovernancePage extends BasePage {
   }
 
   async deleteTeam(name: string): Promise<void> {
-    const deleteBtn = this.page.getByTestId(`team-delete-btn-${name}`)
-    await deleteBtn.click()
+    await this.page.getByTestId(`team-actions-btn-${name}`).click()
+    await this.page.getByTestId(`team-delete-btn-${name}`).click()
 
     const confirmDialog = this.page.locator('[role="alertdialog"]')
     await confirmDialog.getByRole('button', { name: /Delete/i }).click()
@@ -151,8 +167,8 @@ export class GovernancePage extends BasePage {
     await this.customerNameInput.fill(config.name)
 
     if (config.budget?.maxLimit !== undefined) {
-      const budgetInput = this.page.getByTestId('budget-max-limit-input')
-      await budgetInput.fill(String(config.budget.maxLimit))
+      await this.customerDialog.getByTestId('customer-budgets-add-btn').click()
+      await this.customerDialog.getByTestId('customer-budgets-amount-0').fill(String(config.budget.maxLimit))
     }
 
     const saveBtn = this.customerDialog.getByRole('button', { name: /Create Customer/i })
@@ -164,8 +180,9 @@ export class GovernancePage extends BasePage {
 
   async deleteCustomer(name: string): Promise<void> {
     const row = this.getCustomerRow(name)
-    const deleteBtn = row.locator('[data-testid^="customer-button-delete-"]')
-    await deleteBtn.click()
+    // Row actions live in a menu portaled outside the row.
+    await row.locator('[data-testid^="customer-actions-btn-"]').click()
+    await this.page.locator('[data-testid^="customer-button-delete-"]').click()
 
     const confirmBtn = this.page.getByTestId('customer-button-delete-confirm')
     await confirmBtn.waitFor({ state: 'visible', timeout: 5000 })
@@ -175,8 +192,8 @@ export class GovernancePage extends BasePage {
   }
 
   async editTeam(name: string, updates: Partial<TeamConfig>): Promise<void> {
-    const editBtn = this.page.getByTestId(`team-edit-btn-${name}`)
-    await editBtn.click()
+    await this.page.getByTestId(`team-actions-btn-${name}`).click()
+    await this.page.getByTestId(`team-edit-btn-${name}`).click()
     await expect(this.teamDialog).toBeVisible({ timeout: 5000 })
     await this.waitForSheetAnimation()
 
@@ -185,33 +202,37 @@ export class GovernancePage extends BasePage {
       await this.teamNameInput.fill(updates.name)
     }
 
-    if (updates.customerId !== undefined) {
-      const trigger = this.page.getByTestId('team-customer-select-trigger')
-      await trigger.click()
-      if (updates.customerId === '') {
-        await this.page.getByTestId('team-customer-option-none').click()
-      } else {
-        await this.page.getByTestId(`team-customer-option-${updates.customerId}`).click()
-      }
+    if (updates.customerId === '') {
+      await this.clearTeamCustomer()
+    } else if (updates.customerName !== undefined) {
+      await this.selectTeamCustomer(updates.customerName)
     }
 
     if (updates.budget?.maxLimit !== undefined) {
-      const budgetInput = this.page.getByTestId('budget-max-limit-input')
-      await budgetInput.clear()
+      const budgetInput = this.teamDialog.getByTestId('budget-max-limit-input-0')
+      if (!(await budgetInput.isVisible())) {
+        await this.teamDialog.getByTestId('team-add-budget-btn').click()
+      }
       await budgetInput.fill(String(updates.budget.maxLimit))
     }
 
     const saveBtn = this.teamDialog.getByRole('button', { name: /Save|Update/i })
     await expect(saveBtn).toBeEnabled()
     await saveBtn.click()
+    // A changed budget asks whether to reset its usage before saving.
+    const preserveUsage = this.page.getByTestId('team-budget-reset-dialog-preserve-btn')
+    await preserveUsage.or(this.getToast('success')).first().waitFor()
+    if (await preserveUsage.isVisible()) {
+      await preserveUsage.click()
+    }
     await this.waitForSuccessToast()
     await expect(this.teamDialog).not.toBeVisible({ timeout: 10000 })
   }
 
   async editCustomer(name: string, updates: Partial<CustomerConfig>): Promise<void> {
     const row = this.getCustomerRow(name)
-    const editBtn = row.locator('[data-testid^="customer-button-edit-"]')
-    await editBtn.click()
+    await row.locator('[data-testid^="customer-actions-btn-"]').click()
+    await this.page.locator('[data-testid^="customer-button-edit-"]').click()
     await expect(this.customerDialog).toBeVisible({ timeout: 5000 })
     await this.waitForSheetAnimation()
 

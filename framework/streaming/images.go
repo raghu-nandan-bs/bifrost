@@ -121,7 +121,7 @@ func (a *Accumulator) processAccumulatedImageStreamingChunks(requestID string, b
 	defer func() {
 		if isFinalChunk {
 			// Cleanup BEFORE unlocking to prevent other goroutines from accessing chunks being returned to pool
-			a.cleanupStreamAccumulator(requestID)
+			a.cleanupStreamAccumulator(requestID, false) // natural completion — defer if gate is still busy
 		}
 		acc.mu.Unlock()
 	}()
@@ -193,7 +193,7 @@ func (a *Accumulator) processAccumulatedImageStreamingChunks(requestID string, b
 		}
 	}
 
-	// Update semantic cache debug and raw response from final chunk if available
+	// Update semantic cache metadata and raw response from final chunk if available
 	if len(acc.ImageStreamChunks) > 0 {
 		lastChunk := acc.ImageStreamChunks[len(acc.ImageStreamChunks)-1]
 		if lastChunk.SemanticCacheDebug != nil {
@@ -240,6 +240,7 @@ func (a *Accumulator) processImageStreamingResponse(ctx *schemas.BifrostContext,
 			URL:               result.ImageGenerationStreamResponse.URL,
 			CreatedAt:         result.ImageGenerationStreamResponse.CreatedAt,
 			Size:              result.ImageGenerationStreamResponse.Size,
+			AspectRatio:       result.ImageGenerationStreamResponse.AspectRatio,
 			Quality:           result.ImageGenerationStreamResponse.Quality,
 			Background:        result.ImageGenerationStreamResponse.Background,
 			OutputFormat:      result.ImageGenerationStreamResponse.OutputFormat,
@@ -315,6 +316,7 @@ func (a *Accumulator) processImageStreamingResponse(ctx *schemas.BifrostContext,
 				Provider:       provider,
 				RequestedModel: requestedModel,
 				ResolvedModel:  resolvedModel,
+				RoutingInfo:    bifrost.GetResponseRoutingInfo(result, bifrostErr),
 				Data:           data,
 				RawRequest:     &rawRequest,
 			}, nil
@@ -331,6 +333,7 @@ func (a *Accumulator) processImageStreamingResponse(ctx *schemas.BifrostContext,
 		Provider:       provider,
 		RequestedModel: requestedModel,
 		ResolvedModel:  resolvedModel,
+		RoutingInfo:    bifrost.GetResponseRoutingInfo(result, bifrostErr),
 		Data:           nil,
 	}, nil
 }

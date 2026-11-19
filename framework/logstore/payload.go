@@ -2,6 +2,8 @@ package logstore
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -9,7 +11,13 @@ import (
 	"github.com/maximhq/bifrost/core/schemas"
 )
 
-const maxMCPToolInputPreviewRunes = 200
+const (
+	maxMCPToolInputPreviewRunes = 200
+	maxA2APayloadPreviewRunes   = 2048
+	a2aObjectSchemaVersion      = 1
+	maxRelayBodyPreviewRunes    = 2048
+	relayObjectSchemaVersion    = 1
+)
 
 // payloadFields lists the DB column names of large TEXT fields that are
 // offloaded to object storage in hybrid mode. These fields are never needed
@@ -20,6 +28,7 @@ var payloadFields = []string{
 	"responses_input_history",
 	"output_message",
 	"responses_output",
+	"embedding_input",
 	"embedding_output",
 	"rerank_output",
 	"ocr_input",
@@ -33,6 +42,7 @@ var payloadFields = []string{
 	"image_edit_input",
 	"image_variation_input",
 	"video_generation_input",
+	"video_edit_input",
 	"speech_output",
 	"transcription_output",
 	"image_generation_output",
@@ -42,7 +52,10 @@ var payloadFields = []string{
 	"video_download_output",
 	"video_list_output",
 	"video_delete_output",
+	"live_session",
 	"cache_debug",
+	"guardrail_debug",
+	"routing_metadata",
 	"token_usage",
 	"error_details",
 	"raw_request",
@@ -50,16 +63,18 @@ var payloadFields = []string{
 	"passthrough_request_body",
 	"passthrough_response_body",
 	"routing_engine_logs",
+	"plugin_logs",
 }
 
 // ExtractPayload reads the serialized TEXT payload fields from a Log into a map.
 // The map keys are the DB column names.
 func ExtractPayload(l *Log) map[string]string {
-	m := make(map[string]string, len(payloadFields))
+	m := make(map[string]string, len(payloadFields)+25)
 	m["input_history"] = l.InputHistory
 	m["responses_input_history"] = l.ResponsesInputHistory
 	m["output_message"] = l.OutputMessage
 	m["responses_output"] = l.ResponsesOutput
+	m["embedding_input"] = l.EmbeddingInput
 	m["embedding_output"] = l.EmbeddingOutput
 	m["rerank_output"] = l.RerankOutput
 	m["ocr_input"] = l.OCRInput
@@ -73,6 +88,7 @@ func ExtractPayload(l *Log) map[string]string {
 	m["image_edit_input"] = l.ImageEditInput
 	m["image_variation_input"] = l.ImageVariationInput
 	m["video_generation_input"] = l.VideoGenerationInput
+	m["video_edit_input"] = l.VideoEditInput
 	m["speech_output"] = l.SpeechOutput
 	m["transcription_output"] = l.TranscriptionOutput
 	m["image_generation_output"] = l.ImageGenerationOutput
@@ -82,7 +98,10 @@ func ExtractPayload(l *Log) map[string]string {
 	m["video_download_output"] = l.VideoDownloadOutput
 	m["video_list_output"] = l.VideoListOutput
 	m["video_delete_output"] = l.VideoDeleteOutput
+	m["live_session"] = l.LiveSession
 	m["cache_debug"] = l.CacheDebug
+	m["guardrail_debug"] = l.GuardrailDebug
+	m["routing_metadata"] = l.RoutingMetadata
 	m["token_usage"] = l.TokenUsage
 	m["error_details"] = l.ErrorDetails
 	m["raw_request"] = l.RawRequest
@@ -90,11 +109,57 @@ func ExtractPayload(l *Log) map[string]string {
 	m["passthrough_request_body"] = l.PassthroughRequestBody
 	m["passthrough_response_body"] = l.PassthroughResponseBody
 	m["routing_engine_logs"] = l.RoutingEngineLogs
-	// Metadata is deliberately NOT included in the snapshot (nor in
-	// payloadFields): it must always stay DB-resident (filters, rankings,
-	// log-list display). The DB row is authoritative, so metadata is neither
-	// written to nor restored from the object store.
+	m["plugin_logs"] = l.PluginLogs
+	// Metadata is written to the snapshot so consumers reading objects
+	// directly see custom attributes, but it is deliberately NOT part of
+	// payloadFields: it must always stay DB-resident as well (filters,
+	// rankings, log-list display), so ClearPayload never strips it from the
+	// row. NOTE: the snapshot carries the metadata value as of upload time;
+	// subsequent DB updates are NOT reflected in the object store.
+	if l.Metadata != nil && *l.Metadata != "" {
+		m["metadata"] = *l.Metadata
+	}
+	m["provider"] = l.Provider
+	m["model"] = l.Model
+	m["status"] = l.Status
+	m["timestamp"] = l.Timestamp.Format(time.RFC3339Nano)
+	m["selected_key_id"] = l.SelectedKeyID
+	m["selected_key_name"] = l.SelectedKeyName
+	putIfPresent(m, "virtual_key_id", l.VirtualKeyID)
+	putIfPresent(m, "virtual_key_name", l.VirtualKeyName)
+	putIfPresent(m, "user_id", l.UserID)
+	putIfPresent(m, "user_name", l.UserName)
+	putIfPresent(m, "user_email", l.UserEmail)
+	putIfPresent(m, "client_ip", l.ClientIP)
+	putIfPresent(m, "team_id", l.TeamID)
+	putIfPresent(m, "team_name", l.TeamName)
+	putIfPresent(m, "team_ids", l.TeamIDs)
+	putIfPresent(m, "team_names", l.TeamNames)
+	putIfPresent(m, "customer_id", l.CustomerID)
+	putIfPresent(m, "customer_name", l.CustomerName)
+	putIfPresent(m, "customer_ids", l.CustomerIDs)
+	putIfPresent(m, "customer_names", l.CustomerNames)
+	putIfPresent(m, "business_unit_id", l.BusinessUnitID)
+	putIfPresent(m, "business_unit_name", l.BusinessUnitName)
+	putIfPresent(m, "business_unit_ids", l.BusinessUnitIDs)
+	putIfPresent(m, "business_unit_names", l.BusinessUnitNames)
+	putIfPresent(m, "project_id", l.ProjectID)
+	putIfPresent(m, "project_name", l.ProjectName)
+	if l.Cost != nil {
+		m["cost"] = strconv.FormatFloat(*l.Cost, 'f', -1, 64)
+	}
+	if l.Latency != nil {
+		m["latency"] = strconv.FormatFloat(*l.Latency, 'f', -1, 64)
+	}
 	return m
+}
+
+// putIfPresent sets the key only when v is non-nil and non-empty, so absent
+// attribution stays absent rather than becoming an empty string.
+func putIfPresent(m map[string]string, key string, v *string) {
+	if v != nil && *v != "" {
+		m[key] = *v
+	}
 }
 
 // ClearPayload zeros out both the TEXT payload columns and the Parsed virtual
@@ -102,12 +167,63 @@ func ExtractPayload(l *Log) map[string]string {
 // GORM's BeforeCreate/SerializeFields from re-populating TEXT columns.
 // After calling this, the struct only contains index-weight data suitable
 // for a lightweight DB INSERT.
+// BillingHydrationChunkSize is how many rows a cost recomputation may hydrate at
+// once. Kept deliberately tiny: a hydrated row holds its whole offloaded payload,
+// which can include full message histories and raw request/response bodies, so this
+// is the knob that bounds a recompute worker's peak memory. Billing query pages are
+// capped to the same size because DB-resident modality payloads are materialized by
+// the query before object-store hydration begins.
+const BillingHydrationChunkSize = 3
+
+// BillingHydrationResult reports what one hydration pass actually did, so the caller
+// does not have to infer it from the rows.
+type BillingHydrationResult struct {
+	// Hydrated lists the rows whose pricing inputs were fetched from object storage.
+	// These are the only rows worth persisting via BulkBackfillBillingPayloads: every
+	// other row's inputs already came from the database.
+	Hydrated []string
+	// Unpriceable lists rows whose inputs could not be recovered — for example, a
+	// missing object or unavailable object storage. Callers must skip these rather
+	// than price them from the lossy fallback.
+	Unpriceable []string
+}
+
+// BillingPayloadBackfill carries pricing inputs recovered from object storage that are
+// worth writing back into the row.
+//
+// Deliberately only the two small ones. token_usage is a few hundred bytes of counters
+// and cache_debug a handful of cache-hit fields, so keeping them in the row is cheap and
+// repairs legacy rows written before pricing metadata became unconditionally
+// DB-resident. The modality payloads
+// (image_generation_output above all, which carries base64 image bytes) are exactly what
+// offloading exists to keep out of the database, so they stay in object storage and
+// modality rows keep fetching.
+type BillingPayloadBackfill struct {
+	TokenUsage string
+	CacheDebug string
+}
+
+// ReleaseBillingPayloads drops the payload fields from rows that have already been
+// priced, so a batch never accumulates more than one chunk of them.
+//
+// Safe because pricing is the last thing that reads these: the recalc job keeps only
+// the ID, timestamp and computed cost afterwards, and the rows are never written back
+// (BulkUpdateCost takes an id → CostUpdate map).
+func ReleaseBillingPayloads(logs []*Log) {
+	for _, l := range logs {
+		if l != nil {
+			ClearPayload(l)
+		}
+	}
+}
+
 func ClearPayload(l *Log) {
 	// Clear serialized TEXT columns.
 	l.InputHistory = ""
 	l.ResponsesInputHistory = ""
 	l.OutputMessage = ""
 	l.ResponsesOutput = ""
+	l.EmbeddingInput = ""
 	l.EmbeddingOutput = ""
 	l.RerankOutput = ""
 	l.OCRInput = ""
@@ -121,6 +237,7 @@ func ClearPayload(l *Log) {
 	l.ImageEditInput = ""
 	l.ImageVariationInput = ""
 	l.VideoGenerationInput = ""
+	l.VideoEditInput = ""
 	l.SpeechOutput = ""
 	l.TranscriptionOutput = ""
 	l.ImageGenerationOutput = ""
@@ -130,7 +247,10 @@ func ClearPayload(l *Log) {
 	l.VideoDownloadOutput = ""
 	l.VideoListOutput = ""
 	l.VideoDeleteOutput = ""
+	l.LiveSession = ""
 	l.CacheDebug = ""
+	l.GuardrailDebug = ""
+	l.RoutingMetadata = ""
 	l.TokenUsage = ""
 	l.ErrorDetails = ""
 	l.RawRequest = ""
@@ -138,12 +258,14 @@ func ClearPayload(l *Log) {
 	l.PassthroughRequestBody = ""
 	l.PassthroughResponseBody = ""
 	l.RoutingEngineLogs = ""
+	l.PluginLogs = ""
 
 	// Clear Parsed virtual fields so GORM's SerializeFields won't re-serialize them.
 	l.InputHistoryParsed = nil
 	l.ResponsesInputHistoryParsed = nil
 	l.OutputMessageParsed = nil
 	l.ResponsesOutputParsed = nil
+	l.EmbeddingInputParsed = nil
 	l.EmbeddingOutputParsed = nil
 	l.RerankOutputParsed = nil
 	l.OCRInputParsed = nil
@@ -157,6 +279,7 @@ func ClearPayload(l *Log) {
 	l.ImageEditInputParsed = nil
 	l.ImageVariationInputParsed = nil
 	l.VideoGenerationInputParsed = nil
+	l.VideoEditInputParsed = nil
 	l.SpeechOutputParsed = nil
 	l.TranscriptionOutputParsed = nil
 	l.ImageGenerationOutputParsed = nil
@@ -166,7 +289,10 @@ func ClearPayload(l *Log) {
 	l.VideoDownloadOutputParsed = nil
 	l.VideoListOutputParsed = nil
 	l.VideoDeleteOutputParsed = nil
+	l.LiveSessionParsed = nil
 	l.CacheDebugParsed = nil
+	l.GuardrailDebugParsed = nil
+	l.RoutingMetadataParsed = nil
 	l.TokenUsageParsed = nil
 	l.ErrorDetailsParsed = nil
 }
@@ -190,6 +316,9 @@ func MergePayloadFromJSON(l *Log, data []byte) error {
 	}
 	if v, ok := m["responses_output"]; ok && v != "" {
 		l.ResponsesOutput = v
+	}
+	if v, ok := m["embedding_input"]; ok && v != "" {
+		l.EmbeddingInput = v
 	}
 	if v, ok := m["embedding_output"]; ok && v != "" {
 		l.EmbeddingOutput = v
@@ -230,6 +359,9 @@ func MergePayloadFromJSON(l *Log, data []byte) error {
 	if v, ok := m["video_generation_input"]; ok && v != "" {
 		l.VideoGenerationInput = v
 	}
+	if v, ok := m["video_edit_input"]; ok && v != "" {
+		l.VideoEditInput = v
+	}
 	if v, ok := m["speech_output"]; ok && v != "" {
 		l.SpeechOutput = v
 	}
@@ -257,8 +389,17 @@ func MergePayloadFromJSON(l *Log, data []byte) error {
 	if v, ok := m["video_delete_output"]; ok && v != "" {
 		l.VideoDeleteOutput = v
 	}
+	if v, ok := m["live_session"]; ok && v != "" {
+		l.LiveSession = v
+	}
 	if v, ok := m["cache_debug"]; ok && v != "" {
 		l.CacheDebug = v
+	}
+	if v, ok := m["guardrail_debug"]; ok && v != "" {
+		l.GuardrailDebug = v
+	}
+	if v, ok := m["routing_metadata"]; ok && v != "" {
+		l.RoutingMetadata = v
 	}
 	if v, ok := m["token_usage"]; ok && v != "" {
 		l.TokenUsage = v
@@ -281,9 +422,20 @@ func MergePayloadFromJSON(l *Log, data []byte) error {
 	if v, ok := m["routing_engine_logs"]; ok && v != "" {
 		l.RoutingEngineLogs = v
 	}
-	// Metadata is intentionally NOT restored from the snapshot: it is never
-	// written there (see ExtractPayload), and the DB row is authoritative.
-	return l.DeserializeFields()
+	if v, ok := m["plugin_logs"]; ok && v != "" {
+		l.PluginLogs = v
+	}
+	// Metadata is intentionally NOT restored from the snapshot: the copy
+	// written there (see ExtractPayload) is for external object consumers
+	// only, and the DB row stays authoritative.
+	if err := l.DeserializeFields(); err != nil {
+		return err
+	}
+	// Rebuild content summary from freshly deserialized Parsed fields so it
+	// reflects the correct data from object storage, not a potentially
+	// corrupted DB value (e.g. from client/server encoding mismatch).
+	l.ContentSummary = l.BuildContentSummary()
+	return nil
 }
 
 // ExtractPayloadFiltered is like ExtractPayload but omits fields present in
@@ -319,6 +471,180 @@ func MarshalPayload(payload map[string]string) ([]byte, error) {
 	return sonic.Marshal(payload)
 }
 
+type a2aPayloadV1 struct {
+	RawRequest    *string `json:"raw_request,omitempty"`
+	RawResponse   *string `json:"raw_response,omitempty"`
+	SchemaVersion int     `json:"schema_version"`
+	RequestBody   *string `json:"request_body,omitempty"`
+	ResponseBody  *string `json:"response_body,omitempty"`
+	EventBody     *string `json:"event_body,omitempty"`
+}
+
+func MarshalAgentLogPayload(l *AgentLog) ([]byte, error) {
+	return sonic.Marshal(a2aPayloadV1{
+		SchemaVersion: a2aObjectSchemaVersion,
+		RawRequest:    l.RawRequest, RawResponse: l.RawResponse,
+		RequestBody:  l.RequestBody,
+		ResponseBody: l.ResponseBody,
+		EventBody:    l.EventBody,
+	})
+}
+
+func MergeAgentLogPayloadFromJSON(l *AgentLog, data []byte) error {
+	var payload a2aPayloadV1
+	if err := sonic.Unmarshal(data, &payload); err != nil {
+		return fmt.Errorf("logstore: unmarshal A2A log payload: %w", err)
+	}
+	if payload.SchemaVersion != a2aObjectSchemaVersion {
+		return fmt.Errorf("logstore: unsupported A2A object schema version %d", payload.SchemaVersion)
+	}
+	l.RawRequest, l.RawResponse = payload.RawRequest, payload.RawResponse
+	l.RequestBody = payload.RequestBody
+	l.ResponseBody = payload.ResponseBody
+	l.EventBody = payload.EventBody
+	return nil
+}
+
+func PrepareAgentLogDBEntry(l *AgentLog, objectKey string) {
+	l.RawRequest, l.RawResponse = nil, nil
+	if l.ContentHidden {
+		l.RequestBody = nil
+		l.ResponseBody = nil
+		l.EventBody = nil
+	} else {
+		l.RequestBody = truncateStringPointer(l.RequestBody, maxA2APayloadPreviewRunes)
+		l.ResponseBody = truncateStringPointer(l.ResponseBody, maxA2APayloadPreviewRunes)
+		l.EventBody = truncateStringPointer(l.EventBody, maxA2APayloadPreviewRunes)
+	}
+	l.PayloadReference = &objectKey
+}
+
+func truncateStringPointer(value *string, maxRunes int) *string {
+	if value == nil {
+		return nil
+	}
+	preview := truncateRunes(*value, maxRunes)
+	return &preview
+}
+
+func AgentLogHasPayload(l *AgentLog) bool {
+	return l != nil && (l.RequestBody != nil || l.ResponseBody != nil || l.EventBody != nil || l.RawRequest != nil || l.RawResponse != nil)
+}
+
+type relayPayloadV1 struct {
+	SchemaVersion int     `json:"schema_version"`
+	RequestBody   *string `json:"request_body,omitempty"`
+	ResponseBody  *string `json:"response_body,omitempty"`
+	// Set only for a hidden row: content with no body column, kept in the object alone.
+	Path         *string               `json:"path,omitempty"`
+	ErrorDetails *schemas.BifrostError `json:"error_details,omitempty"`
+}
+
+// relayMergePayloadV1 is what a relay reconcile queues: the bodies it carries, each with a flag
+// saying whether it was carried at all (a nil body with its flag set clears the stored one).
+type relayMergePayloadV1 struct {
+	SchemaVersion   int     `json:"schema_version"`
+	RequestBody     *string `json:"request_body,omitempty"`
+	SetRequestBody  bool    `json:"set_request_body,omitempty"`
+	ResponseBody    *string `json:"response_body,omitempty"`
+	SetResponseBody bool    `json:"set_response_body,omitempty"`
+	// Hidden content with no body column (see relayPayloadV1), replacing the stored copy when set.
+	Path         *string               `json:"path,omitempty"`
+	ErrorDetails *schemas.BifrostError `json:"error_details,omitempty"`
+}
+
+// Reserved keys of a relay row update (UpdateRelayLog) carrying hidden content that has no body
+// column: the full path with its query, and the error with its raw payloads. The hybrid store moves
+// them into the row's object; every store strips them before writing the row.
+const (
+	RelayRetainedPathUpdate         = "__retained_path"
+	RelayRetainedErrorDetailsUpdate = "__retained_error_details"
+)
+
+// takeRelayRetainedUpdates splits the reserved hidden-content keys off a relay row update. The
+// update map is returned as is when it holds neither, so the common reconcile copies nothing.
+func takeRelayRetainedUpdates(updates map[string]any) (*string, *schemas.BifrostError, map[string]any) {
+	pathValue, hasPath := updates[RelayRetainedPathUpdate]
+	errValue, hasErr := updates[RelayRetainedErrorDetailsUpdate]
+	if !hasPath && !hasErr {
+		return nil, nil, updates
+	}
+	rest := make(map[string]any, len(updates))
+	for k, v := range updates {
+		if k != RelayRetainedPathUpdate && k != RelayRetainedErrorDetailsUpdate {
+			rest[k] = v
+		}
+	}
+	path, _ := pathValue.(*string)
+	errDetails, _ := errValue.(*schemas.BifrostError)
+	return path, errDetails, rest
+}
+
+// MarshalRelayLogPayload serializes a Relay Logs row's full bodies for object storage.
+func MarshalRelayLogPayload(l *RelayLog) ([]byte, error) {
+	return sonic.Marshal(relayPayloadV1{
+		SchemaVersion: relayObjectSchemaVersion,
+		RequestBody:   l.RequestBody,
+		ResponseBody:  l.ResponseBody,
+		Path:          l.RetainedPath,
+		ErrorDetails:  relayObjectErrorDetails(l),
+	})
+}
+
+// relayObjectErrorDetails is the error a hidden row keeps in its object, since its database row
+// keeps none (PrepareRelayLogDBEntry), as an LLM row offloads error_details: the full error retained
+// with its raw payloads, else the sanitized one.
+func relayObjectErrorDetails(l *RelayLog) *schemas.BifrostError {
+	if l.RetainedErrorDetails != nil {
+		return l.RetainedErrorDetails
+	}
+	if l.ContentHidden {
+		return l.ErrorDetailsParsed
+	}
+	return nil
+}
+
+// MergeRelayLogPayloadFromJSON restores the full bodies read back from object storage.
+func MergeRelayLogPayloadFromJSON(l *RelayLog, data []byte) error {
+	var payload relayPayloadV1
+	if err := sonic.Unmarshal(data, &payload); err != nil {
+		return fmt.Errorf("logstore: unmarshal relay log payload: %w", err)
+	}
+	if payload.SchemaVersion != relayObjectSchemaVersion {
+		return fmt.Errorf("logstore: unsupported relay object schema version %d", payload.SchemaVersion)
+	}
+	l.RequestBody = payload.RequestBody
+	l.ResponseBody = payload.ResponseBody
+	// Kept so a reconcile merged over the object does not drop them; reads never surface them.
+	l.RetainedPath = payload.Path
+	l.RetainedErrorDetails = payload.ErrorDetails
+	return nil
+}
+
+// PrepareRelayLogDBEntry turns a Relay Logs row into its database form in hybrid mode: the
+// bodies shrink to a preview (or nothing, when content is hidden) and the row points at the
+// object holding them in full.
+func PrepareRelayLogDBEntry(l *RelayLog, objectKey string) {
+	if l.ContentHidden {
+		// A hidden row carries no content in the database, as an LLM row's ClearPayload leaves none:
+		// the error goes to the object with the bodies (relayObjectErrorDetails).
+		l.RequestBody = nil
+		l.ResponseBody = nil
+		l.ErrorDetails = ""
+		l.ErrorDetailsParsed = nil
+	} else {
+		l.RequestBody = truncateStringPointer(l.RequestBody, maxRelayBodyPreviewRunes)
+		l.ResponseBody = truncateStringPointer(l.ResponseBody, maxRelayBodyPreviewRunes)
+	}
+	l.PayloadReference = &objectKey
+}
+
+// RelayLogHasPayload reports whether a Relay Logs row carries content to offload: a body, or
+// hidden content retained without a body column (the query string, a raw error).
+func RelayLogHasPayload(l *RelayLog) bool {
+	return l != nil && (l.RequestBody != nil || l.ResponseBody != nil || l.RetainedPath != nil || l.RetainedErrorDetails != nil || (l.ContentHidden && l.ErrorDetailsParsed != nil))
+}
+
 // MarshalMCPToolLogPayload serializes a full MCP tool log for object storage.
 // The object-store copy is intentionally complete; the DB row is only a
 // lightweight index plus a short input preview.
@@ -336,6 +662,7 @@ func MarshalMCPToolLogPayload(l *MCPToolLog) ([]byte, error) {
 func MergeMCPToolLogPayloadFromJSON(l *MCPToolLog, data []byte) error {
 	hasObject := l.HasObject
 	virtualKey := l.VirtualKey
+	redactionMapping := l.RedactionMapping
 
 	var payload MCPToolLog
 	if err := sonic.Unmarshal(data, &payload); err != nil {
@@ -347,6 +674,7 @@ func MergeMCPToolLogPayloadFromJSON(l *MCPToolLog, data []byte) error {
 	*l = payload
 	l.HasObject = hasObject
 	l.VirtualKey = virtualKey
+	l.RedactionMapping = redactionMapping
 	return nil
 }
 
@@ -399,6 +727,14 @@ func (l *Log) BuildInputContentSummary() string {
 		}
 	}
 
+	// Agent loops: no user text, so show the latest tool result or tool call.
+	if text := lastChatToolSummary(l.InputHistoryParsed); text != "" {
+		return text
+	}
+	if text := lastResponsesToolSummary(l.ResponsesInputHistoryParsed); text != "" {
+		return text
+	}
+
 	// Speech input
 	if l.SpeechInputParsed != nil && l.SpeechInputParsed.Input != "" {
 		return l.SpeechInputParsed.Input
@@ -419,7 +755,117 @@ func (l *Log) BuildInputContentSummary() string {
 		return l.VideoGenerationInputParsed.Prompt
 	}
 
+	// Video edit input prompt
+	if l.VideoEditInputParsed != nil && l.VideoEditInputParsed.Prompt != "" {
+		return l.VideoEditInputParsed.Prompt
+	}
+
 	return ""
+}
+
+// formatToolCall renders a tool call as "name(args)", or just "name" when the
+// arguments are empty.
+func formatToolCall(b *strings.Builder, name, args string) {
+	if name == "" {
+		return
+	}
+	if b.Len() > 0 {
+		b.WriteByte('\n')
+	}
+	b.WriteString(name)
+	if args = strings.TrimSpace(args); args != "" {
+		b.WriteByte('(')
+		b.WriteString(args)
+		b.WriteByte(')')
+	}
+}
+
+// lastChatToolSummary returns the text of the last tool result, or the
+// "name(args)" calls of the last assistant message that carries tool calls,
+// whichever comes later in the history.
+func lastChatToolSummary(msgs []schemas.ChatMessage) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		msg := &msgs[i]
+		if msg.Role == schemas.ChatMessageRoleTool {
+			if text := extractChatMessageText(msg); text != "" {
+				return text
+			}
+			continue
+		}
+		if msg.Role != schemas.ChatMessageRoleAssistant || msg.ChatAssistantMessage == nil || len(msg.ToolCalls) == 0 {
+			continue
+		}
+		var b strings.Builder
+		for _, tc := range msg.ToolCalls {
+			if tc.Custom != nil && tc.Custom.Name != nil {
+				formatToolCall(&b, *tc.Custom.Name, tc.Custom.Input)
+			} else if tc.Function.Name != nil {
+				formatToolCall(&b, *tc.Function.Name, tc.Function.Arguments)
+			}
+		}
+		if b.Len() > 0 {
+			return b.String()
+		}
+	}
+	return ""
+}
+
+// lastResponsesToolSummary mirrors lastChatToolSummary for Responses API
+// function_call and function_call_output items.
+func lastResponsesToolSummary(msgs []schemas.ResponsesMessage) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		msg := &msgs[i]
+		if msg.Type == nil || msg.ResponsesToolMessage == nil {
+			continue
+		}
+		switch *msg.Type {
+		case schemas.ResponsesMessageTypeFunctionCallOutput, schemas.ResponsesMessageTypeCustomToolCallOutput:
+			if text := extractResponsesToolOutputText(msg.Output); text != "" {
+				return text
+			}
+		case schemas.ResponsesMessageTypeCustomToolCall:
+			if msg.Name == nil || msg.ResponsesCustomToolCall == nil {
+				continue
+			}
+			var b strings.Builder
+			formatToolCall(&b, *msg.Name, msg.ResponsesCustomToolCall.Input)
+			if b.Len() > 0 {
+				return b.String()
+			}
+		case schemas.ResponsesMessageTypeFunctionCall:
+			if msg.Name == nil {
+				continue
+			}
+			args := ""
+			if msg.Arguments != nil {
+				args = *msg.Arguments
+			}
+			var b strings.Builder
+			formatToolCall(&b, *msg.Name, args)
+			if b.Len() > 0 {
+				return b.String()
+			}
+		}
+	}
+	return ""
+}
+
+// extractResponsesToolOutputText returns a function_call_output's string
+// output, or the last text block when the output is block-shaped.
+func extractResponsesToolOutputText(output *schemas.ResponsesToolMessageOutputStruct) string {
+	if output == nil {
+		return ""
+	}
+	if output.ResponsesToolCallOutputStr != nil && *output.ResponsesToolCallOutputStr != "" {
+		return *output.ResponsesToolCallOutputStr
+	}
+	var lastText string
+	for _, block := range output.ResponsesFunctionToolCallOutputBlocks {
+		if block.Text != nil && *block.Text != "" {
+			lastText = *block.Text
+		}
+	}
+	return lastText
 }
 
 // extractChatMessageText returns the text content from a ChatMessage.
@@ -464,12 +910,106 @@ func extractResponsesMessageText(msg *schemas.ResponsesMessage) string {
 	return ""
 }
 
+// attachmentStrippedPlaceholder replaces attachment payloads (base64 data,
+// image/file URLs, audio data) in the last-user-message preview kept in the
+// DB row. The untouched original always lives in object storage.
+const attachmentStrippedPlaceholder = "[attachment stripped]"
+
+// stripChatMessageAttachments returns a copy of msg with attachment payloads
+// replaced by attachmentStrippedPlaceholder so the DB preview stays
+// lightweight. Copy-on-write: msg, its blocks slice, and nested structs are
+// shared with the caller's entry and are never mutated.
+func stripChatMessageAttachments(msg *schemas.ChatMessage) schemas.ChatMessage {
+	out := *msg
+	if msg.Content == nil || len(msg.Content.ContentBlocks) == 0 {
+		return out
+	}
+	blocks := make([]schemas.ChatContentBlock, len(msg.Content.ContentBlocks))
+	copy(blocks, msg.Content.ContentBlocks)
+	for i := range blocks {
+		if img := blocks[i].ImageURLStruct; img != nil && img.URL != "" {
+			imgCopy := *img
+			imgCopy.URL = attachmentStrippedPlaceholder
+			blocks[i].ImageURLStruct = &imgCopy
+		}
+		if audio := blocks[i].InputAudio; audio != nil && audio.Data != "" {
+			audioCopy := *audio
+			audioCopy.Data = attachmentStrippedPlaceholder
+			blocks[i].InputAudio = &audioCopy
+		}
+		if file := blocks[i].File; file != nil && (file.FileData != nil || file.FileURL != nil) {
+			fileCopy := *file
+			if fileCopy.FileData != nil {
+				fileCopy.FileData = schemas.Ptr(attachmentStrippedPlaceholder)
+			}
+			if fileCopy.FileURL != nil {
+				fileCopy.FileURL = schemas.Ptr(attachmentStrippedPlaceholder)
+			}
+			blocks[i].File = &fileCopy
+		}
+	}
+	content := *msg.Content
+	content.ContentBlocks = blocks
+	out.Content = &content
+	return out
+}
+
+// stripResponsesMessageAttachments mirrors stripChatMessageAttachments for
+// the Responses API message shape. Copy-on-write for the same reason.
+func stripResponsesMessageAttachments(msg *schemas.ResponsesMessage) schemas.ResponsesMessage {
+	out := *msg
+	if msg.Content == nil || len(msg.Content.ContentBlocks) == 0 {
+		return out
+	}
+	blocks := make([]schemas.ResponsesMessageContentBlock, len(msg.Content.ContentBlocks))
+	copy(blocks, msg.Content.ContentBlocks)
+	for i := range blocks {
+		if img := blocks[i].ResponsesInputMessageContentBlockImage; img != nil && img.ImageURL != nil && *img.ImageURL != "" {
+			imgCopy := *img
+			imgCopy.ImageURL = schemas.Ptr(attachmentStrippedPlaceholder)
+			blocks[i].ResponsesInputMessageContentBlockImage = &imgCopy
+		}
+		if file := blocks[i].ResponsesInputMessageContentBlockFile; file != nil && (file.FileData != nil || file.FileURL != nil) {
+			fileCopy := *file
+			if fileCopy.FileData != nil {
+				fileCopy.FileData = schemas.Ptr(attachmentStrippedPlaceholder)
+			}
+			if fileCopy.FileURL != nil {
+				fileCopy.FileURL = schemas.Ptr(attachmentStrippedPlaceholder)
+			}
+			blocks[i].ResponsesInputMessageContentBlockFile = &fileCopy
+		}
+		if audio := blocks[i].Audio; audio != nil && audio.Data != "" {
+			audioCopy := *audio
+			audioCopy.Data = attachmentStrippedPlaceholder
+			blocks[i].Audio = &audioCopy
+		}
+	}
+	content := *msg.Content
+	content.ContentBlocks = blocks
+	out.Content = &content
+	return out
+}
+
 // findLastUserMessageIndex returns the index of the last ChatMessage with
 // role "user", or -1 if none exists. Used by both BuildInputContentSummary
 // and prepareDBEntry to avoid scanning the slice twice.
 func findLastUserMessageIndex(msgs []schemas.ChatMessage) int {
 	for i := len(msgs) - 1; i >= 0; i-- {
 		if msgs[i].Role == schemas.ChatMessageRoleUser {
+			return i
+		}
+	}
+	return -1
+}
+
+// findLastUserResponsesMessageIndex returns the index of the last
+// ResponsesMessage with role "user", or -1 if none exists. Mirrors
+// findLastUserMessageIndex for the Responses API input history so prepareDBEntry
+// can preserve a last-user-message preview when payloads are offloaded.
+func findLastUserResponsesMessageIndex(msgs []schemas.ResponsesMessage) int {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role != nil && *msgs[i].Role == schemas.ResponsesInputMessageRoleUser {
 			return i
 		}
 	}
@@ -539,24 +1079,88 @@ func BuildMCPToolTags(l *MCPToolLog) map[string]string {
 	return tags
 }
 
-// ObjectKey constructs the S3 object key for a log entry.
-func ObjectKey(prefix string, timestamp time.Time, logID string) string {
+func BuildAgentLogTags(l *AgentLog) map[string]string {
+	tags := make(map[string]string, 7)
+	if l.AgentName != "" {
+		tags["agent_name"] = truncateTag(l.AgentName, 256)
+	}
+	if l.Operation != "" {
+		tags["operation"] = truncateTag(l.Operation, 256)
+	}
+	if l.RecordKind != "" {
+		tags["record_kind"] = truncateTag(l.RecordKind, 256)
+	}
+	if l.Status != "" {
+		tags["status"] = truncateTag(l.Status, 256)
+	}
+	if l.VirtualKeyID != nil && *l.VirtualKeyID != "" {
+		tags["virtual_key_id"] = truncateTag(*l.VirtualKeyID, 256)
+	}
+	tags["has_error"] = "false"
+	if l.Status == "error" {
+		tags["has_error"] = "true"
+	}
+	tags["date"] = l.Timestamp.UTC().Format("2006-01-02")
+	return tags
+}
+
+func BuildRelayLogTags(l *RelayLog) map[string]string {
+	tags := make(map[string]string, 6)
+	if l.RelayName != "" {
+		tags["relay_name"] = truncateTag(l.RelayName, 256)
+	}
+	if l.Kind != "" {
+		tags["kind"] = truncateTag(l.Kind, 256)
+	}
+	if l.Status != "" {
+		tags["status"] = truncateTag(l.Status, 256)
+	}
+	if l.VirtualKeyID != nil && *l.VirtualKeyID != "" {
+		tags["virtual_key_id"] = truncateTag(*l.VirtualKeyID, 256)
+	}
+	tags["has_error"] = "false"
+	if l.Status == "error" {
+		tags["has_error"] = "true"
+	}
+	tags["date"] = l.Timestamp.UTC().Format("2006-01-02")
+	return tags
+}
+
+// Object key suffixes. The suffix records how the object is encoded, so a
+// bucket can hold objects written before and after a format change.
+const (
+	jsonObjectExt    = ".json.gz"
+	parquetObjectExt = ".parquet"
+)
+
+// objectKey builds {prefix}/{dir}/YYYY/MM/DD/HH/{id}{ext}.
+func objectKey(prefix, dir string, timestamp time.Time, logID, ext string) string {
 	ts := timestamp.UTC()
-	return fmt.Sprintf("%s/logs/%04d/%02d/%02d/%02d/%s.json.gz",
-		prefix,
+	return fmt.Sprintf("%s/%s/%04d/%02d/%02d/%02d/%s%s",
+		prefix, dir,
 		ts.Year(), ts.Month(), ts.Day(), ts.Hour(),
-		logID,
+		logID, ext,
 	)
 }
 
-// MCPToolObjectKey constructs the S3 object key for an MCP tool log entry.
+// ObjectKey constructs the S3 object key for a JSON log entry.
+func ObjectKey(prefix string, timestamp time.Time, logID string) string {
+	return objectKey(prefix, "logs", timestamp, logID, jsonObjectExt)
+}
+
+// MCPToolObjectKey constructs the S3 object key for a JSON MCP tool log entry.
 func MCPToolObjectKey(prefix string, timestamp time.Time, logID string) string {
-	ts := timestamp.UTC()
-	return fmt.Sprintf("%s/mcp-logs/%04d/%02d/%02d/%02d/%s.json.gz",
-		prefix,
-		ts.Year(), ts.Month(), ts.Day(), ts.Hour(),
-		logID,
-	)
+	return objectKey(prefix, "mcp-logs", timestamp, logID, jsonObjectExt)
+}
+
+// RelayLogObjectKey constructs the S3 object key for a JSON Relay Logs entry.
+func RelayLogObjectKey(prefix string, timestamp time.Time, logID string) string {
+	return objectKey(prefix, "relay-logs", timestamp, logID, jsonObjectExt)
+}
+
+// AgentLogObjectKey constructs the S3 object key for a JSON A2A log entry.
+func AgentLogObjectKey(prefix string, timestamp time.Time, logID string) string {
+	return objectKey(prefix, "agent-logs", timestamp, logID, jsonObjectExt)
 }
 
 // PayloadFieldNames returns the list of DB column names that are payload fields.
@@ -589,10 +1193,12 @@ func fieldsNeedHydration(fields []string) bool {
 	return false
 }
 
-// ensureHydrationFields appends id, timestamp, and has_object to the
-// projection if not already present, so hydrateLog can function correctly.
+// ensureHydrationFields appends id, timestamp, has_object, and content_hidden
+// to the projection if not already present, so hydrateLog can function
+// correctly. content_hidden must always be selected: a projection that omits
+// it would zero-value the flag and hydrate a hidden log.
 func ensureHydrationFields(fields []string) []string {
-	required := [3]string{"id", "timestamp", "has_object"}
+	required := [4]string{"id", "timestamp", "has_object", "content_hidden"}
 	have := make(map[string]struct{}, len(fields))
 	for _, f := range fields {
 		have[f] = struct{}{}
@@ -640,6 +1246,9 @@ func clearPayloadField(l *Log, name string) {
 	case "responses_output":
 		l.ResponsesOutput = ""
 		l.ResponsesOutputParsed = nil
+	case "embedding_input":
+		l.EmbeddingInput = ""
+		l.EmbeddingInputParsed = nil
 	case "embedding_output":
 		l.EmbeddingOutput = ""
 		l.EmbeddingOutputParsed = nil
@@ -679,6 +1288,9 @@ func clearPayloadField(l *Log, name string) {
 	case "video_generation_input":
 		l.VideoGenerationInput = ""
 		l.VideoGenerationInputParsed = nil
+	case "video_edit_input":
+		l.VideoEditInput = ""
+		l.VideoEditInputParsed = nil
 	case "speech_output":
 		l.SpeechOutput = ""
 		l.SpeechOutputParsed = nil
@@ -706,9 +1318,18 @@ func clearPayloadField(l *Log, name string) {
 	case "video_delete_output":
 		l.VideoDeleteOutput = ""
 		l.VideoDeleteOutputParsed = nil
+	case "live_session":
+		l.LiveSession = ""
+		l.LiveSessionParsed = nil
 	case "cache_debug":
 		l.CacheDebug = ""
 		l.CacheDebugParsed = nil
+	case "guardrail_debug":
+		l.GuardrailDebug = ""
+		l.GuardrailDebugParsed = nil
+	case "routing_metadata":
+		l.RoutingMetadata = ""
+		l.RoutingMetadataParsed = nil
 	case "token_usage":
 		l.TokenUsage = ""
 		l.TokenUsageParsed = nil
@@ -725,6 +1346,8 @@ func clearPayloadField(l *Log, name string) {
 		l.PassthroughResponseBody = ""
 	case "routing_engine_logs":
 		l.RoutingEngineLogs = ""
+	case "plugin_logs":
+		l.PluginLogs = ""
 	}
 }
 

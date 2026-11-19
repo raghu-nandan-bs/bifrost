@@ -14,8 +14,10 @@ OpenAI is the **baseline schema** for Bifrost. When using OpenAI directly, param
 |-----------|---------------|-----------|----------|
 | Chat Completions | ✅ | ✅ | `/v1/chat/completions` |
 | Responses API | ✅ | ✅ | `/v1/responses` |
+| Responses Lifecycle | ✅ | ✅ | `/v1/responses/{response_id}` |
 | Text Completions | ✅ | ✅ | `/v1/completions` |
 | Embeddings | ✅ | - | `/v1/embeddings` |
+| Decisions | ✅ | - | `/v1/decisions` |
 | Speech (TTS) | ✅ | ✅ | `/v1/audio/speech` |
 | Transcriptions (STT) | ✅ | ✅ | `/v1/audio/transcriptions` |
 | Image Generation | ✅ | ✅ | `/v1/images/generations` |
@@ -24,6 +26,7 @@ OpenAI is the **baseline schema** for Bifrost. When using OpenAI directly, param
 | Files | ✅ | - | `/v1/files` |
 | Batch | ✅ | - | `/v1/batches` |
 | Video Generation | ✅ | - | `/v1/videos` |
+| Context Compaction | ✅ | - | `/v1/responses/compact` |
 | List Models | ✅ | - | `/v1/models` |
 
 ## Setup & Configuration
@@ -69,28 +72,7 @@ Configure OpenAI as a provider.
 
 </Tab>
 <Tab title="API">
-
-```bash
-curl --location 'http://localhost:8080/api/providers' \
---header 'Content-Type: application/json' \
---data '{
-  "provider": "openai",
-  "keys": [
-    {
-      "name": "openai-key-1",
-      "value": "env.OPENAI_API_KEY",
-      "models": [
-        "*"
-      ],
-      "weight": 1.0
-    }
-  ],
-  "openai_config": {
-    "disable_store": false
-  }
-}'
-```
-
+Refer to the API documentation for [Provider Keys Management](https://docs.getbifrost.ai/api-reference/providers/create-a-key-for-a-provider).
 </Tab>
 <Tab title="Go SDK">
 
@@ -98,7 +80,7 @@ curl --location 'http://localhost:8080/api/providers' \
 case schemas.OpenAI:
     return []schemas.Key{{
         Name:   "openai-key-1",
-        Value:  *schemas.NewEnvVar("env.OPENAI_API_KEY"),
+        Value:  *schemas.NewSecretVar("env.OPENAI_API_KEY"),
         Models: []string{"*"},
         Weight: 1.0,
     }}, nil
@@ -151,7 +133,7 @@ Optional provider settings include `network_config` for timeouts, retries, proxy
 - **Tools:** Standard OpenAI tool format with strict mode support. Tool choice: `"auto"`, `"none"`, `"required"`, or specific tool by name.
 - **Responses:** Passed through in standard OpenAI format. Finish reasons: `stop`, `length`, `tool_calls`, `content_filter`. Usage includes token counts and optionally cached/reasoning token details.
 - **Streaming:** Server-Sent Events format with `delta.content`, `delta.tool_calls`, `finish_reason`, and `usage` (final chunk only, automatically included by Bifrost). `stream_options: { include_usage: true }` is set by default for all streaming calls.
-- **Cache Control:** `cache_control` fields are stripped from messages, their content blocks, and tools before sending.
+- **Cache Control:** `cache_control` fields are stripped from messages, their content blocks, and tools before sending. The exception is the **gpt-5.6 family**, where a marked block is translated into OpenAI's own `prompt_cache_breakpoint`. Bifrost does not set `prompt_cache_options`: the default implicit mode honours explicit breakpoints and also looks back over up to 20 earlier message endings, which is what lets an agent loop with a marker that moves every turn (such as Claude Code) read the previous turn back from cache. Explicit-only mode checks only the breakpoints in the current request, so send `prompt_cache_options.mode: "explicit"` yourself only if your breakpoints stay at fixed positions. In implicit mode Bifrost keeps at most three translated breakpoints, since the implicit breakpoint takes one of the four cache-write slots. Earlier models have no such field, so stripping remains correct for them. Bifrost can also add the marker for clients that send none - see [Prompt caching](/features/prompt-caching).
 - **Token Enforcement:** `max_completion_tokens` is enforced to have a minimum of 16. Values below 16 are automatically set to 16.
 - **Special handling:** `user` field is truncated to 64 characters; `prompt_cache_key`, `store`, `service_tier` are filtered when routing to non-OpenAI providers
 
@@ -208,11 +190,77 @@ This conversion ensures compatibility across different model architectures for t
 **Other conversions:**
 - Action types `zoom` and `region` are converted to `screenshot`
 - `cache_control` fields are stripped from messages and tools
-- Unsupported tool types are silently filtered (only these are supported: `function`, `file_search`, `computer_use_preview`, `web_search`, `mcp`, `code_interpreter`, `image_generation`, `local_shell`, `custom`, `web_search_preview`)
+- Unsupported tool types are silently filtered (only these are supported: `function`, `file_search`, `computer_use_preview`, `web_search`, `mcp`, `code_interpreter`, `image_generation`, `local_shell`, `shell`, `programmatic_tool_calling`, `apply_patch`, `custom`, `web_search_preview`, `tool_search`, `namespace`)
 
 **Response:** Includes `id`, `status` (`completed`, `incomplete`, `pending`, `error`), `output` array with message content, and token `usage`.
 
-**Streaming:** Server-Sent Events with types: `response.created`, `response.in_progress`, `response.output_item.added`, `response.content_part.added`, `response.output_text.delta`, `response.function_call_arguments.delta`, `response.completed`, `response.incomplete`. `stream_options: { include_usage: true }` is set by default for all streaming calls.
+**Streaming:** Server-Sent Events. `stream_options: { include_usage: true }` is set by default for all streaming calls. Each event carries a `type` field ([`ResponsesStreamResponseType`](https://github.com/maximhq/bifrost/blob/main/core/schemas/responses.go#L3039)) with one of the following values:
+
+| Category | Event Types |
+|----------|-------------|
+| Response lifecycle | `response.created`, `response.queued`, `response.in_progress`, `response.completed`, `response.failed`, `response.incomplete` |
+| Output items & content | `response.output_item.added`, `response.output_item.done`, `response.content_part.added`, `response.content_part.done`, `response.output_text.delta`, `response.output_text.done` |
+| Refusals & annotations | `response.refusal.delta`, `response.refusal.done`, `response.output_text.annotation.added`, `response.output_text.annotation.done` |
+| Function & custom tool calls | `response.function_call_arguments.delta`, `response.function_call_arguments.done`, `response.custom_tool_call_input.delta`, `response.custom_tool_call_input.done` |
+| File search | `response.file_search_call.in_progress`, `response.file_search_call.searching`, `response.file_search_call.results.added`, `response.file_search_call.results.completed` |
+| Web search | `response.web_search_call.in_progress`, `response.web_search_call.searching`, `response.web_search_call.completed`, `response.web_search_call.results.added`, `response.web_search_call.results.completed` |
+| Web fetch | `response.web_fetch_call.in_progress`, `response.web_fetch_call.fetching`, `response.web_fetch_call.completed` |
+| Reasoning summaries | `response.reasoning_summary_part.added`, `response.reasoning_summary_part.done`, `response.reasoning_summary_text.delta`, `response.reasoning_summary_text.done` |
+| Image generation | `response.image_generation_call.in_progress`, `response.image_generation_call.generating`, `response.image_generation_call.partial_image`, `response.image_generation_call.completed` |
+| MCP | `response.mcp_call_arguments.delta`, `response.mcp_call_arguments.done`, `response.mcp_call.in_progress`, `response.mcp_call.completed`, `response.mcp_call.failed`, `response.mcp_list_tools.in_progress`, `response.mcp_list_tools.completed`, `response.mcp_list_tools.failed` |
+| Code interpreter | `response.code_interpreter_call.in_progress`, `response.code_interpreter_call.interpreting`, `response.code_interpreter_call.completed`, `response.code_interpreter_call_code.delta`, `response.code_interpreter_call_code.done` |
+| Shell | `response.shell_call_command.added`, `response.shell_call_command.delta`, `response.shell_call_command.done`, `response.shell_call_output_content.delta`, `response.shell_call_output_content.done` |
+| Keepalive & errors | `response.ping` (sent by few providers, e.g. Anthropic), `error` |
+
+## Response Lifecycle
+
+Manage stored and background responses after creation (requests made with `store: true` or `background: true`). All lifecycle operations accept an optional `provider` query parameter (defaults to `openai`); providers that do not implement these operations return an unsupported operation error.
+
+<Note>
+When multiple API keys are configured for the provider, pin key selection on lifecycle calls (for example, with the `x-bf-api-key-id` header, see [Request Options](/providers/request-options)) so they hit the same upstream account as the create call that produced the `response_id`.
+</Note>
+
+### Retrieve Response
+
+GET `/v1/responses/{response_id}` - Retrieve a stored response ([docs](https://platform.openai.com/docs/api-reference/responses/get))
+
+**Query Parameters**
+
+| Parameter | Type | Required | Notes |
+|-----------|------|----------|-------|
+| `include` | array | ❌ | Additional fields to include (repeat the parameter for multiple values) |
+| `starting_after` | int | ❌ | Sequence number of the event after which to start the response |
+| `include_obfuscation` | bool | ❌ | Whether to include obfuscation on the response |
+| `stream` | bool | ❌ | When `true`, replays the stored response as SSE events |
+
+**Response:** The full response object, same shape as `POST /v1/responses`. With `stream=true`, the same SSE event stream as `POST /v1/responses` with `stream: true`.
+
+### Delete Response
+
+DELETE `/v1/responses/{response_id}` - Delete a stored response ([docs](https://platform.openai.com/docs/api-reference/responses/delete))
+
+**Response:** [`BifrostResponsesDeleteResponse`](https://github.com/maximhq/bifrost/blob/main/core/schemas/responses.go#L126) with `id`, `object`, and `deleted: true`.
+
+### Cancel Response
+
+POST `/v1/responses/{response_id}/cancel` - Cancel an in-flight response ([docs](https://platform.openai.com/docs/api-reference/responses/cancel)). Only responses created with `background: true` can be cancelled.
+
+**Response:** The full response object, same shape as `POST /v1/responses`.
+
+### List Input Items
+
+GET `/v1/responses/{response_id}/input_items` - List the input items of a response ([docs](https://platform.openai.com/docs/api-reference/responses/input-items))
+
+**Query Parameters**
+
+| Parameter | Type | Required | Notes |
+|-----------|------|----------|-------|
+| `after` | string | ❌ | Pagination cursor (item ID to list items after) |
+| `include` | array | ❌ | Additional fields to include (repeat the parameter for multiple values) |
+| `limit` | int | ❌ | Results per page |
+| `order` | string | ❌ | asc or desc |
+
+**Response:** [`BifrostResponsesInputItemsResponse`](https://github.com/maximhq/bifrost/blob/main/core/schemas/responses.go#L134) with `object: "list"`, `data` (array of input items), `has_more`, `first_id`, `last_id`. Cursor-based pagination with `has_more` flag.
 
 ---
 
@@ -573,6 +621,68 @@ GET `/v1/models` - Lists available models with metadata. Model IDs in Bifrost re
 | Delete | `DELETE /v1/videos/{id}` | Removes video job |
 | List jobs | `GET /v1/videos` | Query params: `after`, `limit`, `order` |
 | Remix | `POST /v1/videos/{id}/remix` | Body: `{"prompt": "..."}` |
+
+---
+
+# 14. Context Compaction
+
+Compresses a conversation into an opaque encrypted item that can be reused in future Responses API calls, reducing token costs for long-running conversations.
+
+**Request Parameters**
+
+| Parameter | Type | Required | Notes |
+|-----------|------|----------|-------|
+| `model` | string | ✅ | Model identifier |
+| `input` | string/array | ✅* | Conversation to compact. Required unless `previous_response_id` is set. Accepts the same format as the Responses API `input` field, including prior compaction items (`type: "response.compaction"`). |
+| `previous_response_id` | string | ✅* | ID of a previously stored response to compact instead of sending full input. |
+| `instructions` | string | ❌ | System instructions preserved across the compacted context. |
+| `prompt_cache_key` | string | ❌ | Prompt caching key. |
+| `prompt_cache_retention` | string | ❌ | Cache retention duration. |
+| `service_tier` | string | ❌ | Service tier preference. |
+| `fallbacks` | array | ❌ | Bifrost fallback model list. |
+
+**Endpoint**: `POST /v1/responses/compact`
+
+---
+
+# 15. Decisions
+
+Decision models such as `gpt-6-luna` are served on OpenAI's native `POST /v1/decisions`. Send them a request on Bifrost's [`/v1/decisions`](/quickstart/gateway/decisions) like any other decision model:
+
+```bash
+curl http://localhost:8080/v1/decisions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "openai/gpt-6-luna",
+    "input": "Customer message: I was double charged and nobody replied.",
+    "questions": [
+      { "type": "predicate", "name": "is_frustrated", "instructions": "Is the customer frustrated?" },
+      { "type": "choice", "name": "category", "instructions": "Pick the ticket category",
+        "choices": [ { "value": "billing" }, { "value": "bug" }, { "value": "other" } ] }
+    ]
+  }'
+```
+
+A model is sent to the decisions endpoint when the model datasheet marks it `supports_decisions`, so a newly released decisions model needs only a datasheet entry. Without the datasheet, the `gpt-6-luna` family is recognized by name. With `convert_decision_to_responses` off (the default), any other OpenAI model returns `unsupported_operation` on decision requests. With it on, Bifrost answers them through the model's Responses API instead; see [Decision-to-Responses Emulation](/features/compat-plugin#4-decision-to-responses-emulation).
+
+OpenAI takes text where `/v1/decisions` also carries TypeSafe's structured values, so these are converted before the request is sent, the same way they are rendered for a chat model:
+
+| Request detail | Sent to OpenAI as |
+|----------------|-------------------|
+| Structured `input` (an object) | its JSON as text |
+| Structured `instructions` or choice and level `description` | its JSON as text |
+| A predicate's `criteria` | appended to the question's instructions |
+| A level without a `label` | labelled by its index (`"0"`, `"1"`, ...) |
+
+A request whose `input` is `null` is rejected with a `400` for the OpenAI attempt, since OpenAI requires one; a configured fallback can still serve it, and if every fallback fails too, the response carries the first attempt's error. A request with no `input` key at all is rejected before any provider is tried.
+
+Input items are sent unchanged: messages with their `input_text`, `input_image` (with its `detail`), `input_json`, `output_text`, and `refusal` parts, an assistant message's `phase`, and function calls, custom tool calls, and their outputs. OpenAI's decision models read images, unlike TypeSafe-based models. A part of any other type is rejected with a `400`, and a message's `id` and `status` are not sent.
+
+Instructions written as a list of `input_text`, `input_image`, and `input_json` parts are sent as parts; a predicate's `criteria` are added as a final text part. `prompt_cache_key`, `prompt_cache_options`, and `prompt_cache_breakpoint` on input parts are forwarded.
+
+OpenAI SDKs can call the same endpoint through Bifrost at `/openai/v1/decisions`, which takes OpenAI's request: a top-level `state`, and a field a question, choice, or level does not define (such as `criteria`), are rejected with a `400`, while other top-level fields a newer SDK sends are forwarded unchanged. See [OpenAI SDK](/integrations/openai-sdk/overview#decisions-api).
+
+**Endpoint**: `POST /v1/decisions`
 
 ---
 

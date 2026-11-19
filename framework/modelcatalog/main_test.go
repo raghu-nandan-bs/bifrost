@@ -1,209 +1,201 @@
 package modelcatalog
 
 import (
+	"context"
+	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
-	"github.com/maximhq/bifrost/core/schemas"
+	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/framework/configstore"
-	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
-	"github.com/stretchr/testify/assert"
+	"github.com/maximhq/bifrost/framework/configstore/tables"
+	"github.com/maximhq/bifrost/framework/modelcatalog/datasheet"
+	"github.com/stretchr/testify/require"
 )
 
-// newTestCatalog creates a minimal ModelCatalog for testing within the package.
-func newTestCatalog(modelPool map[schemas.ModelProvider][]string, baseModelIndex map[string]string) *ModelCatalog {
-	if modelPool == nil {
-		modelPool = make(map[schemas.ModelProvider][]string)
-	}
-	if baseModelIndex == nil {
-		baseModelIndex = make(map[string]string)
-	}
-	return &ModelCatalog{
-		modelPool:      modelPool,
-		baseModelIndex: baseModelIndex,
-		pricingData:    make(map[string]configstoreTables.TableModelPricing),
-	}
-}
+// newSyncTestCatalog builds a catalog whose pricing and model-parameters URLs
+// point at local files, with no config store. A lock manager without a store
+// grants every lock, so syncTick runs without a database.
+func newSyncTestCatalog(t *testing.T, gateOpen bool) (*ModelCatalog, *int) {
+	t.Helper()
+	dir := t.TempDir()
+	pricingPath := filepath.Join(dir, "pricing.json")
+	paramsPath := filepath.Join(dir, "params.json")
+	require.NoError(t, os.WriteFile(pricingPath, []byte(`{"gpt-4o":{"provider":"openai","mode":"chat","input_cost_per_token":0.0000025,"output_cost_per_token":0.00001}}`), 0o600))
+	require.NoError(t, os.WriteFile(paramsPath, []byte(`{"gpt-4o":{"supports_reasoning":false}}`), 0o600))
 
-// --- GetBaseModelName tests ---
-
-func TestGetBaseModelName_Simple(t *testing.T) {
-	mc := newTestCatalog(nil, nil)
-	// No catalog data, no prefix — returns as-is (no date suffix to strip either)
-	assert.Equal(t, "gpt-4o", mc.GetBaseModelName("gpt-4o"))
-}
-
-func TestGetBaseModelName_Prefixed(t *testing.T) {
-	mc := newTestCatalog(nil, nil)
-	// Provider prefix stripped, no catalog — algorithmic fallback returns base
-	assert.Equal(t, "gpt-4o", mc.GetBaseModelName("openai/gpt-4o"))
-}
-
-func TestGetBaseModelName_PrefixedAnthropic(t *testing.T) {
-	mc := newTestCatalog(nil, nil)
-	assert.Equal(t, "claude-3-5-sonnet", mc.GetBaseModelName("anthropic/claude-3-5-sonnet"))
-}
-
-func TestGetBaseModelName_FromCatalog(t *testing.T) {
-	// Model has a pre-computed base_model in the catalog
-	mc := newTestCatalog(nil, map[string]string{
-		"gpt-4o":            "gpt-4o",
-		"gpt-4o-2024-08-06": "gpt-4o",
+	logger := bifrost.NewNoOpLogger()
+	ds := datasheet.New(nil, logger, datasheet.Config{
+		URL:                "file://" + pricingPath,
+		ModelParametersURL: "file://" + paramsPath,
+		SyncInterval:       time.Hour,
 	})
-	assert.Equal(t, "gpt-4o", mc.GetBaseModelName("gpt-4o"))
-	assert.Equal(t, "gpt-4o", mc.GetBaseModelName("gpt-4o-2024-08-06"))
+	mc := NewTestCatalogWithDatasheet(ds)
+	mc.logger = logger
+	mc.distributedLockManager = configstore.NewDistributedLockManager(nil, logger)
+
+	hookCalls := 0
+	mc.SetShouldSyncGate(func(context.Context) bool { return gateOpen })
+	mc.SetAfterSyncHook(func(context.Context) { hookCalls++ })
+	return mc, &hookCalls
 }
 
-func TestGetBaseModelName_ProviderPrefixWithCatalog(t *testing.T) {
-	// Model has provider prefix — strip prefix, then find in catalog
-	mc := newTestCatalog(nil, map[string]string{
-		"gpt-4o": "gpt-4o",
-	})
-	assert.Equal(t, "gpt-4o", mc.GetBaseModelName("openai/gpt-4o"))
+type pausedModelParamsStore struct {
+	configstore.ConfigStore
+	paused  chan struct{}
+	release chan struct{}
+	once    sync.Once
 }
 
-func TestGetBaseModelName_FallbackAlgorithmic(t *testing.T) {
-	// Model NOT in catalog — falls back to schemas.BaseModelName (date stripping)
-	mc := newTestCatalog(nil, nil)
-	// Anthropic-style date suffix
-	assert.Equal(t, "claude-sonnet-4", mc.GetBaseModelName("claude-sonnet-4-20250514"))
-	// OpenAI-style date suffix
-	assert.Equal(t, "gpt-4o", mc.GetBaseModelName("gpt-4o-2024-08-06"))
+type observedLockStore struct {
+	configstore.ConfigStore
+	tried chan bool
+	once  sync.Once
 }
 
-func TestGetBaseModelName_FallbackAlgorithmicWithPrefix(t *testing.T) {
-	// Provider prefix + not in catalog — strip prefix, then algorithmic fallback
-	mc := newTestCatalog(nil, nil)
-	assert.Equal(t, "claude-sonnet-4", mc.GetBaseModelName("anthropic/claude-sonnet-4-20250514"))
+// TryAcquireLock records when the second gateway attempts to enter the shared critical section.
+func (s *observedLockStore) TryAcquireLock(ctx context.Context, lock *tables.TableDistributedLock) (bool, error) {
+	acquired, err := s.ConfigStore.TryAcquireLock(ctx, lock)
+	s.once.Do(func() { s.tried <- acquired })
+	return acquired, err
 }
 
-func TestGetBaseModelName_UnknownModel(t *testing.T) {
-	mc := newTestCatalog(nil, nil)
-	assert.Equal(t, "some-random-model", mc.GetBaseModelName("some-random-model"))
-}
-
-func TestGetBaseModelName_CatalogTakesPrecedence(t *testing.T) {
-	// If catalog says the base_model is X, use it even if algorithmic would give Y
-	mc := newTestCatalog(nil, map[string]string{
-		"my-custom-model-20250101": "my-custom-model-20250101", // catalog says keep the date
-	})
-	assert.Equal(t, "my-custom-model-20250101", mc.GetBaseModelName("my-custom-model-20250101"))
-}
-
-// --- IsSameModel tests ---
-
-func TestIsSameModel_DirectMatch(t *testing.T) {
-	mc := newTestCatalog(nil, nil)
-	assert.True(t, mc.IsSameModel("gpt-4o", "gpt-4o"))
-}
-
-func TestIsSameModel_ProviderPrefix(t *testing.T) {
-	mc := newTestCatalog(nil, nil)
-	assert.True(t, mc.IsSameModel("openai/gpt-4o", "gpt-4o"))
-	assert.True(t, mc.IsSameModel("gpt-4o", "openai/gpt-4o"))
-}
-
-func TestIsSameModel_BothPrefixed(t *testing.T) {
-	mc := newTestCatalog(nil, nil)
-	assert.True(t, mc.IsSameModel("openai/gpt-4o", "openai/gpt-4o"))
-}
-
-func TestIsSameModel_DifferentProvidersSameBase(t *testing.T) {
-	mc := newTestCatalog(nil, nil)
-	// Both have the same base model after stripping different provider prefixes
-	assert.True(t, mc.IsSameModel("openai/gpt-4o", "azure/gpt-4o"))
-}
-
-func TestIsSameModel_DifferentModels(t *testing.T) {
-	mc := newTestCatalog(nil, nil)
-	assert.False(t, mc.IsSameModel("gpt-4o", "claude-3-5-sonnet"))
-}
-
-func TestIsSameModel_DifferentModelsBothPrefixed(t *testing.T) {
-	mc := newTestCatalog(nil, nil)
-	assert.False(t, mc.IsSameModel("openai/gpt-4o", "anthropic/claude-3-5-sonnet"))
-}
-
-func TestIsSameModel_CatalogBacked(t *testing.T) {
-	// Two model strings that look different but the catalog says they have the same base_model
-	mc := newTestCatalog(nil, map[string]string{
-		"claude-3-5-sonnet":          "claude-3-5-sonnet",
-		"claude-3-5-sonnet-20241022": "claude-3-5-sonnet",
-	})
-	assert.True(t, mc.IsSameModel("claude-3-5-sonnet", "claude-3-5-sonnet-20241022"))
-	assert.True(t, mc.IsSameModel("claude-3-5-sonnet-20241022", "claude-3-5-sonnet"))
-}
-
-func TestIsSameModel_AlgorithmicFallback(t *testing.T) {
-	// Models not in catalog — use algorithmic date stripping
-	mc := newTestCatalog(nil, nil)
-	assert.True(t, mc.IsSameModel("custom-model-20250101", "custom-model"))
-}
-
-func TestIsSameModel_EmptyStrings(t *testing.T) {
-	mc := newTestCatalog(nil, nil)
-	assert.True(t, mc.IsSameModel("", ""))
-	assert.False(t, mc.IsSameModel("gpt-4o", ""))
-	assert.False(t, mc.IsSameModel("", "gpt-4o"))
-}
-
-func TestIsModelAllowedForProvider_PrefixedAllowedModelInCatalog(t *testing.T) {
-	mc := newTestCatalog(
-		map[schemas.ModelProvider][]string{
-			schemas.OpenRouter: {"openai/gpt-4o"},
-		},
-		nil,
-	)
-
-	providerConfig := configstore.ProviderConfig{}
-
-	assert.True(t, mc.IsModelAllowedForProvider(schemas.OpenRouter, "gpt-4o", &providerConfig, []string{"openai/gpt-4o"}))
-}
-
-func TestIsModelAllowedForProvider_CustomProviderListModelsDisabled(t *testing.T) {
-	mc := newTestCatalog(nil, nil)
-
-	// Custom provider with list-models disabled + ["*"] → should return true
-	providerConfig := configstore.ProviderConfig{
-		CustomProviderConfig: &schemas.CustomProviderConfig{
-			AllowedRequests: &schemas.AllowedRequests{
-				ListModels: false,
-			},
-		},
+// GetModelParameters pauses after taking a database snapshot to expose overlapping syncs.
+func (s *pausedModelParamsStore) GetModelParameters(ctx context.Context) ([]tables.TableModelParameters, error) {
+	rows, err := s.ConfigStore.GetModelParameters(ctx)
+	if err != nil {
+		return nil, err
 	}
-	assert.True(t, mc.IsModelAllowedForProvider("custom-provider", "any-model", &providerConfig, []string{"*"}))
-}
-
-func TestIsModelAllowedForProvider_CustomProviderListModelsEnabled(t *testing.T) {
-	mc := newTestCatalog(
-		map[schemas.ModelProvider][]string{
-			"custom-provider": {"model-a"},
-		},
-		nil,
-	)
-
-	// Custom provider with list-models enabled + ["*"] → should go through catalog
-	providerConfig := configstore.ProviderConfig{
-		CustomProviderConfig: &schemas.CustomProviderConfig{
-			AllowedRequests: &schemas.AllowedRequests{
-				ListModels: true,
-			},
-		},
+	s.once.Do(func() { close(s.paused) })
+	select {
+	case <-s.release:
+		return rows, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	// model-a is in catalog → allowed
-	assert.True(t, mc.IsModelAllowedForProvider("custom-provider", "model-a", &providerConfig, []string{"*"}))
-	// model-b is NOT in catalog → denied
-	assert.False(t, mc.IsModelAllowedForProvider("custom-provider", "model-b", &providerConfig, []string{"*"}))
 }
 
-func TestIsModelAllowedForProvider_NilProviderConfig(t *testing.T) {
-	mc := newTestCatalog(
-		map[schemas.ModelProvider][]string{
-			"some-provider": {"model-x"},
-		},
-		nil,
-	)
+// TestRunParamsSyncSerializesSharedDatabaseSnapshot verifies gateways cannot publish overlapping snapshots.
+func TestRunParamsSyncSerializesSharedDatabaseSnapshot(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	logger := bifrost.NewNoOpLogger()
+	cfg := &configstore.Config{Enabled: true, Type: configstore.ConfigStoreTypeSQLite,
+		Config: &configstore.SQLiteConfig{Path: filepath.Join(t.TempDir(), "shared.db")}}
+	openStore := func() configstore.ConfigStore {
+		cs, err := configstore.NewConfigStore(ctx, cfg, logger)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = cs.Close(context.Background()) })
+		return cs
+	}
+	csA, csB := openStore(), openStore()
+	paused := &pausedModelParamsStore{ConfigStore: csA, paused: make(chan struct{}), release: make(chan struct{})}
 
-	// nil providerConfig + ["*"] → should go through catalog (not bypass)
-	assert.True(t, mc.IsModelAllowedForProvider("some-provider", "model-x", nil, []string{"*"}))
-	assert.False(t, mc.IsModelAllowedForProvider("some-provider", "model-y", nil, []string{"*"}))
+	newCatalog := func(cs configstore.ConfigStore, model string) (*ModelCatalog, *datasheet.Store) {
+		path := filepath.Join(t.TempDir(), model+".json")
+		require.NoError(t, os.WriteFile(path, []byte(`{"custom-anthropic/`+model+`":{"provider":"custom-anthropic","max_output_tokens":32000}}`), 0o600))
+		ds := datasheet.New(cs, logger, datasheet.Config{ModelParametersURL: "file://" + path})
+		mc := NewTestCatalogWithDatasheet(ds)
+		mc.configStore = cs
+		mc.logger = logger
+		mc.distributedLockManager = configstore.NewDistributedLockManager(cs, logger)
+		return mc, ds
+	}
+	first, _ := newCatalog(paused, "first")
+	second, secondDatasheet := newCatalog(csB, "second")
+	secondLockStore := &observedLockStore{ConfigStore: csB, tried: make(chan bool, 1)}
+	second.distributedLockManager = configstore.NewDistributedLockManager(secondLockStore, logger)
+	firstDone, secondDone := make(chan error, 1), make(chan error, 1)
+	go func() { _, err := first.runParamsSync(ctx); firstDone <- err }()
+	select {
+	case <-paused.paused:
+	case <-ctx.Done():
+		t.Fatal("first gateway did not pause after reading its snapshot")
+	}
+	go func() { _, err := second.runParamsSync(ctx); secondDone <- err }()
+	select {
+	case acquired := <-secondLockStore.tried:
+		if acquired {
+			t.Fatal("second gateway acquired the shared lock while the first still held it")
+		}
+	case <-ctx.Done():
+		t.Fatal("second gateway did not try to acquire the shared lock")
+	}
+	select {
+	case err := <-secondDone:
+		t.Fatalf("second gateway bypassed the shared lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(paused.release)
+	require.NoError(t, <-firstDone)
+	require.NoError(t, <-secondDone)
+
+	for _, model := range []string{"first", "second"} {
+		caps, err := secondDatasheet.LoadModelCapabilities(ctx, "custom-anthropic", model)
+		require.NoError(t, err)
+		if caps == nil || caps.MaxOutputTokens == nil || *caps.MaxOutputTokens != 32000 {
+			t.Fatalf("last published snapshot lost %s: %+v", model, caps)
+		}
+	}
+}
+
+// In cluster mode the gate is "am I the leader". A pod whose gate rejects the
+// sync wrote nothing, so it must not broadcast a reload: with every pod doing
+// so, one hourly cycle cost N*(N-1) full catalog reads. It must not mark itself
+// synced either, so a pod that becomes leader picks up the overdue sync on its
+// next tick instead of waiting a full interval.
+func TestSyncTickGateClosedSkipsHookAndMarkSynced(t *testing.T) {
+	mc, hookCalls := newSyncTestCatalog(t, false)
+
+	mc.syncTick(context.Background())
+
+	require.Equal(t, 0, *hookCalls, "after-sync hook fired on a pod whose sync was gated off")
+	require.True(t, mc.datasheet.LastSyncedAt().IsZero(), "gated-off pod marked itself synced")
+}
+
+// The leader path: a sync that ran broadcasts exactly once and marks the pod synced.
+func TestSyncTickGateOpenFiresHookOnce(t *testing.T) {
+	mc, hookCalls := newSyncTestCatalog(t, true)
+
+	mc.syncTick(context.Background())
+
+	require.Equal(t, 1, *hookCalls)
+	require.False(t, mc.datasheet.LastSyncedAt().IsZero(), "leader did not mark itself synced")
+}
+
+// Leadership can move after syncTick's pre-lock gate check, so one of the two
+// runs may sync while the other is skipped. Peers must still reload what was
+// written, but the node must not count the cycle as synced: a half-skipped
+// cycle stays overdue and the next tick on the leader retries it.
+func TestSyncTickGateFlipMidSyncFiresHookButDoesNotMarkSynced(t *testing.T) {
+	mc, hookCalls := newSyncTestCatalog(t, true)
+	// Call 1 is the pre-lock check; of the two in-run checks, which run on
+	// separate goroutines, exactly one is allowed through.
+	var gateCalls atomic.Int32
+	mc.SetShouldSyncGate(func(context.Context) bool { return gateCalls.Add(1) <= 2 })
+
+	mc.syncTick(context.Background())
+
+	require.Equal(t, int32(3), gateCalls.Load())
+	require.Equal(t, 1, *hookCalls, "peers must reload the half that was written")
+	require.True(t, mc.datasheet.LastSyncedAt().IsZero(), "half-skipped cycle marked the node synced")
+}
+
+func TestForceReloadPricingGateClosedSkipsHook(t *testing.T) {
+	mc, hookCalls := newSyncTestCatalog(t, false)
+
+	require.NoError(t, mc.ForceReloadPricing(context.Background()))
+
+	require.Equal(t, 0, *hookCalls, "after-sync hook fired on a force reload whose sync was gated off")
+}
+
+func TestForceReloadPricingGateOpenFiresHookOnce(t *testing.T) {
+	mc, hookCalls := newSyncTestCatalog(t, true)
+
+	require.NoError(t, mc.ForceReloadPricing(context.Background()))
+
+	require.Equal(t, 1, *hookCalls)
 }

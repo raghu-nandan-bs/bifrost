@@ -15,6 +15,41 @@ import (
 	mocker "github.com/maximhq/bifrost/plugins/mocker"
 )
 
+// embeddingThrottle bounds the number of concurrent live embedding calls
+// across every parallel test in the process. The semantic cache plugin embeds
+// each request against real OpenAI for similarity search; with no cap, the
+// burst from many t.Parallel() tests trips OpenAI's embeddings rate limit
+// (429), and each affected test then self-skips via the "upstream request
+// error" guard - silently hiding dozens of tests. A small cap smooths the
+// burst so the test account's retry/backoff (MaxRetries in GetConfigForProvider)
+// can absorb any residual throttling. Override with
+// SEMCACHE_TEST_EMBED_CONCURRENCY; defaults to 2.
+var embeddingThrottle = make(chan struct{}, embeddingConcurrency())
+
+func embeddingConcurrency() int {
+	if v := os.Getenv("SEMCACHE_TEST_EMBED_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 2
+}
+
+// throttledEmbeddingExecutor wraps an EmbeddingRequestExecutor with the
+// package-level concurrency cap above so embedding bursts stay under the
+// provider's rate limit regardless of the test runner or -parallel setting.
+func throttledEmbeddingExecutor(inner EmbeddingRequestExecutor) EmbeddingRequestExecutor {
+	return func(ctx *schemas.BifrostContext, req *schemas.BifrostEmbeddingRequest) (*schemas.BifrostEmbeddingResponse, *schemas.BifrostError) {
+		select {
+		case embeddingThrottle <- struct{}{}:
+		case <-ctx.Done():
+			return nil, &schemas.BifrostError{Error: &schemas.ErrorField{Message: "embedding throttle wait cancelled: " + ctx.Err().Error()}}
+		}
+		defer func() { <-embeddingThrottle }()
+		return inner(ctx, req)
+	}
+}
+
 // isTransientUpstreamError reports whether a BifrostError reflects a
 // transient upstream condition (timeout, rate-limit, 5xx) where skipping
 // the test is reasonable. All other errors — including missing API keys,
@@ -68,12 +103,12 @@ func getWeaviateConfigFromEnv() vectorstore.WeaviateConfig {
 	if scheme == "" {
 		scheme = "http"
 	}
-	host := schemas.NewEnvVar("env.WEAVIATE_HOST")
+	host := schemas.NewSecretVar("env.WEAVIATE_HOST")
 	if host.GetValue() == "" {
-		host = schemas.NewEnvVar("localhost:9000")
+		host = schemas.NewSecretVar("localhost:9000")
 	}
 
-	apiKey := schemas.NewEnvVar("env.WEAVIATE_API_KEY")
+	apiKey := schemas.NewSecretVar("env.WEAVIATE_API_KEY")
 
 	timeoutStr := os.Getenv("WEAVIATE_TIMEOUT")
 	timeout := 30 // default
@@ -93,13 +128,13 @@ func getWeaviateConfigFromEnv() vectorstore.WeaviateConfig {
 
 // getRedisConfigFromEnv retrieves Redis configuration from environment variables
 func getRedisConfigFromEnv() vectorstore.RedisConfig {
-	addr := schemas.NewEnvVar("env.REDIS_ADDR")
+	addr := schemas.NewSecretVar("env.REDIS_ADDR")
 	if addr.GetValue() == "" {
-		addr = schemas.NewEnvVar("localhost:6379")
+		addr = schemas.NewSecretVar("localhost:6379")
 	}
-	username := schemas.NewEnvVar("env.REDIS_USERNAME")
-	password := schemas.NewEnvVar("env.REDIS_PASSWORD")
-	db := schemas.NewEnvVar("env.REDIS_DB")
+	username := schemas.NewSecretVar("env.REDIS_USERNAME")
+	password := schemas.NewSecretVar("env.REDIS_PASSWORD")
+	db := schemas.NewSecretVar("env.REDIS_DB")
 
 	timeoutStr := os.Getenv("REDIS_TIMEOUT")
 	if timeoutStr == "" {
@@ -121,18 +156,18 @@ func getRedisConfigFromEnv() vectorstore.RedisConfig {
 
 // getQdrantConfigFromEnv retrieves Qdrant configuration from environment variables
 func getQdrantConfigFromEnv() vectorstore.QdrantConfig {
-	host := schemas.NewEnvVar("env.QDRANT_HOST")
+	host := schemas.NewSecretVar("env.QDRANT_HOST")
 	if host.GetValue() == "" {
-		host = schemas.NewEnvVar("localhost")
+		host = schemas.NewSecretVar("localhost")
 	}
-	port := schemas.NewEnvVar("env.QDRANT_PORT")
+	port := schemas.NewSecretVar("env.QDRANT_PORT")
 	if port.GetValue() == "" {
-		port = schemas.NewEnvVar("6334")
+		port = schemas.NewSecretVar("6334")
 	}
-	apiKey := schemas.NewEnvVar("env.QDRANT_API_KEY")
-	useTLS := schemas.NewEnvVar("env.QDRANT_USE_TLS")
+	apiKey := schemas.NewSecretVar("env.QDRANT_API_KEY")
+	useTLS := schemas.NewSecretVar("env.QDRANT_USE_TLS")
 	if useTLS.GetValue() == "" {
-		useTLS = schemas.NewEnvVar("false")
+		useTLS = schemas.NewSecretVar("false")
 	}
 
 	return vectorstore.QdrantConfig{
@@ -145,18 +180,37 @@ func getQdrantConfigFromEnv() vectorstore.QdrantConfig {
 
 // getPineconeConfigFromEnv retrieves Pinecone configuration from environment variables
 func getPineconeConfigFromEnv() vectorstore.PineconeConfig {
-	apiKey := schemas.NewEnvVar("env.PINECONE_API_KEY")
+	apiKey := schemas.NewSecretVar("env.PINECONE_API_KEY")
 	if apiKey.GetValue() == "" {
-		apiKey = schemas.NewEnvVar("pclocal") // Pinecone Local doesn't validate API keys
+		apiKey = schemas.NewSecretVar("pclocal") // Pinecone Local doesn't validate API keys
 	}
-	indexHost := schemas.NewEnvVar("env.PINECONE_INDEX_HOST")
+	indexHost := schemas.NewSecretVar("env.PINECONE_INDEX_HOST")
 	if indexHost.GetValue() == "" {
-		indexHost = schemas.NewEnvVar("localhost:5081") // Pinecone Local default port
+		indexHost = schemas.NewSecretVar("localhost:5081") // Pinecone Local default port
 	}
 
 	return vectorstore.PineconeConfig{
 		APIKey:    *apiKey,
 		IndexHost: *indexHost,
+	}
+}
+
+// storeConfigForType returns the env-derived connection config for a vector
+// store type. The bool is false for an unrecognized type. Shared by test setup
+// and the TestMain namespace sweep so both stay in lockstep when a new backend
+// is added.
+func storeConfigForType(storeType vectorstore.VectorStoreType) (interface{}, bool) {
+	switch storeType {
+	case vectorstore.VectorStoreTypeWeaviate:
+		return getWeaviateConfigFromEnv(), true
+	case vectorstore.VectorStoreTypeRedis:
+		return getRedisConfigFromEnv(), true
+	case vectorstore.VectorStoreTypeQdrant:
+		return getQdrantConfigFromEnv(), true
+	case vectorstore.VectorStoreTypePinecone:
+		return getPineconeConfigFromEnv(), true
+	default:
+		return nil, false
 	}
 }
 
@@ -170,7 +224,7 @@ func (baseAccount *BaseAccount) GetConfiguredProviders() ([]schemas.ModelProvide
 func (baseAccount *BaseAccount) GetKeysForProvider(ctx context.Context, providerKey schemas.ModelProvider) ([]schemas.Key, error) {
 	return []schemas.Key{
 		{
-			Value:  *schemas.NewEnvVar("env.OPENAI_API_KEY"),
+			Value:  *schemas.NewSecretVar("env.OPENAI_API_KEY"),
 			Models: schemas.WhiteList{"*"}, // "*" means allow all models
 			Weight: 1.0,
 		},
@@ -379,7 +433,12 @@ func getMockRules() []mocker.MockRule {
 }
 
 // getMockedBifrostClient creates a Bifrost client with a mocker plugin for testing
-func getMockedBifrostClient(t *testing.T, ctx *schemas.BifrostContext, logger schemas.Logger, semanticCachePlugin schemas.LLMPlugin) *bifrost.Bifrost {
+// extraPlugins, when given, are inserted between semanticCachePlugin and the
+// mocker plugin — e.g. a test-local plugin that short-circuits with a real
+// multi-chunk stream (see chunkStreamPlugin) where the mocker's single-shot
+// Response short-circuit can't exercise the case being tested. Any request
+// an extra plugin doesn't handle falls through to mocker as usual.
+func getMockedBifrostClient(t *testing.T, ctx *schemas.BifrostContext, logger schemas.Logger, semanticCachePlugin schemas.LLMPlugin, extraPlugins ...schemas.LLMPlugin) *bifrost.Bifrost {
 	mockerCfg := mocker.MockerConfig{
 		Enabled: true,
 		Rules:   getMockRules(),
@@ -390,10 +449,13 @@ func getMockedBifrostClient(t *testing.T, ctx *schemas.BifrostContext, logger sc
 		t.Fatalf("Failed to initialize mocker plugin: %v", err)
 	}
 
+	llmPlugins := append([]schemas.LLMPlugin{semanticCachePlugin}, extraPlugins...)
+	llmPlugins = append(llmPlugins, mockerPlugin)
+
 	account := &BaseAccount{}
 	client, err := bifrost.Init(ctx, schemas.BifrostConfig{
 		Account:    account,
-		LLMPlugins: []schemas.LLMPlugin{semanticCachePlugin, mockerPlugin},
+		LLMPlugins: llmPlugins,
 		Logger:     logger,
 	})
 	if err != nil {
@@ -452,8 +514,9 @@ func ensureSharedTestNamespace(ctx context.Context, store vectorstore.VectorStor
 	return sharedTestNamespaceErr
 }
 
-// NewTestSetupWithVectorStore creates a new test setup with custom configuration and vector store type
-func NewTestSetupWithVectorStore(t *testing.T, config *Config, storeType vectorstore.VectorStoreType) *TestSetup {
+// NewTestSetupWithVectorStore creates a new test setup with custom configuration and vector store type.
+// extraPlugins are forwarded to getMockedBifrostClient — see its doc comment.
+func NewTestSetupWithVectorStore(t *testing.T, config *Config, storeType vectorstore.VectorStoreType, extraPlugins ...schemas.LLMPlugin) *TestSetup {
 	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
 	logger := bifrost.NewDefaultLogger(schemas.LogLevelDebug)
 
@@ -463,17 +526,8 @@ func NewTestSetupWithVectorStore(t *testing.T, config *Config, storeType vectors
 	}
 
 	// Get the appropriate config for the vector store type
-	var storeConfig interface{}
-	switch storeType {
-	case vectorstore.VectorStoreTypeWeaviate:
-		storeConfig = getWeaviateConfigFromEnv()
-	case vectorstore.VectorStoreTypeRedis:
-		storeConfig = getRedisConfigFromEnv()
-	case vectorstore.VectorStoreTypeQdrant:
-		storeConfig = getQdrantConfigFromEnv()
-	case vectorstore.VectorStoreTypePinecone:
-		storeConfig = getPineconeConfigFromEnv()
-	default:
+	storeConfig, ok := storeConfigForType(storeType)
+	if !ok {
 		t.Fatalf("Unsupported vector store type: %s", storeType)
 	}
 
@@ -505,10 +559,10 @@ func NewTestSetupWithVectorStore(t *testing.T, config *Config, storeType vectors
 	clearTestKeysWithStore(t, pluginImpl.store)
 
 	// Get a mocked Bifrost client
-	client := getMockedBifrostClient(t, ctx, logger, plugin)
+	client := getMockedBifrostClient(t, ctx, logger, plugin, extraPlugins...)
 
 	// Wire the global client as the embedding executor so semantic search works.
-	pluginImpl.SetEmbeddingRequestExecutor(client.EmbeddingRequest)
+	pluginImpl.SetEmbeddingRequestExecutor(throttledEmbeddingExecutor(client.EmbeddingRequest))
 
 	return &TestSetup{
 		Logger: logger,
@@ -612,7 +666,7 @@ func AssertNoCacheHit(t *testing.T, response *schemas.BifrostResponse) {
 		return
 	}
 
-	// Check the actual CacheHit field instead of just checking if CacheDebug exists
+	// Check the actual CacheHit field instead of just checking whether cache metadata exists.
 	if extraFields.CacheDebug.CacheHit {
 		t.Error("❌ Response was cached when it shouldn't be")
 		return
@@ -651,9 +705,14 @@ func CreateEmbeddingRequest(texts []string) *schemas.BifrostEmbeddingRequest {
 	return &schemas.BifrostEmbeddingRequest{
 		Provider: schemas.OpenAI,
 		Model:    "text-embedding-3-small",
-		Input: &schemas.EmbeddingInput{
-			Texts: texts,
-		},
+		Input: func() []schemas.EmbeddingInputItem {
+			items := make([]schemas.EmbeddingInputItem, len(texts))
+			for i, text := range texts {
+				t := text
+				items[i] = schemas.EmbeddingInputItem{Content: schemas.EmbeddingContent{{Type: schemas.EmbeddingContentPartTypeText, Text: &t}}}
+			}
+			return items
+		}(),
 	}
 }
 

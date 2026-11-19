@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Bifrost API Management & Health Tests
 # This script runs tests for /api/* and /health endpoints
@@ -24,6 +24,9 @@ API_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Configuration
 COLLECTION="$API_DIR/collections/bifrost-api-management.postman_collection.json"
 REPORT_DIR="$API_DIR/newman-reports/api-management"
+# OSS setup lock: while dashboard auth is not active, /api requires the setup token.
+# Must match setup_token in the server's config.json (or its BIFROST_SETUP_TOKEN).
+SETUP_TOKEN="${BIFROST_E2E_SETUP_TOKEN:-${BIFROST_SETUP_TOKEN:-bifrost-e2e-setup-token}}"
 
 # Colors for output
 GREEN='\033[0;32m'
@@ -66,6 +69,10 @@ DB_CONFIG_PATH=""
 SEED_ENV_PATH="${BIFROST_E2E_SEED_ENV:-}"
 EXPECTED_PATH="${BIFROST_E2E_SEED_EXPECTED:-}"
 EXTRA_COLLECTIONS=()
+BASE_URL="${BIFROST_E2E_BASE_URL:-${BIFROST_BASE_URL:-http://localhost:8080}}"
+ADMIN_USERNAME="${BIFROST_E2E_ADMIN_USERNAME:-admin}"
+ADMIN_PASSWORD="${BIFROST_E2E_ADMIN_PASSWORD:-Bifrost-E2E-Admin-Pass1!}"
+ADMIN_AUTH_HEADER="Bearer $(printf '%s:%s' "$ADMIN_USERNAME" "$ADMIN_PASSWORD" | base64 | tr -d '\n')"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -164,7 +171,7 @@ while [[ $# -gt 0 ]]; do
             echo "                      (default: ./config.json; also reads BIFROST_CONFIG_PATH env)"
             echo "  --extra-collection <p>"
             echo "                      Merge an additional Postman collection into this API run."
-            echo "                      Intended for enterprise-only API e2e coverage from another repo."
+            echo "                      Intended for API e2e coverage maintained in another repo."
             echo "  --seed-env <p>      Load generated seed dotenv values and pass them to Newman."
             echo "  --expected <p>      Load generated DAC expected-manifest JSON for assertions."
             echo "  --help              Show this help message"
@@ -203,17 +210,33 @@ fi
 # Make globally-installed npm packages (e.g. newman-reporter-htmlextra from
 # `npm install -g`) visible to Node's module resolver. Node 20+ no longer falls
 # back to the global npm prefix automatically, so without this NODE_PATH addition
-# the require.resolve check below fails even when the package is installed.
+# a global install is invisible to Node even when the package is installed.
 if NPM_GLOBAL_ROOT="$(npm root -g 2>/dev/null)" && [ -n "$NPM_GLOBAL_ROOT" ]; then
     export NODE_PATH="$NPM_GLOBAL_ROOT${NODE_PATH:+:$NODE_PATH}"
 fi
 
 # Validate optional reporters are resolvable before invoking newman so we fail
-# fast with a clear message instead of a cryptic mid-run newman error. node's
-# require.resolve uses the same module-resolution path newman uses (including
-# the NODE_PATH set above for the global npm root and below for newman-reporter-dbverify).
+# fast with a clear message instead of a cryptic mid-run newman error.
+#
+# The probe must resolve from newman's own install tree, because that is where
+# newman resolves its reporters from: it requires `newman-reporter-<name>` from
+# inside the newman package, so Node walks up newman's own node_modules chain.
+# CI installs newman and its reporters locally under
+# .github/workflows/tools/node_modules and puts only .bin on PATH, so a probe
+# that resolves from this script's cwd (or from the global npm root) reports the
+# reporter missing on a tree where newman itself would load it fine.
+# process.cwd() stays in the paths list to cover a repo-local npm install, and
+# NODE_PATH (set above for the global root, and below for newman-reporter-dbverify)
+# is still honoured by Node on top of these paths.
 if [[ "$REPORTERS" == *"htmlextra"* ]]; then
-    if ! node -e 'require.resolve("newman-reporter-htmlextra")' >/dev/null 2>&1; then
+    if ! node -e '
+        const fs = require("fs"), path = require("path");
+        const paths = [process.cwd()];
+        try {
+            paths.unshift(path.dirname(fs.realpathSync(process.argv[1])));
+        } catch (e) { /* newman not on PATH or not a real file; cwd still applies */ }
+        require.resolve("newman-reporter-htmlextra", { paths });
+    ' "$(command -v newman)" >/dev/null 2>&1; then
         echo -e "${RED}Error: newman-reporter-htmlextra is not installed${NC}"
         echo "Install it with: npm install -g newman-reporter-htmlextra"
         exit 1
@@ -222,8 +245,10 @@ fi
 
 echo -e "Configuration:"
 echo -e "  Collection: ${YELLOW}$COLLECTION${NC}"
+echo -e "  Base URL:   ${YELLOW}$BASE_URL${NC}"
 echo -e "  Reports:    ${YELLOW}$REPORT_DIR${NC}"
 echo -e "  Verbose:    ${YELLOW}$([ -n "$VERBOSE" ] && echo "enabled" || echo "disabled")${NC}"
+echo -e "  Auth Pass:  ${YELLOW}enabled (username: $ADMIN_USERNAME)${NC}"
 if [ ${#EXTRA_COLLECTIONS[@]} -gt 0 ]; then
     echo -e "  Extensions: ${YELLOW}${EXTRA_COLLECTIONS[*]}${NC}"
 fi
@@ -267,6 +292,11 @@ fi
 HTTP_SERVER_DIR="$BIFROST_ROOT/examples/mcps/http-no-ping-server"
 HTTP_SERVER_BIN="$HTTP_SERVER_DIR/http-server"
 HTTP_SERVER_PID=""
+AUTH_ENABLED_BY_RUN=""
+# "1" once this run has created (or found) the admin account and restored auth to
+# disabled: the request guard suite's Dashboard auth update folder needs a stored
+# admin whose password is ADMIN_PASSWORD and only runs when told one exists.
+REQUEST_GUARDS_ADMIN_EXISTS="0"
 
 start_http_mcp_server() {
     # Skip if something is already listening on 3001
@@ -312,8 +342,21 @@ stop_http_mcp_server() {
     fi
 }
 
-# Register teardown so the server is stopped even if the script exits early
-trap stop_http_mcp_server EXIT
+cleanup() {
+    if [ "$AUTH_ENABLED_BY_RUN" = "1" ]; then
+        echo "Restoring dashboard auth to disabled..."
+        BIFROST_E2E_AUTH_HEADER="$ADMIN_AUTH_HEADER" \
+        BIFROST_E2E_BASE_URL="$BASE_URL" \
+        BIFROST_E2E_SETUP_TOKEN="$SETUP_TOKEN" \
+        BIFROST_E2E_ADMIN_USERNAME="$ADMIN_USERNAME" \
+        BIFROST_E2E_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+            node "$SCRIPT_DIR/set-auth-config.mjs" disable >/dev/null 2>&1 || true
+    fi
+    stop_http_mcp_server
+}
+
+# Register teardown so auth and the server are restored even if the script exits early
+trap cleanup EXIT
 
 echo "Setting up MCP test servers..."
 start_http_mcp_server
@@ -350,8 +393,10 @@ if [ -n "$DB_VERIFY" ]; then
     export NODE_PATH="$API_DIR/node_modules${NODE_PATH:+:$NODE_PATH}"
 fi
 
-# Build Newman command
-cmd=(newman run "$COLLECTION" --timeout-script 120000 --timeout 900000 -r "$REPORTERS")
+# Build shared Newman arguments. The collection and reporter export paths are
+# supplied per pass so the unauthenticated and authenticated runs keep separate
+# reports while using identical environment/config inputs.
+newman_args=(--timeout-script 120000 --timeout 900000 -r "$REPORTERS" --env-var "base_url=$BASE_URL" --env-var "setup_token=$SETUP_TOKEN")
 
 # Parsed seed env entries live here, not in the runner's shell namespace.
 # Decoupling the data keyspace from the script's own variables (PATH, COLLECTION,
@@ -392,7 +437,7 @@ add_env_var_if_set() {
     local name="$1"
     local value="${seed_env_values[$name]:-}"
     if [ -n "$value" ]; then
-        cmd+=(--env-var "$name=$value")
+        newman_args+=(--env-var "$name=$value")
     fi
 }
 
@@ -423,33 +468,39 @@ if [ -n "$EXPECTED_PATH" ]; then
         exit 1
     fi
     EXPECTED_JSON="$(node -e 'const fs=require("fs"); const p=process.argv[1]; process.stdout.write(JSON.stringify(JSON.parse(fs.readFileSync(p,"utf8"))));' "$EXPECTED_PATH")"
-    cmd+=(--env-var "e2e_seed_expected=$EXPECTED_JSON")
+    newman_args+=(--env-var "e2e_seed_expected=$EXPECTED_JSON")
 fi
 
 # Override plugin_path with resolved absolute path so Create Plugin / Get Plugin use the built .so
 # env-var takes precedence over collection variables in Newman's resolution order
 if [ -n "$PLUGIN_PATH_ABS" ]; then
-    cmd+=(--env-var "plugin_path=$PLUGIN_PATH_ABS")
-fi
-
-if [[ "$REPORTERS" == *"htmlextra"* ]]; then
-    cmd+=(--reporter-htmlextra-export "$REPORT_DIR/report.html")
-    cmd+=(--reporter-htmlextra-title "Bifrost API Management & Health")
-    cmd+=(--reporter-htmlextra-darkTheme)
-fi
-
-if [[ "$REPORTERS" == *"json"* ]]; then
-    cmd+=(--reporter-json-export "$REPORT_DIR/report.json")
+    newman_args+=(--env-var "plugin_path=$PLUGIN_PATH_ABS")
 fi
 
 if [ -n "$DB_VERIFY" ]; then
-    [ -n "$DB_URL" ]      && cmd+=(--reporter-dbverify-db-url "$DB_URL")
-    [ -n "$LOGS_DB_URL" ] && cmd+=(--reporter-dbverify-logs-db-url "$LOGS_DB_URL")
-    [ -n "$DB_CONFIG_PATH" ] && cmd+=(--reporter-dbverify-config "$DB_CONFIG_PATH")
+    [ -n "$DB_URL" ]      && newman_args+=(--reporter-dbverify-db-url "$DB_URL")
+    [ -n "$LOGS_DB_URL" ] && newman_args+=(--reporter-dbverify-logs-db-url "$LOGS_DB_URL")
+    [ -n "$DB_CONFIG_PATH" ] && newman_args+=(--reporter-dbverify-config "$DB_CONFIG_PATH")
 fi
 
-[ -n "$VERBOSE" ] && cmd+=("$VERBOSE")
-[ -n "$BAIL" ] && cmd+=("$BAIL")
+[ -n "$VERBOSE" ] && newman_args+=("$VERBOSE")
+[ -n "$BAIL" ] && newman_args+=("$BAIL")
+
+build_newman_cmd() {
+    local collection_path="$1"
+    local report_suffix="$2"
+    cmd=(newman run "$collection_path" "${newman_args[@]}")
+
+    if [[ "$REPORTERS" == *"htmlextra"* ]]; then
+        cmd+=(--reporter-htmlextra-export "$REPORT_DIR/report${report_suffix}.html")
+        cmd+=(--reporter-htmlextra-title "Bifrost API Management & Health${report_suffix}")
+        cmd+=(--reporter-htmlextra-darkTheme)
+    fi
+
+    if [[ "$REPORTERS" == *"json"* ]]; then
+        cmd+=(--reporter-json-export "$REPORT_DIR/report${report_suffix}.json")
+    fi
+}
 
 # Run Newman and save output to log file while displaying to console (using tee)
 LOG_FILE="$LOG_DIR/api-management.log"
@@ -461,10 +512,231 @@ else
     echo "[setup] plugin_path not resolved (build may have failed)" | tee "$LOG_FILE"
 fi
 
-set +e
-"${cmd[@]}" 2>&1 | tee -a "$LOG_FILE"
-EXIT_CODE=${PIPESTATUS[0]}
-set -e
+run_newman_pass() {
+    local label="$1"
+    local collection_path="$2"
+    local report_suffix="$3"
+    local with_auth="$4"
+
+    echo "" | tee -a "$LOG_FILE"
+    echo -e "${GREEN}${label}${NC}" | tee -a "$LOG_FILE"
+
+    build_newman_cmd "$collection_path" "$report_suffix"
+    if [ "$with_auth" = "1" ]; then
+        cmd+=(--env-var "admin_auth_header=$ADMIN_AUTH_HEADER")
+        cmd+=(--env-var "admin_username=$ADMIN_USERNAME")
+        cmd+=(--env-var "admin_password=$ADMIN_PASSWORD")
+    fi
+
+    set +e
+    "${cmd[@]}" 2>&1 | tee -a "$LOG_FILE"
+    local pass_exit=${PIPESTATUS[0]}
+    set -e
+    return $pass_exit
+}
+
+# The unauthenticated pass runs while dashboard auth is off, so the OSS setup lock
+# needs every request to carry the setup token.
+SETUP_COLLECTION="$REPORT_DIR/api-management-setup-token.postman_collection.json"
+node "$SCRIPT_DIR/add-setup-token-header.mjs" "$COLLECTION" "$SETUP_COLLECTION"
+run_newman_pass "Running unauthenticated API management tests..." "$SETUP_COLLECTION" "" ""
+EXIT_CODE=$?
+
+AUTH_COLLECTION="$REPORT_DIR/api-management-auth.postman_collection.json"
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "" | tee -a "$LOG_FILE"
+    echo -e "${GREEN}Enabling dashboard auth for authenticated API management tests...${NC}" | tee -a "$LOG_FILE"
+    set +e
+    BIFROST_E2E_BASE_URL="$BASE_URL" \
+    BIFROST_E2E_SETUP_TOKEN="$SETUP_TOKEN" \
+    BIFROST_E2E_ADMIN_USERNAME="$ADMIN_USERNAME" \
+    BIFROST_E2E_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+        node "$SCRIPT_DIR/set-auth-config.mjs" enable 2>&1 | tee -a "$LOG_FILE"
+    AUTH_SETUP_EXIT=${PIPESTATUS[0]}
+    set -e
+    # Exit 3 means the auth pass cannot run here (fresh database, no bootstrap
+    # token). That is a coverage gap, not a test failure -- do not fail a run
+    # whose unauthenticated pass was green.
+    if [ $AUTH_SETUP_EXIT -eq 3 ]; then
+        echo -e "${YELLOW}Skipping authenticated API management pass (see message above).${NC}" | tee -a "$LOG_FILE"
+    elif [ $AUTH_SETUP_EXIT -ne 0 ]; then
+        EXIT_CODE=$AUTH_SETUP_EXIT
+    else
+        AUTH_ENABLED_BY_RUN="1"
+        node "$SCRIPT_DIR/add-auth-header.mjs" "$COLLECTION" "$AUTH_COLLECTION"
+        run_newman_pass "Running authenticated API management tests..." "$AUTH_COLLECTION" "-auth" "1"
+        EXIT_CODE=$?
+    fi
+fi
+
+if [ $EXIT_CODE -eq 0 ] && [ "${BIFROST_E2E_SKIP_OBSERVABILITY:-0}" != "1" ]; then
+    echo "" | tee -a "$LOG_FILE"
+    echo -e "${GREEN}Running authenticated local OTEL and Prometheus observability checks...${NC}" | tee -a "$LOG_FILE"
+    set +e
+    BIFROST_E2E_BASE_URL="$BASE_URL" \
+    BIFROST_E2E_AUTH_HEADER="$ADMIN_AUTH_HEADER" \
+        node "$SCRIPT_DIR/run-observability-local.mjs" 2>&1 | tee -a "$LOG_FILE"
+    OBS_EXIT_CODE=${PIPESTATUS[0]}
+    set -e
+    if [ $OBS_EXIT_CODE -ne 0 ]; then
+        EXIT_CODE=$OBS_EXIT_CODE
+    fi
+elif [ $EXIT_CODE -eq 0 ]; then
+    echo "" | tee -a "$LOG_FILE"
+    echo -e "${YELLOW}Skipping local OTEL and Prometheus observability checks (BIFROST_E2E_SKIP_OBSERVABILITY=1).${NC}" | tee -a "$LOG_FILE"
+fi
+
+if [ "$AUTH_ENABLED_BY_RUN" = "1" ]; then
+    echo "" | tee -a "$LOG_FILE"
+    echo -e "${GREEN}Restoring dashboard auth to disabled...${NC}" | tee -a "$LOG_FILE"
+    set +e
+    BIFROST_E2E_AUTH_HEADER="$ADMIN_AUTH_HEADER" \
+    BIFROST_E2E_BASE_URL="$BASE_URL" \
+    BIFROST_E2E_SETUP_TOKEN="$SETUP_TOKEN" \
+    BIFROST_E2E_ADMIN_USERNAME="$ADMIN_USERNAME" \
+    BIFROST_E2E_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+        node "$SCRIPT_DIR/set-auth-config.mjs" disable 2>&1 | tee -a "$LOG_FILE"
+    AUTH_RESTORE_EXIT=${PIPESTATUS[0]}
+    set -e
+    AUTH_ENABLED_BY_RUN=""
+    if [ $AUTH_RESTORE_EXIT -eq 0 ]; then
+        REQUEST_GUARDS_ADMIN_EXISTS="1"
+    fi
+    if [ $EXIT_CODE -eq 0 ] && [ $AUTH_RESTORE_EXIT -ne 0 ]; then
+        EXIT_CODE=$AUTH_RESTORE_EXIT
+    fi
+fi
+
+# Content-logging permutation matrix: every combination of virtual key (inherit/on/off), client
+# disable_content_logging, OTel connector disable_content_logging, the per-request override gate
+# and the x-bf-disable-content-logging header, checked in both the log store and the OTel export.
+# It brings its own echo provider and OTLP collector (no provider credentials, no paid calls),
+# restores the client config and OTel plugin afterwards, and runs after auth is restored to
+# disabled because it provisions virtual keys through the unauthenticated management API.
+# Its echo provider and collector are on loopback, so the gateway must share this host (as it does
+# in every CI path and for the observability check above); for a gateway in another container or
+# host, set BIFROST_E2E_CALLBACK_HOST to an address it can reach this runner on.
+# Set BIFROST_E2E_SKIP_CONTENT_LOGGING_MATRIX=1 to skip it.
+if [ $EXIT_CODE -eq 0 ] && [ "${BIFROST_E2E_SKIP_CONTENT_LOGGING_MATRIX:-0}" != "1" ]; then
+    echo "" | tee -a "$LOG_FILE"
+    echo -e "${GREEN}Running content-logging permutation matrix...${NC}" | tee -a "$LOG_FILE"
+    # The matrix reads raw log rows, so it must look at the same logs database this run was pointed
+    # at: --logs-db-url and --config-path are plain shell variables here, not exported, so pass them
+    # on explicitly. Unset values are left out so a caller's exported BIFROST_LOGS_DB_URL still wins.
+    matrix_env=(BIFROST_E2E_BASE_URL="$BASE_URL" BIFROST_E2E_SETUP_TOKEN="$SETUP_TOKEN")
+    [ -n "$LOGS_DB_URL" ] && matrix_env+=(BIFROST_LOGS_DB_URL="$LOGS_DB_URL")
+    [ -n "$DB_CONFIG_PATH" ] && matrix_env+=(BIFROST_E2E_CONFIG_PATH="$DB_CONFIG_PATH")
+    set +e
+    env "${matrix_env[@]}" node "$SCRIPT_DIR/run-content-logging-matrix.mjs" 2>&1 | tee -a "$LOG_FILE"
+    MATRIX_EXIT_CODE=${PIPESTATUS[0]}
+    set -e
+    if [ $MATRIX_EXIT_CODE -ne 0 ]; then
+        EXIT_CODE=$MATRIX_EXIT_CODE
+    fi
+elif [ $EXIT_CODE -eq 0 ]; then
+    echo "" | tee -a "$LOG_FILE"
+    echo -e "${YELLOW}Skipping content-logging permutation matrix (BIFROST_E2E_SKIP_CONTENT_LOGGING_MATRIX=1).${NC}" | tee -a "$LOG_FILE"
+fi
+
+# Request guard suite: what the management and gateway surface refuses over the
+# API (catalog URL validation, MCP client registration, proxy / provider /
+# provider-key endpoint changes, OAuth2 issuance availability, passthrough path
+# validation, request body limits, the webhook test-delivery gate and auth_config
+# updates that must prove the stored admin password). Hermetic: no provider is
+# contacted. It runs as its own newman invocation for the same reasons as the
+# governance suites below (its deliberate 4xx assertions must not meet the
+# management collection's 2xx gate), after auth is restored to disabled because
+# every folder exercises the unauthenticated posture. Its Dashboard auth update
+# folder re-enables auth with ADMIN_PASSWORD and disables it again, so it only
+# runs when this run created the admin account (REQUEST_GUARDS_ADMIN_EXISTS=1).
+# Set BIFROST_E2E_SKIP_REQUEST_GUARDS=1 to skip it.
+if [ $EXIT_CODE -eq 0 ] && [ "${BIFROST_E2E_SKIP_REQUEST_GUARDS:-0}" != "1" ]; then
+    echo "" | tee -a "$LOG_FILE"
+    echo -e "${GREEN}Running request guard tests...${NC}" | tee -a "$LOG_FILE"
+    set +e
+    BIFROST_BASE_URL="$BASE_URL" \
+    BIFROST_E2E_SETUP_TOKEN="$SETUP_TOKEN" \
+    BIFROST_E2E_ADMIN_USERNAME="$ADMIN_USERNAME" \
+    BIFROST_E2E_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+    BIFROST_E2E_ADMIN_EXISTS="$REQUEST_GUARDS_ADMIN_EXISTS" \
+        "$SCRIPT_DIR/individual/run-newman-request-guards-tests.sh" 2>&1 | tee -a "$LOG_FILE"
+    REQUEST_GUARDS_EXIT=${PIPESTATUS[0]}
+    set -e
+    if [ $REQUEST_GUARDS_EXIT -ne 0 ]; then
+        EXIT_CODE=$REQUEST_GUARDS_EXIT
+        # A failure inside the Dashboard auth update folder can leave auth enabled;
+        # the suites below need it disabled, so restore it best-effort.
+        if [ "$REQUEST_GUARDS_ADMIN_EXISTS" = "1" ]; then
+            BIFROST_E2E_AUTH_HEADER="$ADMIN_AUTH_HEADER" \
+            BIFROST_E2E_BASE_URL="$BASE_URL" \
+            BIFROST_E2E_ADMIN_USERNAME="$ADMIN_USERNAME" \
+            BIFROST_E2E_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+                node "$SCRIPT_DIR/set-auth-config.mjs" disable >/dev/null 2>&1 || true
+        fi
+    fi
+elif [ $EXIT_CODE -eq 0 ]; then
+    echo "" | tee -a "$LOG_FILE"
+    echo -e "${YELLOW}Skipping request guard tests (BIFROST_E2E_SKIP_REQUEST_GUARDS=1).${NC}" | tee -a "$LOG_FILE"
+fi
+
+# Extra fields placement suite: client.extra_fields_placement body vs headers on
+# /v1/chat/completions, /v1/responses and the /openai integration, unary and
+# streaming, plus a provider error and the CORS expose-headers list. Its own newman
+# invocation for the same reasons as the suites around it (it switches client config
+# and asserts a 4xx), after auth is restored to disabled because it writes config
+# through the unauthenticated management API. About ten small live completions; set
+# BIFROST_E2E_SKIP_EXTRA_FIELDS_PLACEMENT=1 to skip it.
+if [ $EXIT_CODE -eq 0 ] && [ "${BIFROST_E2E_SKIP_EXTRA_FIELDS_PLACEMENT:-0}" != "1" ]; then
+    echo "" | tee -a "$LOG_FILE"
+    echo -e "${GREEN}Running extra fields placement tests...${NC}" | tee -a "$LOG_FILE"
+    set +e
+    BIFROST_BASE_URL="$BASE_URL" \
+    BIFROST_E2E_SETUP_TOKEN="$SETUP_TOKEN" \
+        "$SCRIPT_DIR/individual/run-newman-extra-fields-placement-tests.sh" 2>&1 | tee -a "$LOG_FILE"
+    EXTRA_FIELDS_PLACEMENT_EXIT=${PIPESTATUS[0]}
+    set -e
+    if [ $EXTRA_FIELDS_PLACEMENT_EXIT -ne 0 ]; then
+        EXIT_CODE=$EXTRA_FIELDS_PLACEMENT_EXIT
+    fi
+elif [ $EXIT_CODE -eq 0 ]; then
+    echo "" | tee -a "$LOG_FILE"
+    echo -e "${YELLOW}Skipping extra fields placement tests (BIFROST_E2E_SKIP_EXTRA_FIELDS_PLACEMENT=1).${NC}" | tee -a "$LOG_FILE"
+fi
+
+# Governance suites (virtual key quota, rate limit / budget enforcement,
+# rotation cooldown, provider object ownership, and time-of-day pricing). These run as their own newman
+# invocations rather than through --extra-collection: merging folds them into the management collection,
+# which would drop their collection variables, subject their deliberate 401/403/
+# 429/402 assertions to that collection's 2xx gate, and run them a second time in
+# the authenticated pass. They also run after auth is restored to disabled,
+# because they provision virtual keys through the unauthenticated management API.
+# Roughly 8 minutes, most of it the rotation suite waiting out real 1m and 3m
+# grace windows; set BIFROST_E2E_SKIP_GOVERNANCE=1 to skip them.
+if [ $EXIT_CODE -eq 0 ] && [ "${BIFROST_E2E_SKIP_GOVERNANCE:-0}" != "1" ]; then
+    for governance_suite in \
+        "vk-quota:run-newman-vk-quota-tests.sh" \
+        "rate-limit:run-newman-rate-limit-tests.sh" \
+        "vk-rotation-cooldown:run-newman-vk-rotation-cooldown-tests.sh" \
+        "vk-object-ownership:run-newman-vk-object-ownership-tests.sh" \
+        "pricing-time-of-day:run-newman-pricing-time-of-day-tests.sh"; do
+        suite_name="${governance_suite%%:*}"
+        suite_runner="${governance_suite##*:}"
+        echo "" | tee -a "$LOG_FILE"
+        echo -e "${GREEN}Running ${suite_name} governance tests...${NC}" | tee -a "$LOG_FILE"
+        set +e
+        BIFROST_BASE_URL="$BASE_URL" \
+            "$SCRIPT_DIR/individual/$suite_runner" 2>&1 | tee -a "$LOG_FILE"
+        GOVERNANCE_EXIT=${PIPESTATUS[0]}
+        set -e
+        if [ $GOVERNANCE_EXIT -ne 0 ]; then
+            EXIT_CODE=$GOVERNANCE_EXIT
+            break
+        fi
+    done
+elif [ $EXIT_CODE -eq 0 ]; then
+    echo "" | tee -a "$LOG_FILE"
+    echo -e "${YELLOW}Skipping governance test suites (BIFROST_E2E_SKIP_GOVERNANCE=1).${NC}" | tee -a "$LOG_FILE"
+fi
 
 echo ""
 if [ $EXIT_CODE -eq 0 ]; then
@@ -480,6 +752,7 @@ if [[ "$REPORTERS" == *"htmlextra"* ]] || [[ "$REPORTERS" == *"json"* ]]; then
 fi
 if [[ "$REPORTERS" == *"htmlextra"* ]]; then
     echo -e "HTML report: ${YELLOW}$REPORT_DIR/report.html${NC}"
+    [ -f "$REPORT_DIR/report-auth.html" ] && echo -e "Auth HTML report: ${YELLOW}$REPORT_DIR/report-auth.html${NC}"
 fi
 echo -e "Log saved to: ${YELLOW}$LOG_FILE${NC}"
 

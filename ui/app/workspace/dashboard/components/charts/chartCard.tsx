@@ -12,9 +12,20 @@ interface ChartCardProps {
 	loading?: boolean;
 	testId?: string;
 	className?: string;
+	// Let the card grow to its content instead of the fixed chart height. Needed
+	// by cards that render a ranked legend under the plot. This has to be a prop
+	// rather than an `h-full` in `className`: cn() merges per variant, so a
+	// caller class only cancels the unprefixed height and leaves `sm:h-[330px]`
+	// in place, which clips the legend at the sm breakpoint and up.
+	autoHeight?: boolean;
 	total?: ReactNode;
 	totalLabel?: string;
 	totalTooltip?: ReactNode;
+	// Optional second labeled total rendered beside the first (e.g. actual vs
+	// attributed request counts).
+	secondaryTotal?: ReactNode;
+	secondaryTotalLabel?: string;
+	secondaryTotalTooltip?: ReactNode;
 }
 
 function TotalChip({
@@ -61,6 +72,9 @@ function Header({
 	total,
 	totalLabel,
 	totalTooltip,
+	secondaryTotal,
+	secondaryTotalLabel,
+	secondaryTotalTooltip,
 	testId,
 }: {
 	title: string;
@@ -69,9 +83,13 @@ function Header({
 	total?: ReactNode;
 	totalLabel?: string;
 	totalTooltip?: ReactNode;
+	secondaryTotal?: ReactNode;
+	secondaryTotalLabel?: string;
+	secondaryTotalTooltip?: ReactNode;
 	testId?: string;
 }) {
 	const hasTotal = total !== undefined && total !== null;
+	const hasSecondaryTotal = secondaryTotal !== undefined && secondaryTotal !== null;
 	const hasActionRow = hasTotal || controls;
 	return (
 		<div className="shrink-0 space-y-2">
@@ -79,9 +97,22 @@ function Header({
 				<span className="text-primary text-sm font-medium">{title}</span>
 			</div>
 			{hasActionRow && (
-				<div className="flex h-7 w-full min-w-0 items-center justify-between gap-3" data-testid={testId ? `${testId}-actions` : undefined}>
+				<div
+					className="flex min-h-7 w-full min-w-0 flex-wrap items-center justify-between gap-2 sm:gap-3"
+					data-testid={testId ? `${testId}-actions` : undefined}
+				>
 					{hasTotal ? (
-						<TotalChip total={total} totalLabel={totalLabel} totalTooltip={totalTooltip} testId={testId} />
+						<div className="flex min-w-0 items-center gap-5">
+							<TotalChip total={total} totalLabel={totalLabel} totalTooltip={totalTooltip} testId={testId} />
+							{hasSecondaryTotal && (
+								<TotalChip
+									total={secondaryTotal}
+									totalLabel={secondaryTotalLabel}
+									totalTooltip={secondaryTotalTooltip}
+									testId={testId ? `${testId}-secondary` : undefined}
+								/>
+							)}
+						</div>
 					) : (
 						<span className="shrink-0" />
 					)}
@@ -104,10 +135,19 @@ export function ChartCard({
 	total,
 	totalLabel,
 	totalTooltip,
+	secondaryTotal,
+	secondaryTotalLabel,
+	secondaryTotalTooltip,
+	autoHeight,
 }: ChartCardProps) {
+	const heightClass = autoHeight ? "h-auto" : "h-[260px] sm:h-[330px]";
+	// An auto-height card has no height for the skeleton's `h-full` to resolve
+	// against, so the loading state keeps the fixed height as a floor.
+	const loadingHeightClass = autoHeight ? "h-auto min-h-[260px] sm:min-h-[330px]" : heightClass;
+
 	if (loading) {
 		return (
-			<Card className={cn("min-w-0 rounded-sm p-2 shadow-none h-[330px]", className)} data-testid={testId}>
+			<Card className={cn("min-w-0 rounded-sm p-2 shadow-none", loadingHeightClass, className)} data-testid={testId}>
 				<Header
 					title={title}
 					controls={controls}
@@ -115,6 +155,9 @@ export function ChartCard({
 					total={total}
 					totalLabel={totalLabel}
 					totalTooltip={totalTooltip}
+					secondaryTotal={secondaryTotal}
+					secondaryTotalLabel={secondaryTotalLabel}
+					secondaryTotalTooltip={secondaryTotalTooltip}
 					testId={testId}
 				/>
 				<div className="grow" data-testid={testId ? `${testId}-chart-skeleton` : undefined}>
@@ -125,7 +168,7 @@ export function ChartCard({
 	}
 
 	return (
-		<Card className={cn("min-w-0 rounded-sm p-2 shadow-none h-[330px]", className)} data-testid={testId}>
+		<Card className={cn("min-w-0 rounded-sm p-2 shadow-none", heightClass, className)} data-testid={testId}>
 			<Header
 				title={title}
 				controls={controls}
@@ -133,6 +176,9 @@ export function ChartCard({
 				total={total}
 				totalLabel={totalLabel}
 				totalTooltip={totalTooltip}
+				secondaryTotal={secondaryTotal}
+				secondaryTotalLabel={secondaryTotalLabel}
+				secondaryTotalTooltip={secondaryTotalTooltip}
 				testId={testId}
 			/>
 			<div className="grow">{children}</div>

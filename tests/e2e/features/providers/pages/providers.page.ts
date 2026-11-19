@@ -4,6 +4,18 @@ import { BasePage } from '../../../core/pages/base.page'
 import { Selectors } from '../../../core/utils/selectors'
 import { fillSelect, waitForNetworkIdle } from '../../../core/utils/test-helpers'
 
+const resetPeriodLabels: Record<string, string> = {
+  '1m': 'Every Minute',
+  '5m': 'Every 5 Minutes',
+  '15m': 'Every 15 Minutes',
+  '30m': 'Every 30 Minutes',
+  '1h': 'Hourly',
+  '6h': 'Every 6 Hours',
+  '1d': 'Daily',
+  '1w': 'Weekly',
+  '1M': 'Monthly',
+}
+
 export type { CustomProviderConfig, ProviderKeyConfig }
 
 /**
@@ -17,6 +29,8 @@ export class ProvidersPage extends BasePage {
   readonly addProviderOptionCustom: Locator
   readonly addKeyBtn: Locator
   readonly keysTable: Locator
+  /** Provider-level "Refresh model list" button in the keys table header */
+  readonly refreshProviderModelsBtn: Locator
 
   // Custom provider sheet
   readonly customProviderSheet: Locator
@@ -45,6 +59,7 @@ export class ProvidersPage extends BasePage {
     // Keys table
     this.addKeyBtn = page.getByTestId('add-key-btn')
     this.keysTable = page.getByTestId('keys-table')
+    this.refreshProviderModelsBtn = page.getByTestId('provider-refresh-models')
 
     // Custom provider sheet
     this.customProviderSheet = page.getByTestId('custom-provider-sheet')
@@ -134,6 +149,224 @@ export class ProvidersPage extends BasePage {
   }
 
   /**
+   * Add an OAuth-minted key (client credentials) to the currently selected openai-based provider.
+   * The token endpoint is never contacted at save time, so any https URL works here.
+   */
+  async addOAuthClientCredentialsKey(config: {
+    name: string
+    tokenUrl: string
+    clientId: string
+    clientSecret: string
+    scopes?: string[]
+    audience?: string
+    credentialPlacement?: 'header' | 'body'
+  }): Promise<void> {
+    await this.dismissToasts()
+    await this.addKeyBtn.click()
+    await expect(this.keyForm).toBeVisible()
+
+    await this.page.getByLabel('Name').fill(config.name)
+    await this.page.getByTestId('apikey-openai-oauth-tab').click()
+    await this.page.getByTestId('key-input-oauth-token-url').fill(config.tokenUrl)
+    await this.page.getByTestId('key-input-oauth-client-id').fill(config.clientId)
+    await this.page.getByTestId('key-input-oauth-client-secret').fill(config.clientSecret)
+    if (config.credentialPlacement) {
+      await this.page.getByTestId('key-select-oauth-auth-style').click()
+      const label = config.credentialPlacement === 'body' ? /Form body/i : /Authorization header/i
+      await this.page.getByRole('option', { name: label }).click()
+    }
+    await this.fillOAuthScopes(config.scopes)
+    if (config.audience !== undefined) {
+      await this.page.getByTestId('key-input-oauth-cc-audience').fill(config.audience)
+    }
+
+    await this.keySaveBtn.click()
+    await this.waitForSuccessToast()
+    await expect(this.keyForm).not.toBeVisible({ timeout: 5000 })
+    await waitForNetworkIdle(this.page)
+  }
+
+  /**
+   * Open a new GitHub Copilot key and start Sign in with GitHub. The caller mocks the gateway's
+   * sign-in endpoints and saves the key.
+   */
+  async startCopilotSignIn(config: { name: string }): Promise<void> {
+    await this.dismissToasts()
+    await this.addKeyBtn.click()
+    await expect(this.keyForm).toBeVisible()
+
+    await this.page.getByLabel('Name').fill(config.name)
+    await this.page.getByTestId('copilot-sign-in-button').click()
+  }
+
+  /**
+   * Add a key that mints its bearer with the RFC 7523 JWT bearer grant.
+   * Only fields the caller sets are filled, so the form's defaults (RS256, subject = issuer,
+   * 300s lifetime) are exercised when they are left out.
+   */
+  async addOAuthJWTBearerKey(config: {
+    name: string
+    tokenUrl: string
+    privateKeyPem: string
+    issuer: string
+    audience: string
+    subject?: string
+    keyId?: string
+    signingAlgorithm?: string
+    assertionLifetimeSeconds?: number
+    scopes?: string[]
+  }): Promise<void> {
+    await this.dismissToasts()
+    await this.addKeyBtn.click()
+    await expect(this.keyForm).toBeVisible()
+
+    await this.page.getByLabel('Name').fill(config.name)
+    await this.page.getByTestId('apikey-openai-oauth-tab').click()
+    await this.page.getByTestId('key-select-oauth-grant-type').click()
+    await this.page.getByRole('option', { name: /JWT bearer/i }).click()
+    await this.page.getByTestId('key-input-oauth-token-url').fill(config.tokenUrl)
+    await this.page.getByTestId('key-input-oauth-private-key').fill(config.privateKeyPem)
+    await this.page.getByTestId('key-input-oauth-issuer').fill(config.issuer)
+    await this.page.getByTestId('key-input-oauth-audience').fill(config.audience)
+    if (config.subject !== undefined) {
+      await this.page.getByTestId('key-input-oauth-subject').fill(config.subject)
+    }
+    if (config.keyId !== undefined) {
+      await this.page.getByTestId('key-input-oauth-key-id').fill(config.keyId)
+    }
+    if (config.signingAlgorithm) {
+      await this.page.getByTestId('key-select-oauth-signing-algorithm').click()
+      await this.page.getByRole('option', { name: config.signingAlgorithm, exact: true }).click()
+    }
+    if (config.assertionLifetimeSeconds !== undefined) {
+      await this.page.getByTestId('key-input-oauth-assertion-lifetime').fill(String(config.assertionLifetimeSeconds))
+    }
+    await this.fillOAuthScopes(config.scopes)
+
+    await this.keySaveBtn.click()
+    await this.waitForSuccessToast()
+    await expect(this.keyForm).not.toBeVisible({ timeout: 5000 })
+    await waitForNetworkIdle(this.page)
+  }
+
+  /**
+   * Open the key editor for an existing key and leave it on screen.
+   */
+  async openKeyEditor(keyName: string): Promise<void> {
+    const keyRow = this.getKeyRow(keyName)
+    await keyRow.scrollIntoViewIfNeeded()
+    const menuBtn = keyRow.locator('button').filter({ has: this.page.locator('svg') }).last()
+    await menuBtn.waitFor({ state: 'visible', timeout: 5000 })
+    await menuBtn.click()
+    await this.page.getByRole('menuitem', { name: /Edit/i }).click()
+    await expect(this.keyForm).toBeVisible()
+  }
+
+  /**
+   * Edit an OAuth-minted key: the editor must reopen on the OAuth tab (detected from the
+   * stored block) and the masked credentials are left untouched so the save sends them back.
+   */
+  async editOAuthKey(keyName: string, updates: { audience?: string; scopes?: string[] }): Promise<void> {
+    await this.openKeyEditor(keyName)
+    await expect(this.page.getByTestId('apikey-openai-oauth-tab')).toHaveAttribute('data-state', 'active')
+
+    if (updates.audience !== undefined) {
+      const audience = this.page.getByTestId('key-input-oauth-cc-audience')
+      await audience.clear()
+      await audience.fill(updates.audience)
+    }
+    await this.fillOAuthScopes(updates.scopes)
+
+    await this.keySaveBtn.click()
+    await this.waitForSuccessToast()
+    await expect(this.keyForm).not.toBeVisible({ timeout: 5000 })
+    await waitForNetworkIdle(this.page)
+  }
+
+  /**
+   * Reopen an OAuth-minted key and move it back to a static API key.
+   */
+  async switchOAuthKeyToApiKey(keyName: string, apiKey: string): Promise<void> {
+    await this.openKeyEditor(keyName)
+    await expect(this.page.getByTestId('apikey-openai-oauth-tab')).toHaveAttribute('data-state', 'active')
+    await this.page.getByTestId('apikey-openai-api-key-tab').click()
+    await this.page.getByLabel('API Key').fill(apiKey)
+
+    await this.keySaveBtn.click()
+    await this.waitForSuccessToast()
+    await expect(this.keyForm).not.toBeVisible({ timeout: 5000 })
+    await waitForNetworkIdle(this.page)
+  }
+
+  /**
+   * Add a key that federates through Anthropic Workload Identity Federation, reading its identity
+   * token from a file, to the currently selected anthropic-based provider. No token exchange runs
+   * at save time, so the IDs and the path only need to be present.
+   */
+  async addAnthropicWorkloadIdentityKey(config: {
+    name: string
+    federationRuleId: string
+    organizationId: string
+    serviceAccountId: string
+    workspaceId?: string
+    identityTokenFile: string
+  }): Promise<void> {
+    await this.dismissToasts()
+    await this.addKeyBtn.click()
+    await expect(this.keyForm).toBeVisible()
+
+    await this.page.getByLabel('Name').fill(config.name)
+    await this.page.getByTestId('apikey-anthropic-workload-identity-tab').click()
+    await this.page.getByTestId('key-input-anthropic-wif-federation-rule-id').fill(config.federationRuleId)
+    await this.page.getByTestId('key-input-anthropic-wif-organization-id').fill(config.organizationId)
+    await this.page.getByTestId('key-input-anthropic-wif-service-account-id').fill(config.serviceAccountId)
+    if (config.workspaceId !== undefined) {
+      await this.page.getByTestId('key-input-anthropic-wif-workspace-id').fill(config.workspaceId)
+    }
+    // Token File is the default source, so its path input is already on screen.
+    await expect(this.page.getByTestId('key-select-anthropic-wif-token-source')).toContainText('Token File')
+    await this.page.getByTestId('key-input-anthropic-wif-identity-token-file').fill(config.identityTokenFile)
+
+    await this.keySaveBtn.click()
+    await this.waitForSuccessToast()
+    await expect(this.keyForm).not.toBeVisible({ timeout: 5000 })
+    await waitForNetworkIdle(this.page)
+  }
+
+  private async fillOAuthScopes(scopes: string[] | undefined): Promise<void> {
+    for (const scope of scopes ?? []) {
+      await this.page.getByTestId('key-input-oauth-scopes').fill(scope)
+      await this.page.getByTestId('key-input-oauth-scopes').press('Enter')
+    }
+  }
+
+  /**
+   * Add a SageMaker key with explicit AWS credentials to the currently selected sagemaker provider.
+   * Bifrost mints the endpoint bearer token from these locally, so no AWS call is made at save time.
+   */
+  async addSageMakerKey(config: {
+    name: string
+    accessKey: string
+    secretKey: string
+    region: string
+  }): Promise<void> {
+    await this.dismissToasts()
+    await this.addKeyBtn.click()
+    await expect(this.keyForm).toBeVisible()
+
+    await this.page.getByLabel('Name', { exact: true }).fill(config.name)
+    await this.page.getByTestId('apikey-sagemaker-explicit-credentials-tab').click()
+    await this.page.getByTestId('apikey-sagemaker-access-key-input').fill(config.accessKey)
+    await this.page.getByTestId('apikey-sagemaker-secret-key-input').fill(config.secretKey)
+    await this.page.getByTestId('apikey-sagemaker-region-input').fill(config.region)
+
+    await this.keySaveBtn.click()
+    await this.waitForSuccessToast()
+    await expect(this.keyForm).not.toBeVisible({ timeout: 5000 })
+    await waitForNetworkIdle(this.page)
+  }
+
+  /**
    * Add a known provider from the "Add provider" dropdown (e.g. Nebius, OpenAI).
    * Opens the dropdown and clicks the option with data-testid add-provider-option-{name}.
    */
@@ -159,6 +392,14 @@ export class ProvidersPage extends BasePage {
    * Create a custom provider
    */
   async createProvider(config: CustomProviderConfig): Promise<void> {
+    await this.fillCustomProviderForm(config)
+    await this.saveCustomProvider()
+  }
+
+  /**
+   * Open the custom provider sheet and fill name, base format and base URL without saving
+   */
+  async fillCustomProviderForm(config: CustomProviderConfig): Promise<void> {
     await this.openCustomProviderSheet()
 
     // Fill in provider name
@@ -175,7 +416,12 @@ export class ProvidersPage extends BasePage {
     if (config.baseUrl) {
       await this.baseUrlInput.fill(config.baseUrl)
     }
+  }
 
+  /**
+   * Save the open custom provider sheet and wait for it to close
+   */
+  async saveCustomProvider(): Promise<void> {
     // Save the provider
     await this.customProviderSaveBtn.click()
 
@@ -338,6 +584,33 @@ export class ProvidersPage extends BasePage {
   }
 
   /**
+   * Get the per-key "Refresh model list" button for a key row.
+   */
+  getKeyRefreshModelsBtn(keyName: string): Locator {
+    return this.getKeyRow(keyName).getByTestId(`key-refresh-models-${keyName}`)
+  }
+
+  /**
+   * Trigger model discovery for every enabled key of the selected provider.
+   */
+  async refreshProviderModels(): Promise<void> {
+    await this.dismissToasts()
+    await this.refreshProviderModelsBtn.click()
+    await this.waitForSuccessToast('refreshed')
+  }
+
+  /**
+   * Trigger model discovery for a single key.
+   */
+  async refreshKeyModels(keyName: string): Promise<void> {
+    await this.dismissToasts()
+    const refreshBtn = this.getKeyRefreshModelsBtn(keyName)
+    await refreshBtn.scrollIntoViewIfNeeded()
+    await refreshBtn.click()
+    await this.waitForSuccessToast('refreshed')
+  }
+
+  /**
    * Get the count of keys in the table
    */
   async getKeyCount(): Promise<number> {
@@ -367,6 +640,7 @@ export class ProvidersPage extends BasePage {
       gemini: 'Gemini',
       cohere: 'Cohere',
       bedrock: 'AWS Bedrock',
+      typesafe: 'TypeSafe',
     }
     return labels[type] || type
   }
@@ -395,7 +669,7 @@ export class ProvidersPage extends BasePage {
   /**
    * Select a configuration tab
    */
-  async selectConfigTab(tabName: 'network' | 'proxy' | 'performance' | 'governance' | 'debugging'): Promise<void> {
+  async selectConfigTab(tabName: 'network' | 'proxy' | 'performance' | 'governance' | 'debugging' | 'tools'): Promise<void> {
     await this.openConfigSheet()
 
     const tab = this.page.getByTestId(`provider-tab-${tabName}`)
@@ -629,16 +903,53 @@ export class ProvidersPage extends BasePage {
    * Set governance configuration (budget and rate limits)
    */
   async setGovernanceConfig(config: {
-    budgetLimit?: number
+    aligned?: boolean
+    budgets?: Array<{
+      amount?: number
+      resetPeriod?: string
+    }>
     tokenLimit?: number
     requestLimit?: number
   }): Promise<void> {
     await this.selectConfigTab('governance')
 
-    if (config.budgetLimit !== undefined) {
-      const input = this.page.locator('#providerBudgetMaxLimit')
-      await input.clear()
-      await input.fill(String(config.budgetLimit))
+    if (config.budgets) {
+      const budgetLines = this.page.locator('[data-testid^="provider-governance-budgets-line-"]')
+      let existingCount = await budgetLines.count()
+
+      while (existingCount < config.budgets.length) {
+        await this.page.getByTestId('provider-governance-budgets-add-btn').click()
+        existingCount += 1
+      }
+
+      while (existingCount > config.budgets.length) {
+        existingCount -= 1
+        await this.page.getByTestId(`provider-governance-budgets-remove-${existingCount}`).click()
+      }
+
+      for (const [index, budget] of config.budgets.entries()) {
+        const amountInput = this.page.getByTestId(`provider-governance-budgets-amount-${index}`)
+        await amountInput.click()
+        await amountInput.fill('')
+        if (budget.amount !== undefined) {
+          await amountInput.pressSequentially(String(budget.amount))
+        }
+
+        if (budget.resetPeriod) {
+          const budgetLine = this.page.getByTestId(`provider-governance-budgets-line-${index}`)
+          const resetPeriodLabel = resetPeriodLabels[budget.resetPeriod] ?? budget.resetPeriod
+          await budgetLine.getByRole('combobox').click()
+          await this.page.getByRole('option', { name: resetPeriodLabel }).click()
+        }
+      }
+
+      if (config.aligned !== undefined && config.budgets.length > 0) {
+        const switchEl = this.page.getByTestId('provider-governance-calendar-aligned-switch')
+        const isChecked = (await switchEl.getAttribute('data-state')) === 'checked'
+        if (isChecked !== config.aligned) {
+          await switchEl.click()
+        }
+      }
     }
 
     if (config.tokenLimit !== undefined) {

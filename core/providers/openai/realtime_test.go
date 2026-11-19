@@ -1,12 +1,102 @@
 package openai
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/valyala/fasthttp"
 )
+
+func TestRealtimeWebRTCUpstreamErrorPreservesProviderResponse(t *testing.T) {
+	t.Parallel()
+
+	provider := &OpenAIProvider{}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	var resp fasthttp.Response
+	resp.SetStatusCode(fasthttp.StatusUnauthorized)
+	resp.SetBodyString(`{"error":{"message":"Invalid realtime token","type":"invalid_request_error","code":"invalid_realtime_token","param":"token"}}`)
+
+	bifrostErr := provider.realtimeWebRTCUpstreamError(ctx, &resp)
+	if bifrostErr.StatusCode == nil || *bifrostErr.StatusCode != fasthttp.StatusUnauthorized {
+		t.Fatalf("status = %v, want %d", bifrostErr.StatusCode, fasthttp.StatusUnauthorized)
+	}
+	if bifrostErr.Error == nil || bifrostErr.Error.Message != "Invalid realtime token" {
+		t.Fatalf("error = %#v", bifrostErr.Error)
+	}
+	if bifrostErr.Error.Type == nil || *bifrostErr.Error.Type != "invalid_request_error" {
+		t.Fatalf("error type = %v", bifrostErr.Error.Type)
+	}
+	if bifrostErr.Error.Code == nil || *bifrostErr.Error.Code != "invalid_realtime_token" {
+		t.Fatalf("error code = %v", bifrostErr.Error.Code)
+	}
+	if bifrostErr.ExtraFields.RoutingInfo.Provider != schemas.OpenAI || bifrostErr.ExtraFields.RequestType != schemas.RealtimeRequest {
+		t.Fatalf("extra fields = %#v", bifrostErr.ExtraFields)
+	}
+	if bifrostErr.ExtraFields.Provider != schemas.OpenAI { //nolint:staticcheck // deprecated field must stay in sync for backward compatibility
+		t.Fatalf("deprecated provider = %v, want %v", bifrostErr.ExtraFields.Provider, schemas.OpenAI)
+	}
+	if bifrostErr.ExtraFields.RawResponse != nil {
+		t.Fatalf("raw response = %#v, want nil", bifrostErr.ExtraFields.RawResponse)
+	}
+}
+
+func TestExtractRealtimeTurnUsageSupportsTranscriptionCompletion(t *testing.T) {
+	t.Parallel()
+
+	provider := &OpenAIProvider{}
+	usage := provider.ExtractRealtimeTurnUsage([]byte(`{
+		"type":"conversation.item.input_audio_transcription.completed",
+		"usage":{
+			"type":"tokens",
+			"total_tokens":11,
+			"input_tokens":7,
+			"output_tokens":4,
+			"input_token_details":{"text_tokens":2,"audio_tokens":5},
+			"output_token_details":{"text_tokens":4}
+		}
+	}`))
+	if usage == nil {
+		t.Fatal("expected transcription usage")
+	}
+	if usage.PromptTokens != 7 || usage.CompletionTokens != 4 || usage.TotalTokens != 11 {
+		t.Fatalf("usage = %+v, want input=7 output=4 total=11", usage)
+	}
+	if usage.PromptTokensDetails == nil || usage.PromptTokensDetails.AudioTokens != 5 {
+		t.Fatalf("prompt token details = %+v, want audio_tokens=5", usage.PromptTokensDetails)
+	}
+}
+
+func TestExtractRealtimeTurnUsageSupportsDurationTranscriptionCompletion(t *testing.T) {
+	t.Parallel()
+
+	provider := &OpenAIProvider{}
+	usage := provider.ExtractRealtimeTurnUsage([]byte(`{
+		"type":"conversation.item.input_audio_transcription.completed",
+		"usage":{"type":"duration","seconds":3.4}
+	}`))
+	if usage == nil || usage.AudioSeconds == nil || *usage.AudioSeconds != 3.4 {
+		t.Fatalf("usage = %+v, want audio_seconds=3.4", usage)
+	}
+	if usage.PromptTokens != 0 || usage.CompletionTokens != 0 || usage.TotalTokens != 0 {
+		t.Fatalf("usage = %+v, want zero token counts", usage)
+	}
+}
+
+func TestRealtimeWebSocketURL(t *testing.T) {
+	t.Parallel()
+
+	provider := &OpenAIProvider{networkConfig: schemas.NetworkConfig{BaseURL: "https://api.openai.com"}}
+	if got, err := provider.RealtimeWebSocketURL(nil, schemas.Key{}, "gpt-4o transcribe", ""); err != nil || got != "wss://api.openai.com/v1/realtime?model=gpt-4o+transcribe" {
+		t.Fatalf("RealtimeWebSocketURL() = %q, %v", got, err)
+	}
+	if got, err := provider.RealtimeWebSocketURL(nil, schemas.Key{}, "gpt-4o transcribe", "transcription"); err != nil || got != "wss://api.openai.com/v1/realtime?intent=transcription" {
+		t.Fatalf("RealtimeWebSocketURL() = %q, %v", got, err)
+	}
+}
 
 func TestNormalizeRealtimeClientSecretRequest(t *testing.T) {
 	t.Parallel()
@@ -14,7 +104,6 @@ func TestNormalizeRealtimeClientSecretRequest(t *testing.T) {
 	body, model, bifrostErr := NormalizeRealtimeClientSecretRequest(
 		json.RawMessage(`{"model":"openai/gpt-4o-realtime-preview","voice":"alloy"}`),
 		schemas.OpenAI,
-		schemas.RealtimeSessionEndpointClientSecrets,
 	)
 	if bifrostErr != nil {
 		t.Fatalf("NormalizeRealtimeClientSecretRequest() error = %v", bifrostErr)
@@ -43,13 +132,187 @@ func TestNormalizeRealtimeClientSecretRequest(t *testing.T) {
 	}
 }
 
+func TestNormalizeRealtimeClientSecretRequestGATranscriptionSession(t *testing.T) {
+	t.Parallel()
+
+	body, model, bifrostErr := NormalizeRealtimeClientSecretRequest(
+		json.RawMessage(`{"session":{"type":"transcription","audio":{"input":{"transcription":{"model":"openai/gpt-4o-transcribe","language":"en"},"format":{"type":"audio/pcm","rate":24000}}}}}`),
+		schemas.OpenAI,
+	)
+	if bifrostErr != nil {
+		t.Fatalf("NormalizeRealtimeClientSecretRequest() error = %v", bifrostErr)
+	}
+	if model != "gpt-4o-transcribe" {
+		t.Fatalf("model = %q, want %q", model, "gpt-4o-transcribe")
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("failed to unmarshal normalized body: %v", err)
+	}
+
+	var session map[string]json.RawMessage
+	if err := json.Unmarshal(payload["session"], &session); err != nil {
+		t.Fatalf("failed to unmarshal session: %v", err)
+	}
+	if _, hasModel := session["model"]; hasModel {
+		t.Fatal("transcription-type session must not gain a top-level session.model field — not part of RealtimeTranscriptionSessionCreateRequestGA")
+	}
+	var sessionType string
+	if err := json.Unmarshal(session["type"], &sessionType); err != nil || sessionType != "transcription" {
+		t.Fatalf("session.type = %v, want %q", session["type"], "transcription")
+	}
+
+	var audio map[string]json.RawMessage
+	if err := json.Unmarshal(session["audio"], &audio); err != nil {
+		t.Fatalf("failed to unmarshal session.audio: %v", err)
+	}
+	var input map[string]json.RawMessage
+	if err := json.Unmarshal(audio["input"], &input); err != nil {
+		t.Fatalf("failed to unmarshal session.audio.input: %v", err)
+	}
+	var transcription map[string]any
+	if err := json.Unmarshal(input["transcription"], &transcription); err != nil {
+		t.Fatalf("failed to unmarshal session.audio.input.transcription: %v", err)
+	}
+	if transcription["model"] != "gpt-4o-transcribe" {
+		t.Fatalf("session.audio.input.transcription.model = %v, want %q (provider prefix must be stripped)", transcription["model"], "gpt-4o-transcribe")
+	}
+	if transcription["language"] != "en" {
+		t.Fatalf("session.audio.input.transcription.language = %v, want %q (sibling fields must survive)", transcription["language"], "en")
+	}
+	if _, hasFormat := input["format"]; !hasFormat {
+		t.Fatal("session.audio.input.format must survive normalization")
+	}
+}
+
+func TestNormalizeRealtimeClientSecretRequestGATranscriptionSessionNoExplicitType(t *testing.T) {
+	t.Parallel()
+
+	body, model, bifrostErr := NormalizeRealtimeClientSecretRequest(
+		json.RawMessage(`{"session":{"audio":{"input":{"transcription":{"model":"openai/whisper-1"}}}}}`),
+		schemas.OpenAI,
+	)
+	if bifrostErr != nil {
+		t.Fatalf("NormalizeRealtimeClientSecretRequest() error = %v", bifrostErr)
+	}
+	if model != "whisper-1" {
+		t.Fatalf("model = %q, want %q", model, "whisper-1")
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("failed to unmarshal normalized body: %v", err)
+	}
+	var session map[string]json.RawMessage
+	if err := json.Unmarshal(payload["session"], &session); err != nil {
+		t.Fatalf("failed to unmarshal session: %v", err)
+	}
+	var sessionType string
+	if err := json.Unmarshal(session["type"], &sessionType); err != nil || sessionType != "transcription" {
+		t.Fatalf("session.type = %v, want %q (must be inferred and set even when the client omitted it)", session["type"], "transcription")
+	}
+	if _, hasModel := session["model"]; hasModel {
+		t.Fatal("transcription-type session must not gain a top-level session.model field")
+	}
+}
+
+// TestNormalizeRealtimeClientSecretRequestLegacyRootModelWithTranscriptionSibling
+// is a regression test for a codex-review-caught bug: a full realtime
+// session using the legacy top-level "model" field, with live input-audio
+// transcription enabled as a sibling feature, must keep its real
+// conversational model and must not be reclassified as a transcription-only
+// session.
+func TestNormalizeRealtimeClientSecretRequestLegacyRootModelWithTranscriptionSibling(t *testing.T) {
+	t.Parallel()
+
+	body, model, bifrostErr := NormalizeRealtimeClientSecretRequest(
+		json.RawMessage(`{"model":"openai/gpt-4o-realtime-preview","session":{"audio":{"input":{"transcription":{"model":"openai/whisper-1"}}}}}`),
+		schemas.OpenAI,
+	)
+	if bifrostErr != nil {
+		t.Fatalf("NormalizeRealtimeClientSecretRequest() error = %v", bifrostErr)
+	}
+	if model != "gpt-4o-realtime-preview" {
+		t.Fatalf("model = %q, want %q (the real conversational model, not the transcription sibling's)", model, "gpt-4o-realtime-preview")
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("failed to unmarshal normalized body: %v", err)
+	}
+	var session map[string]json.RawMessage
+	if err := json.Unmarshal(payload["session"], &session); err != nil {
+		t.Fatalf("failed to unmarshal session: %v", err)
+	}
+	var sessionModel string
+	if err := json.Unmarshal(session["model"], &sessionModel); err != nil || sessionModel != "gpt-4o-realtime-preview" {
+		t.Fatalf("session.model = %v, want %q", session["model"], "gpt-4o-realtime-preview")
+	}
+	var sessionType string
+	if err := json.Unmarshal(session["type"], &sessionType); err != nil || sessionType != "realtime" {
+		t.Fatalf("session.type = %v, want %q (must not be reclassified as transcription)", session["type"], "realtime")
+	}
+	// The transcription sibling's model survives, with its provider prefix
+	// stripped by StripNestedModelPrefixes (existing behavior for all nested
+	// model fields in a full session, unrelated to which model is used for
+	// routing) — it's a different model than the routing one, just no longer
+	// carrying a Bifrost-style provider prefix upstream wouldn't understand.
+	var audio map[string]json.RawMessage
+	if err := json.Unmarshal(session["audio"], &audio); err != nil {
+		t.Fatalf("failed to unmarshal session.audio: %v", err)
+	}
+	var input map[string]json.RawMessage
+	if err := json.Unmarshal(audio["input"], &input); err != nil {
+		t.Fatalf("failed to unmarshal session.audio.input: %v", err)
+	}
+	var transcription map[string]any
+	if err := json.Unmarshal(input["transcription"], &transcription); err != nil {
+		t.Fatalf("failed to unmarshal session.audio.input.transcription: %v", err)
+	}
+	if transcription["model"] != "whisper-1" {
+		t.Fatalf("session.audio.input.transcription.model = %v, want %q (sibling config survives, prefix stripped, unrelated to routing)", transcription["model"], "whisper-1")
+	}
+}
+
+// TestNormalizeRealtimeClientSecretRequestTranscriptionTypeDropsStaleSessionModel
+// is a regression test for a codex-review-caught bug: when a permissive
+// client sends both session.type=="transcription" AND a stray top-level
+// session.model, the transcription branch must delete it rather than leave
+// an un-stripped, schema-invalid field in the wire body.
+func TestNormalizeRealtimeClientSecretRequestTranscriptionTypeDropsStaleSessionModel(t *testing.T) {
+	t.Parallel()
+
+	body, model, bifrostErr := NormalizeRealtimeClientSecretRequest(
+		json.RawMessage(`{"session":{"type":"transcription","model":"openai/gpt-4o-transcribe","audio":{"input":{"transcription":{}}}}}`),
+		schemas.OpenAI,
+	)
+	if bifrostErr != nil {
+		t.Fatalf("NormalizeRealtimeClientSecretRequest() error = %v", bifrostErr)
+	}
+	if model != "gpt-4o-transcribe" {
+		t.Fatalf("model = %q, want %q", model, "gpt-4o-transcribe")
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("failed to unmarshal normalized body: %v", err)
+	}
+	var session map[string]json.RawMessage
+	if err := json.Unmarshal(payload["session"], &session); err != nil {
+		t.Fatalf("failed to unmarshal session: %v", err)
+	}
+	if _, hasModel := session["model"]; hasModel {
+		t.Fatal("stray session.model must be deleted for a transcription-type session, not left un-stripped in the wire body")
+	}
+}
+
 func TestNormalizeRealtimeClientSecretRequestUsesDefaultProvider(t *testing.T) {
 	t.Parallel()
 
 	body, model, bifrostErr := NormalizeRealtimeClientSecretRequest(
 		json.RawMessage(`{"session":{"model":"gpt-4o-realtime-preview"}}`),
 		schemas.OpenAI,
-		schemas.RealtimeSessionEndpointClientSecrets,
 	)
 	if bifrostErr != nil {
 		t.Fatalf("NormalizeRealtimeClientSecretRequest() error = %v", bifrostErr)
@@ -72,36 +335,6 @@ func TestNormalizeRealtimeClientSecretRequestUsesDefaultProvider(t *testing.T) {
 	}
 	if session["type"] != "realtime" {
 		t.Fatalf("session.type = %v, want %q", session["type"], "realtime")
-	}
-}
-
-func TestNormalizeRealtimeSessionsRequest(t *testing.T) {
-	t.Parallel()
-
-	body, model, bifrostErr := NormalizeRealtimeClientSecretRequest(
-		json.RawMessage(`{"session":{"model":"openai/gpt-4o-realtime-preview","voice":"alloy"}}`),
-		schemas.OpenAI,
-		schemas.RealtimeSessionEndpointSessions,
-	)
-	if bifrostErr != nil {
-		t.Fatalf("NormalizeRealtimeClientSecretRequest() error = %v", bifrostErr)
-	}
-	if model != "gpt-4o-realtime-preview" {
-		t.Fatalf("model = %q, want %q", model, "gpt-4o-realtime-preview")
-	}
-
-	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
-		t.Fatalf("failed to unmarshal normalized body: %v", err)
-	}
-	if _, ok := payload["session"]; ok {
-		t.Fatal("legacy sessions endpoint should not forward nested session object")
-	}
-	if payload["model"] != "gpt-4o-realtime-preview" {
-		t.Fatalf("model = %v, want %q", payload["model"], "gpt-4o-realtime-preview")
-	}
-	if payload["voice"] != "alloy" {
-		t.Fatalf("voice = %v, want %q", payload["voice"], "alloy")
 	}
 }
 
@@ -232,8 +465,13 @@ func TestShouldStartRealtimeTurn(t *testing.T) {
 			want:  true,
 		},
 		{
-			name:  "audio buffer committed starts turn",
+			name:  "audio buffer committed only acknowledges input",
 			event: &schemas.BifrostRealtimeEvent{Type: schemas.RTEventInputAudioBufferCommitted},
+			want:  false,
+		},
+		{
+			name:  "provider response created starts automatic turn",
+			event: &schemas.BifrostRealtimeEvent{Type: schemas.RTEventResponseCreated},
 			want:  true,
 		},
 		{
@@ -604,5 +842,62 @@ func TestInputAudioBufferAppendRoundtrip(t *testing.T) {
 	}
 	if audioStr != b64Audio {
 		t.Fatalf("audio = %q, want %q", audioStr, b64Audio)
+	}
+}
+
+func TestRealtimeWebRTCUpstreamErrorCarriesRetryHint(t *testing.T) {
+	t.Parallel()
+
+	var resp fasthttp.Response
+	resp.SetStatusCode(fasthttp.StatusTooManyRequests)
+	resp.Header.Set("Retry-After", "7")
+	resp.SetBodyString(`{"error":{"message":"slow down"}}`)
+
+	provider := &OpenAIProvider{}
+	bifrostErr := provider.realtimeWebRTCUpstreamError(schemas.NewBifrostContext(nil, schemas.NoDeadline), &resp)
+	// The upstream status is carried through as ParseOpenAIError read it, so the retry
+	// hint sits beside the 429 that gave it meaning rather than a synthetic 502.
+	if bifrostErr.StatusCode == nil {
+		t.Fatalf("StatusCode = nil, want 429")
+	}
+	if *bifrostErr.StatusCode != fasthttp.StatusTooManyRequests {
+		t.Fatalf("StatusCode = %d, want 429", *bifrostErr.StatusCode)
+	}
+	if bifrostErr.Error == nil || bifrostErr.Error.Message != "slow down" {
+		t.Fatalf("Message = %+v, want upstream message", bifrostErr.Error)
+	}
+	if bifrostErr.ExtraFields.RetryAfter != 7000 {
+		t.Fatalf("RetryAfter = %d, want 7000", bifrostErr.ExtraFields.RetryAfter)
+	}
+}
+
+// TestRealtimeSessionVoiceKeepsItsForm pins that a voice name goes upstream as a string, as before
+// the union type, and a custom voice object as an object.
+func TestRealtimeSessionVoiceKeepsItsForm(t *testing.T) {
+	t.Parallel()
+
+	provider := &OpenAIProvider{}
+	for raw, want := range map[string]string{
+		`{"type":"session.update","session":{"voice":"alloy"}}`:            `"voice":"alloy"`,
+		`{"type":"session.update","session":{"voice":{"id":"voice_123"}}}`: `"voice":{"id":"voice_123"}`,
+	} {
+		event, err := schemas.ParseRealtimeEvent([]byte(raw))
+		if err != nil {
+			t.Fatalf("ParseRealtimeEvent(%s) error = %v", raw, err)
+		}
+		out, err := provider.ToProviderRealtimeEvent(event)
+		if err != nil {
+			t.Fatalf("ToProviderRealtimeEvent(%s) error = %v", raw, err)
+		}
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("upstream event = %s, want %s", out, want)
+		}
+	}
+
+	if got := ExtractNestedVoice(json.RawMessage(`{"output":{"voice":"marin"}}`)); got != "marin" {
+		t.Fatalf("ExtractNestedVoice(name) = %q, want marin", got)
+	}
+	if got := ExtractNestedVoice(json.RawMessage(`{"output":{"voice":{"id":"voice_123"}}}`)); got != "voice_123" {
+		t.Fatalf("ExtractNestedVoice(custom) = %q, want voice_123", got)
 	}
 }

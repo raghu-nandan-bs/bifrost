@@ -8,7 +8,7 @@ import (
 )
 
 // ToBifrostListModelsResponse converts an OpenAI list models response to a Bifrost list models response
-func (response *OpenAIListModelsResponse) ToBifrostListModelsResponse(providerKey schemas.ModelProvider, allowedModels schemas.WhiteList, blacklistedModels schemas.BlackList, aliases map[string]string, unfiltered bool) *schemas.BifrostListModelsResponse {
+func (response *OpenAIListModelsResponse) ToBifrostListModelsResponse(providerKey schemas.ModelProvider, allowedModels schemas.WhiteList, blacklistedModels schemas.BlackList, aliases schemas.KeyAliases, unfiltered bool) *schemas.BifrostListModelsResponse {
 	if response == nil {
 		return nil
 	}
@@ -53,6 +53,47 @@ func (response *OpenAIListModelsResponse) ToBifrostListModelsResponse(providerKe
 	return bifrostResponse
 }
 
+// ToBifrostModelRetrieveResponse converts an OpenAI model object to a Bifrost model retrieve response
+func (model *OpenAIModel) ToBifrostModelRetrieveResponse(providerKey schemas.ModelProvider) *schemas.BifrostModelRetrieveResponse {
+	if model == nil {
+		return nil
+	}
+
+	return &schemas.BifrostModelRetrieveResponse{
+		Model: schemas.Model{
+			ID:            string(providerKey) + "/" + model.ID,
+			Created:       model.Created,
+			OwnedBy:       schemas.Ptr(model.OwnedBy),
+			ContextLength: model.ContextWindow,
+			ShutdownDate:  model.ShutdownDate,
+		},
+	}
+}
+
+// ToOpenAIModelRetrieveResponse converts a Bifrost model retrieve response to an OpenAI model object.
+// The ID keeps its provider prefix so this surface agrees with ToOpenAIListModelsResponse.
+func ToOpenAIModelRetrieveResponse(response *schemas.BifrostModelRetrieveResponse) *OpenAIModel {
+	if response == nil {
+		return nil
+	}
+
+	openaiModel := &OpenAIModel{
+		ID:           response.ID,
+		Object:       "model",
+		Created:      response.Created,
+		ShutdownDate: response.ShutdownDate,
+	}
+	if response.OwnedBy != nil {
+		openaiModel.OwnedBy = *response.OwnedBy
+	}
+	if response.ContextLength != nil {
+		openaiModel.ContextWindow = response.ContextLength
+	} else if response.MaxInputTokens != nil {
+		openaiModel.ContextWindow = response.MaxInputTokens // Fallback to MaxInputTokens if ContextLength is not set
+	}
+	return openaiModel
+}
+
 // ToOpenAIListModelsResponse converts a Bifrost list models response to an OpenAI list models response
 func ToOpenAIListModelsResponse(response *schemas.BifrostListModelsResponse) *OpenAIListModelsResponse {
 	if response == nil {
@@ -71,6 +112,11 @@ func ToOpenAIListModelsResponse(response *schemas.BifrostListModelsResponse) *Op
 		}
 		if model.OwnedBy != nil {
 			openaiModel.OwnedBy = *model.OwnedBy
+		}
+		if model.ContextLength != nil {
+			openaiModel.ContextWindow = model.ContextLength
+		} else if model.MaxInputTokens != nil {
+			openaiModel.ContextWindow = model.MaxInputTokens // Fallback to MaxInputTokens if ContextLength is not set
 		}
 
 		openaiResponse.Data = append(openaiResponse.Data, openaiModel)

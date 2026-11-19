@@ -70,7 +70,22 @@ run "schema_url_injected" {
   }
   assert {
     condition     = jsondecode(output.config_json)["$schema"] == "https://www.getbifrost.ai/schema"
-    error_message = "Schema URL should always be injected"
+    error_message = "Schema location should always be injected"
+  }
+}
+
+run "schema_url_override" {
+  command = plan
+  module { source = "./tests/setup" }
+  variables {
+    cloud_provider = "aws"
+    service        = "ecs"
+    region         = "us-east-1"
+    schema_url     = "https://schema.internal/bifrost"
+  }
+  assert {
+    condition     = jsondecode(output.config_json)["$schema"] == "https://schema.internal/bifrost"
+    error_message = "schema_url should override the default schema location"
   }
 }
 
@@ -111,5 +126,21 @@ run "multiple_overrides" {
   assert {
     condition     = jsondecode(output.config_json)["framework"] == "test"
     error_message = "Non-overridden base keys should be preserved"
+  }
+}
+
+run "server_override" {
+  command = plan
+  module { source = "./tests/setup" }
+  variables {
+    cloud_provider = "aws"
+    service        = "ecs"
+    region         = "us-east-1"
+    config_json    = jsonencode({ server = { read_buffer_size = 65536 } })
+    server         = { base_path = "/bifrost" }
+  }
+  assert {
+    condition     = jsondecode(output.config_json)["server"]["base_path"] == "/bifrost"
+    error_message = "server variable should land in config.json as the server block"
   }
 }

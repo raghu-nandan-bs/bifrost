@@ -480,6 +480,12 @@ func (p *MockerPlugin) GetName() string {
 	return PluginName
 }
 
+// HTTPTransportPreAuthHook is a no-op: this plugin does no credential work, so it has
+// nothing to do before the transport authenticates the request (HTTPTransportPlugin interface).
+func (*MockerPlugin) HTTPTransportPreAuthHook(_ *schemas.BifrostContext, _ *schemas.HTTPRequest) (*schemas.HTTPResponse, error) {
+	return nil, nil
+}
+
 // HTTPTransportPreHook is not used for this plugin
 func (p *MockerPlugin) HTTPTransportPreHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest) (*schemas.HTTPResponse, error) {
 	return nil, nil
@@ -490,9 +496,19 @@ func (p *MockerPlugin) HTTPTransportPostHook(ctx *schemas.BifrostContext, req *s
 	return nil
 }
 
+// HTTPTransportResponseHeadersHook leaves response headers unchanged.
+func (p *MockerPlugin) HTTPTransportResponseHeadersHook(_ *schemas.BifrostContext, _ *schemas.HTTPRequest, _ *schemas.HTTPResponseMetadata) error {
+	return nil
+}
+
 // HTTPTransportStreamChunkHook passes through streaming chunks unchanged
 func (p *MockerPlugin) HTTPTransportStreamChunkHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, chunk *schemas.BifrostStreamChunk) (*schemas.BifrostStreamChunk, error) {
 	return chunk, nil
+}
+
+// PreRequestHook implements schemas.LLMPlugin (no-op — required for plugin indexing).
+func (p *MockerPlugin) PreRequestHook(_ *schemas.BifrostContext, _ *schemas.BifrostRequest) error {
+	return nil
 }
 
 // PreLLMHook intercepts requests and applies mocking rules based on configuration
@@ -853,10 +869,10 @@ func (p *MockerPlugin) generateSuccessShortCircuit(req *schemas.BifrostRequest, 
 				},
 			},
 			ExtraFields: schemas.BifrostResponseExtraFields{
-				RequestType:    req.RequestType,
-				Provider:       provider,
+				RequestType:            req.RequestType,
+				Provider:               provider,
 				OriginalModelRequested: model,
-				Latency:        int64(time.Since(startTime).Milliseconds()),
+				Latency:                int64(time.Since(startTime).Milliseconds()),
 			},
 		}
 	} else if req.RequestType == schemas.ResponsesRequest {
@@ -877,10 +893,10 @@ func (p *MockerPlugin) generateSuccessShortCircuit(req *schemas.BifrostRequest, 
 				TotalTokens:  usage.TotalTokens,
 			},
 			ExtraFields: schemas.BifrostResponseExtraFields{
-				RequestType:    schemas.ResponsesRequest,
-				Provider:       provider,
+				RequestType:            schemas.ResponsesRequest,
+				Provider:               provider,
 				OriginalModelRequested: model,
-				Latency:        int64(time.Since(startTime).Milliseconds()),
+				Latency:                int64(time.Since(startTime).Milliseconds()),
 			},
 		}
 	} else if req.RequestType == schemas.ResponsesStreamRequest {
@@ -905,10 +921,10 @@ func (p *MockerPlugin) generateSuccessShortCircuit(req *schemas.BifrostRequest, 
 				},
 			},
 			ExtraFields: schemas.BifrostResponseExtraFields{
-				RequestType:    schemas.ResponsesStreamRequest,
-				Provider:       provider,
+				RequestType:            schemas.ResponsesStreamRequest,
+				Provider:               provider,
 				OriginalModelRequested: model,
-				Latency:        int64(time.Since(startTime).Milliseconds()),
+				Latency:                int64(time.Since(startTime).Milliseconds()),
 			},
 		}
 	}
@@ -959,8 +975,8 @@ func (p *MockerPlugin) generateErrorShortCircuit(req *schemas.BifrostRequest, re
 		},
 		AllowFallbacks: allowFallbacks,
 		ExtraFields: schemas.BifrostErrorExtraFields{
-			RequestType:    req.RequestType,
-			Provider:       provider,
+			RequestType:            req.RequestType,
+			Provider:               provider,
 			OriginalModelRequested: model,
 		},
 	}
@@ -1083,8 +1099,8 @@ func (p *MockerPlugin) handleDefaultBehavior(req *schemas.BifrostRequest) (*sche
 						},
 					},
 					ExtraFields: schemas.BifrostResponseExtraFields{
-						RequestType:    schemas.ChatCompletionRequest,
-						Provider:       provider,
+						RequestType:            schemas.ChatCompletionRequest,
+						Provider:               provider,
 						OriginalModelRequested: model,
 					},
 				},

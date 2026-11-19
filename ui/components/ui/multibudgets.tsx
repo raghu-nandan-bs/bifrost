@@ -1,15 +1,21 @@
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import NumberAndSelect from "@/components/ui/numberAndSelect";
-import { resetDurationOptions } from "@/lib/constants/governance";
+import QuarterStartSelect from "@/components/ui/quarterStartSelect";
+import { budgetResetDurationOptions } from "@/lib/constants/governance";
 import { Plus, RotateCcw, Trash2 } from "lucide-react";
 import { useMemo } from "react";
+import { useTranslation } from "react-i18next";
 
 export interface BudgetLineEntry {
 	id?: string;
 	max_limit?: number;
 	reset_duration: string;
+	reset_config?: { quarter_start_month?: number };
 }
+
+// Quarterly is the only period with settings beyond the duration itself.
+const isQuarterly = (duration: string) => duration.endsWith("Q");
 
 interface MultiBudgetLinesProps {
 	"data-testid"?: string;
@@ -19,17 +25,24 @@ interface MultiBudgetLinesProps {
 	options?: { label: string; value: string }[];
 	onReset?: () => void;
 	showReset?: boolean;
+	// How many lines this holder can carry; Add Budget disappears once they are all there. Left out
+	// where there is no ceiling - a team, a customer or a virtual key may carry one per reset window.
+	maxLines?: number;
 }
 
 export default function MultiBudgetLines({
 	"data-testid": testId,
-	label = "Budget Configuration",
+	label: labelProp,
 	lines,
 	onChange,
-	options = resetDurationOptions,
+	options = budgetResetDurationOptions,
 	onReset,
 	showReset,
+	maxLines,
 }: MultiBudgetLinesProps) {
+	const { t } = useTranslation("governance");
+	const { t: tModels } = useTranslation("models");
+	const label = labelProp ?? tModels("virtualKeys.budgetConfiguration");
 	// Track which reset durations are already used (for duplicate detection)
 	const usedDurations = useMemo(() => {
 		const counts = new Map<string, number>();
@@ -64,7 +77,17 @@ export default function MultiBudgetLines({
 
 	function updateResetDuration(index: number, value: string) {
 		const updated = [...lines];
-		updated[index] = { ...updated[index], reset_duration: value };
+		// Drop the quarter definition when leaving a quarterly window. The API
+		// rejects reset_config on any other duration, and keeping it would silently
+		// resurrect a start month the operator never re-chose on switching back.
+		const { reset_config, ...rest } = updated[index];
+		updated[index] = isQuarterly(value) ? { ...rest, reset_config, reset_duration: value } : { ...rest, reset_duration: value };
+		onChange(updated);
+	}
+
+	function updateQuarterStartMonth(index: number, quarterStartMonth: number) {
+		const updated = [...lines];
+		updated[index] = { ...updated[index], reset_config: { quarter_start_month: quarterStartMonth } };
 		onChange(updated);
 	}
 
@@ -76,18 +99,20 @@ export default function MultiBudgetLines({
 					{onReset && (showReset ?? true) && (
 						<Button data-testid={`${testId}-reset-btn`} type="button" variant="ghost" size="sm" onClick={onReset}>
 							<RotateCcw className="mr-1 h-3 w-3" />
-							Reset
+							{t("sheet.reset")}
 						</Button>
 					)}
-					<Button data-testid={`${testId}-add-btn`} variant="outline" size="sm" type="button" onClick={addLine}>
-						<Plus className="mr-1 h-3 w-3" />
-						Add Budget
-					</Button>
+					{(maxLines === undefined || lines.length < maxLines) && (
+						<Button data-testid={`${testId}-add-btn`} variant="outline" size="sm" type="button" onClick={addLine}>
+							<Plus className="mr-1 h-3 w-3" />
+							{t("sheet.addBudgetButton")}
+						</Button>
+					)}
 				</div>
 			</div>
 
 			{lines.length === 0 && (
-				<div className="text-muted-foreground rounded-md border border-dashed p-3 text-center text-sm">No budget limits configured.</div>
+				<div className="text-muted-foreground rounded-md border border-dashed p-3 text-center text-sm">{t("sheet.noBudgetLimits")}</div>
 			)}
 
 			{lines.map((line, index) => {
@@ -100,7 +125,7 @@ export default function MultiBudgetLines({
 									id={`${testId}-${index}`}
 									dataTestId={`${testId}-amount-${index}`}
 									labelClassName="font-normal"
-									label="Maximum Spend (USD)"
+									label={t("sheet.maximumSpend")}
 									value={line.max_limit}
 									selectValue={line.reset_duration}
 									onChangeNumber={(value) => updateMaxLimit(index, value)}
@@ -110,19 +135,28 @@ export default function MultiBudgetLines({
 							</div>
 							<Button
 								data-testid={`${testId}-remove-${index}`}
-								aria-label={`Remove budget ${index + 1}`}
+								aria-label={t("sheet.removeBudgetAria", { number: index + 1 })}
 								variant="ghost"
 								size="icon"
 								type="button"
-								className="text-destructive mb-0.5 h-8 w-8 shrink-0"
+								className="text-muted-foreground mb-0.5 h-8 w-8 shrink-0 hover:text-red-400"
 								onClick={() => removeLine(index)}
 							>
 								<Trash2 className="h-4 w-4" />
 							</Button>
 						</div>
-						{isDuplicate && (
-							<p className="text-destructive pl-0.5 text-xs">Duplicate reset period — each budget line must use a different interval.</p>
+						{isQuarterly(line.reset_duration) && (
+							// mr-10 (40px) = the remove button (w-8) + its gap-2, so the fiscal-year
+							// row shares its right edge with the Reset Period select above it.
+							<div className="mr-10">
+								<QuarterStartSelect
+									data-testid={`${testId}-quarter-config-${index}`}
+									value={line.reset_config?.quarter_start_month}
+									onChange={(month) => updateQuarterStartMonth(index, month)}
+								/>
+							</div>
 						)}
+						{isDuplicate && <p className="text-destructive pl-0.5 text-xs">{t("sheet.duplicateResetPeriod")}</p>}
 					</div>
 				);
 			})}

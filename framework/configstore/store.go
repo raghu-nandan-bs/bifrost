@@ -9,6 +9,7 @@ import (
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/framework/logstore"
+	"github.com/maximhq/bifrost/framework/objectstore"
 	"github.com/maximhq/bifrost/framework/vectorstore"
 	"gorm.io/gorm"
 )
@@ -20,10 +21,17 @@ type VirtualKeyQueryParams struct {
 	Search                             string
 	CustomerID                         string
 	TeamID                             string
+	BusinessUnitID                     string // Enterprise-only owner kind; a key names at most one owner, so it ORs with the other two
+	UserID                             string // Enterprise-only: filters to VKs assigned to this user; matches nothing in OSS
 	SortBy                             string // name, budget_spent, created_at, status (default: created_at)
 	Order                              string // asc, desc (default: asc)
 	Export                             bool   // When true, skip default pagination limits (caller controls limit)
 	ExcludeAccessProfileManagedVirtual bool   // When true, exclude VKs managed through enterprise access profiles
+	ExcludeAssignedVirtualKeys         bool   // When true, exclude VKs that already have any user assignment
+	ForUserAssignment                  bool   // When true, exclude VKs assigned to any entity (team, customer, access profile, or user) — intended for user-assignment pickers
+	// MetadataFilters narrows to keys whose metadata has every listed key set to exactly the given
+	// value (AND). Keys failing tables.IsValidVirtualKeyMetadataKey match nothing.
+	MetadataFilters map[string]string
 }
 
 // ModelConfigsQueryParams holds pagination, filtering, and search parameters for model configs queries.
@@ -31,6 +39,60 @@ type ModelConfigsQueryParams struct {
 	Limit  int
 	Offset int
 	Search string
+	// Scope optionally filters to an exact scope value (e.g. "global",
+	// "virtual_key").
+	//
+	// Deprecated: use Scopes, which can carry more than one. Kept so existing
+	// callers of this published module keep compiling and behaving identically; a
+	// value set here is OR-ed together with anything in Scopes.
+	Scope string
+	// Scopes optionally filters to one or more exact scope values. Several values
+	// are OR-ed, which lets a UI present one filter option covering scopes a user
+	// thinks of as the same thing — e.g. rows scoped to a user directly and rows
+	// materialized onto them from an access profile. Empty (with Scope also empty)
+	// means no scope filter.
+	Scopes   []string
+	ScopeID  string // optional; filters to an exact scope target (e.g. a virtual key or user ID)
+	Provider string // optional; filters to an exact provider value (e.g. "openai")
+}
+
+// effectiveScopes returns the scope values to filter on, merging the deprecated
+// single Scope with Scopes and dropping blanks and duplicates. Returns nil when
+// neither is set, meaning "no scope filter".
+func (p ModelConfigsQueryParams) effectiveScopes() []string {
+	seen := make(map[string]struct{}, len(p.Scopes)+1)
+	out := make([]string, 0, len(p.Scopes)+1)
+	for _, s := range append([]string{p.Scope}, p.Scopes...) {
+		if s == "" {
+			continue
+		}
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// SkillListQueryParams holds pagination, filtering, and search parameters for skill repository queries.
+type SkillListQueryParams struct {
+	Limit  int
+	Offset int
+	Search string
+	SortBy string // name, updated_at, created_at (default: created_at)
+	Order  string // asc, desc (default: desc)
+}
+
+type SkillVersionListQueryParams struct {
+	Limit  int
+	Offset int
+	SortBy string // version, created_at (default: created_at)
+	Order  string // asc, desc (default: desc)
+	Search string // substring match on the version string (optional)
 }
 
 // RoutingRulesQueryParams holds pagination, filtering, and search parameters for routing rules queries.
@@ -40,11 +102,71 @@ type RoutingRulesQueryParams struct {
 	Search string
 }
 
+// WebhookEndpointsQueryParams holds pagination, filtering, and search
+// parameters for webhook endpoint queries.
+type WebhookEndpointsQueryParams struct {
+	Limit    int
+	Offset   int
+	Search   string   // matches name or url (case-insensitive)
+	Events   []string // endpoints subscribed to any of these events, OR semantics
+	Disabled *bool    // nil = no filter; true/false = filter on disabled
+}
+
 // MCPClientsQueryParams holds pagination, filtering, and search parameters for MCP client queries.
 type MCPClientsQueryParams struct {
-	Limit  int
-	Offset int
-	Search string
+	Limit            int
+	Offset           int
+	Search           string   // matches name (case-insensitive)
+	ClientID         string   // exact client_id match
+	ConnectionTypes  []string // exact connection_type filter(s), OR semantics (http | sse | stdio)
+	AuthTypes        []string // exact auth_type filter(s), OR semantics (none | headers | oauth | per_user_oauth | per_user_headers)
+	IsCodeModeClient *bool    // nil = no filter; true/false = filter on is_code_mode_client
+	Disabled         *bool    // nil = no filter; true/false = filter on disabled
+
+	// Runtime connection-state filter. State is not persisted, so the caller
+	// resolves the set of currently-connected client_ids from the engine and
+	// passes it here. StateInclude nil = no filter; true = client_id IN set
+	// (connected); false = client_id NOT IN set (disconnected).
+	StateClientIDs []string
+	StateInclude   *bool
+
+	// Virtual-key access filter (OR semantics within the group). When both are
+	// set, a client matches if it is open to all VKs OR explicitly assigned to
+	// one of VirtualKeyIDs.
+	OnlyAllowedByDefault bool     // include clients allowed by default (column allow_on_all_virtual_keys)
+	VirtualKeyIDs        []string // include clients explicitly assigned to any of these VK IDs
+}
+
+// VirtualMCPsQueryParams holds pagination and search parameters for Virtual MCP list queries.
+type VirtualMCPsQueryParams struct {
+	Limit       int
+	Offset      int
+	Search      string // matches name (case-insensitive)
+	MCPClientID string // only Virtual MCPs with a tool spec for this exact client_id
+}
+
+// MCPLibraryQueryParams holds pagination, filtering, search, and sort
+// parameters for MCP library catalog queries. All fields are optional — an
+// empty struct returns the first default-sized page ordered by name.
+type MCPLibraryQueryParams struct {
+	Limit           int
+	Offset          int
+	Search          string   // matches name/description/publisher (case-insensitive)
+	Categories      []string // exact category filter(s), OR semantics
+	ConnectionTypes []string // exact connection_type filter(s) (http | stdio | sse)
+	AuthTypes       []string // exact auth_type filter(s)
+	Tags            []string // match rows carrying any of these tags
+	SortBy          string   // name, category, publisher, created_at, updated_at (default: name)
+	Order           string   // asc, desc (default: asc)
+}
+
+// MCPLibraryFilterData holds the distinct facet values surfaced by the filter
+// sidebar on the MCP library page. Populated via GetMCPLibraryFilterData.
+type MCPLibraryFilterData struct {
+	Categories      []string `json:"categories"`
+	ConnectionTypes []string `json:"connection_types"`
+	AuthTypes       []string `json:"auth_types"`
+	Tags            []string `json:"tags"`
 }
 
 // TeamsQueryParams holds pagination, filtering, and search parameters for team queries.
@@ -76,10 +198,20 @@ type CustomersQueryParams struct {
 // the virtual key's id/name (joined). Empty filter slices match all
 // values for that field.
 type MCPSessionsFilterParams struct {
-	Search       string
-	Statuses     []string
-	AuthModes    []string // matched against auth_mode (tokens, credentials) or flow_mode (sessions, flows)
-	MCPClientIDs []string
+	Search        string
+	Statuses      []string
+	AuthModes     []string // matched against auth_mode (tokens, credentials) or flow_mode (sessions, flows)
+	MCPClientIDs  []string
+	VirtualKeyIDs []string // exact-match against virtual_key_id; only meaningful for vk-mode rows
+	UserIDs       []string // exact-match against user_id; only meaningful for user-mode rows
+	// Identity exact-matches a single resolved identity value against any of
+	// the row's identity columns (user_id, virtual_key_id, session_id). Unlike
+	// Search it is not a substring match — it pins the list to exactly one
+	// user, virtual key, or session. Typically paired with AuthModes to scope
+	// to that identity's rows for a known mode. Distinct from UserIDs above:
+	// this is a single value used for deep-linking to one identity (e.g. the
+	// OAuth grants table's "View sessions" action), not a multi-select facet.
+	Identity string
 	// MatchedUserIDs is an optional set of user_ids that should be treated
 	// as a positive search hit alongside Search. Callers that maintain a
 	// user directory (display names, emails) resolve the search string
@@ -91,9 +223,37 @@ type MCPSessionsFilterParams struct {
 	MatchedUserIDs []string
 }
 
+// MCPPerUserDiscoveryBinding names one caller's discovery on one MCP client:
+// the (mode, identity, client) binding the discovery shares with the
+// credential it was made with.
+type MCPPerUserDiscoveryBinding struct {
+	Mode        schemas.MCPAuthMode
+	Identity    string
+	MCPClientID string
+}
+
+// OAuth2SessionsQueryParams holds the filters + pagination for the OAuth2
+// grants list (Connected Clients UI). Search is a case-insensitive substring
+// matched against the client name/id, the bound identity (bf_sub), and the
+// joined virtual key name. Modes filters on bf_mode (user/vk/session); an
+// empty slice matches all. Limit/Offset paginate the filtered result in SQL.
+type OAuth2SessionsQueryParams struct {
+	Search string
+	Modes  []string
+	// VirtualKeyIDs/UserIDs exact-match bf_sub, scoped to rows of the
+	// matching bf_mode (there is no separate identity column to filter on —
+	// bf_sub is a single generic subject disambiguated only by bf_mode). Both
+	// may be set together: a row matches if it hits either scoped set.
+	VirtualKeyIDs []string
+	UserIDs       []string
+	Limit         int
+	Offset        int
+}
+
 // PricingOverrideFilters holds the filters for pricing overrides.
 type PricingOverrideFilters struct {
 	ScopeKind     *string
+	UserID        *string
 	VirtualKeyID  *string
 	ProviderID    *string
 	ProviderKeyID *string
@@ -105,6 +265,7 @@ type PricingOverridesQueryParams struct {
 	Offset        int
 	Search        string
 	ScopeKind     *string
+	UserID        *string
 	VirtualKeyID  *string
 	ProviderID    *string
 	ProviderKeyID *string
@@ -157,10 +318,38 @@ type ConfigStore interface {
 	GetMCPClientByID(ctx context.Context, id string) (*tables.TableMCPClient, error)
 	GetMCPClientConfigByID(ctx context.Context, id string) (*schemas.MCPClientConfig, error)
 	GetMCPClientByName(ctx context.Context, name string) (*tables.TableMCPClient, error)
+	// MCPEndpointSlugTaken reports whether a Virtual MCP or MCP client already
+	// serves /mcp/<slug>.
+	MCPEndpointSlugTaken(ctx context.Context, slug string) (bool, error)
+	GetMCPClientByOauthConfigID(ctx context.Context, oauthConfigID string) (*tables.TableMCPClient, error)
+	UpdateMCPClientOAuthConfigID(ctx context.Context, clientID string, oauthConfigID *string) error
+	ClearMCPClientPendingVerification(ctx context.Context, clientID string) error
 	GetMCPClientsPaginated(ctx context.Context, params MCPClientsQueryParams) ([]tables.TableMCPClient, int64, error)
 	CreateMCPClientConfig(ctx context.Context, clientConfig *schemas.MCPClientConfig) error
 	UpdateMCPClientConfig(ctx context.Context, id string, clientConfig *tables.TableMCPClient) error
+	// UpdateMCPClientConfigHash writes only config_hash, and only while it still equals oldHash.
+	UpdateMCPClientConfigHash(ctx context.Context, clientID, oldHash, newHash string) (bool, error)
+	// UpdateMCPClientDiscovery writes only the discovery columns; safe from a background refresh.
+	UpdateMCPClientDiscovery(ctx context.Context, clientID string, discovery *schemas.MCPDiscovery) error
 	DeleteMCPClientConfig(ctx context.Context, id string) error
+
+	// MCP library catalog (synced + org-custom)
+	GetMCPLibraryPaginated(ctx context.Context, params MCPLibraryQueryParams) ([]tables.TableMCPLibrary, int64, error)
+	GetMCPLibraryFilterData(ctx context.Context) (*MCPLibraryFilterData, error)
+	UpsertMCPLibraryEntry(ctx context.Context, entry *tables.TableMCPLibrary, tx ...*gorm.DB) error
+	// CreateCustomMCPLibraryEntry inserts an org-internal ("custom") library row,
+	// replacing a deleted entry with the same slug. Returns ErrAlreadyExists when
+	// the slug collides with a live entry.
+	CreateCustomMCPLibraryEntry(ctx context.Context, entry *tables.TableMCPLibrary) error
+	// SoftDeleteMCPLibraryEntry tombstones a library row by ID (sets deleted_at)
+	// so it is hidden from listings and never resurrected by the remote sync.
+	SoftDeleteMCPLibraryEntry(ctx context.Context, id uint) error
+	// DeleteMCPLibraryEntry removes a library row by ID, hard-deleting "custom"
+	// rows (freeing their slug for re-add) and tombstoning "remote" rows.
+	DeleteMCPLibraryEntry(ctx context.Context, id uint) error
+	// GetProtectedMCPLibrarySlugs returns the slugs the remote sync must not
+	// overwrite or recreate: custom rows and soft-deleted (tombstoned) rows.
+	GetProtectedMCPLibrarySlugs(ctx context.Context) ([]string, error)
 
 	// Vector store config CRUD
 	UpdateVectorStoreConfig(ctx context.Context, config *vectorstore.Config) error
@@ -173,6 +362,33 @@ type ConfigStore interface {
 	// Config CRUD
 	GetConfig(ctx context.Context, key string) (*tables.TableGovernanceConfig, error)
 	UpdateConfig(ctx context.Context, config *tables.TableGovernanceConfig, tx ...*gorm.DB) error
+	// GetComplexityAnalyzerConfig retrieves the persisted analyzer config, if configured.
+	GetComplexityAnalyzerConfig(ctx context.Context) (*ComplexityAnalyzerConfig, error)
+	// UpdateComplexityAnalyzerConfig persists the normalized analyzer config.
+	UpdateComplexityAnalyzerConfig(ctx context.Context, config *ComplexityAnalyzerConfig, tx ...*gorm.DB) error
+	// ResetComplexityAnalyzerConfig restores the tier boundaries and phrase lists from the
+	// supplied defaults, preserves every other section of the stored record, and returns what
+	// was persisted. Read and save share one transaction so a concurrent edit to a preserved
+	// section cannot be overwritten.
+	ResetComplexityAnalyzerConfig(ctx context.Context, defaults *ComplexityAnalyzerConfig) (*ComplexityAnalyzerConfig, error)
+
+	// Model routers CRUD.
+	GetModelRouters(ctx context.Context) ([]ModelRouter, error)
+	GetModelRouter(ctx context.Context, id string) (*ModelRouter, error)
+	CreateModelRouter(ctx context.Context, router *ModelRouter, tx ...*gorm.DB) error
+	UpdateModelRouter(ctx context.Context, router *ModelRouter, tx ...*gorm.DB) error
+	// EditModelRouter applies edit to the stored router under its row lock and
+	// saves what edit changed; see RDBConfigStore.EditModelRouter.
+	EditModelRouter(ctx context.Context, id string, edit func(*ModelRouter) (bool, error)) (*ModelRouter, error)
+	DeleteModelRouter(ctx context.Context, id string, tx ...*gorm.DB) error
+	ResetModelRouter(ctx context.Context, id string, defaults *ComplexityAnalyzerConfig) (*ModelRouter, error)
+	// SetModelRouterTargets replaces the model each tier of a saved router gets.
+	SetModelRouterTargets(ctx context.Context, routerID string, targets []tables.TableModelRouterTarget, tx ...*gorm.DB) error
+	// SetModelRouterRouting replaces which requests a saved router takes.
+	SetModelRouterRouting(ctx context.Context, routerID string, routing ModelRouterRouting, tx ...*gorm.DB) error
+	// SetModelRouterRoutings replaces several routers' routing in one
+	// transaction, checking priorities on the final state.
+	SetModelRouterRoutings(ctx context.Context, changes []ModelRouterRoutingChange, tx ...*gorm.DB) error
 
 	// Plugins CRUD
 	GetPlugins(ctx context.Context) ([]*tables.TablePlugin, error)
@@ -185,6 +401,12 @@ type ConfigStore interface {
 	// Governance config CRUD
 	GetVirtualKeys(ctx context.Context) ([]tables.TableVirtualKey, error)
 	GetVirtualKeysPaginated(ctx context.Context, params VirtualKeyQueryParams) ([]tables.TableVirtualKey, int64, error)
+	// ListExpiredVirtualKeysForDeletion returns keys whose expiry has passed and whose
+	// delete_after_expire is true, or unset when includeUnset is true.
+	ListExpiredVirtualKeysForDeletion(ctx context.Context, now time.Time, includeUnset bool) ([]tables.TableVirtualKey, error)
+	// DeleteExpiredVirtualKey deletes the key only if it is still expired and eligible
+	// under the row lock, returning the deleted row, or nil when it no longer qualifies.
+	DeleteExpiredVirtualKey(ctx context.Context, id string, now time.Time, includeUnset bool) (*tables.TableVirtualKey, error)
 	GetRedactedVirtualKeys(ctx context.Context, ids []string) ([]tables.TableVirtualKey, error) // leave ids empty to get all
 	GetVirtualKey(ctx context.Context, id string) (*tables.TableVirtualKey, error)
 	GetVirtualKeyByValue(ctx context.Context, value string) (*tables.TableVirtualKey, error)
@@ -192,10 +414,48 @@ type ConfigStore interface {
 	CreateVirtualKey(ctx context.Context, virtualKey *tables.TableVirtualKey, tx ...*gorm.DB) error
 	UpdateVirtualKey(ctx context.Context, virtualKey *tables.TableVirtualKey, tx ...*gorm.DB) error
 	DeleteVirtualKey(ctx context.Context, id string, tx ...*gorm.DB) error
+	ReplaceVirtualKeyAgentGrants(ctx context.Context, virtualKeyID string, agentNames []string, tx ...*gorm.DB) error
+	ReplaceVirtualKeyRelayGrants(ctx context.Context, virtualKeyID string, endpointNames []string, tx ...*gorm.DB) error
+
+	// Relay CRUD.
+	ListRelays(ctx context.Context) ([]*schemas.RelayConfig, error)
+	GetRelay(ctx context.Context, name string) (*schemas.RelayConfig, error)
+	CreateRelay(ctx context.Context, cfg *schemas.RelayConfig, configHash string) error
+	UpdateRelay(ctx context.Context, cfg *schemas.RelayConfig, configHash string) error
+	DeleteRelay(ctx context.Context, name string) error
+	GetRelayConfigHashes(ctx context.Context) (map[string]string, error)
+	GetRelayGrantedVirtualKeyIDs(ctx context.Context, name string) ([]string, error)
+
+	// Agent Gateway registration CRUD. Declared on the interface (not just the
+	// RDB implementation) so wrappers that embed ConfigStore — like the
+	// enterprise config store — forward them and still satisfy agent.Store.
+	CreateAgentRegistration(ctx context.Context, registration *schemas.AgentRegistration) error
+	UpdateAgentRegistration(ctx context.Context, registration *schemas.AgentRegistration) error
+	ListAgentRegistrations(ctx context.Context) ([]schemas.AgentRegistration, error)
+	GetAgentRegistration(ctx context.Context, name string) (*schemas.AgentRegistration, error)
+	DeleteAgentRegistration(ctx context.Context, name string) error
+
+	// Agent Gateway push relay persistence, mirroring agent.PushStore for the
+	// same wrapper-forwarding reason as the registration CRUD above.
+	SaveAgentPushConfig(ctx context.Context, config *schemas.AgentPushConfig) error
+	BindAgentPushConfigTask(ctx context.Context, agentName, ingressTokenHash, pendingTaskID, taskID string) error
+	GetAgentPushConfig(ctx context.Context, agentName, taskID, configID string) (*schemas.AgentPushConfig, error)
+	GetAgentPushConfigByIngressTokenHash(ctx context.Context, agentName, hash string) (*schemas.AgentPushConfig, error)
+	ListAgentPushConfigs(ctx context.Context, agentName, taskID string) ([]schemas.AgentPushConfig, error)
+	ListAgentPushConfigsPaginated(ctx context.Context, query schemas.AgentPushConfigQuery) ([]schemas.AgentPushConfig, int64, error)
+	ListAgentPushConfigAgentNames(ctx context.Context) ([]string, error)
+	DeleteAgentPushConfig(ctx context.Context, agentName, taskID, configID string) (bool, error)
+	DeletePendingAgentPushConfig(ctx context.Context, agentName, ingressTokenHash, pendingTaskID string) (bool, error)
+	CreateAgentPushDeliveryIfNotExists(ctx context.Context, delivery *schemas.AgentPushDelivery) (bool, error)
+	ListDueAgentPushDeliveries(ctx context.Context, now time.Time, limit int) ([]schemas.AgentPushDelivery, error)
+	ClaimAgentPushDelivery(ctx context.Context, id, runnerID string, leaseUntil time.Time) (*schemas.AgentPushDelivery, error)
+	UpdateAgentPushDeliveryOutcome(ctx context.Context, delivery *schemas.AgentPushDelivery, runnerID string, leaseUntil time.Time) error
+	PruneAgentPushDeliveries(ctx context.Context, before time.Time) error
 
 	// Virtual key provider config CRUD
 	GetVirtualKeyProviderConfigs(ctx context.Context, virtualKeyID string) ([]tables.TableVirtualKeyProviderConfig, error)
 	CreateVirtualKeyProviderConfig(ctx context.Context, virtualKeyProviderConfig *tables.TableVirtualKeyProviderConfig, tx ...*gorm.DB) error
+	ReplaceVirtualKeyProviderConfigs(ctx context.Context, virtualKeyID string, virtualKeyProviderConfigs []tables.TableVirtualKeyProviderConfig, tx *gorm.DB) error
 	UpdateVirtualKeyProviderConfig(ctx context.Context, virtualKeyProviderConfig *tables.TableVirtualKeyProviderConfig, tx ...*gorm.DB) error
 	DeleteVirtualKeyProviderConfig(ctx context.Context, id uint, tx ...*gorm.DB) error
 
@@ -208,23 +468,49 @@ type ConfigStore interface {
 	UpdateVirtualKeyMCPConfig(ctx context.Context, virtualKeyMCPConfig *tables.TableVirtualKeyMCPConfig, tx ...*gorm.DB) error
 	DeleteVirtualKeyMCPConfig(ctx context.Context, id uint, tx ...*gorm.DB) error
 
+	// GetVirtualMCPs returns every Virtual MCP definition (enabled and disabled), tools decoded, for
+	// the governance cache. GetVirtualMCPAssignments returns each VK's assigned definition IDs, keyed
+	// by VK row ID. Neither is DAC-scoped: holder grant data, not an admin catalog view.
+	GetVirtualMCPs(ctx context.Context) ([]tables.TableVirtualMCP, error)
+	GetVirtualMCPAssignments(ctx context.Context) (map[string][]uint, error)
+
+	// Virtual MCP CRUD. CreateVirtualMCP fills endpoint_slug from the name when unset and enforces
+	// its uniqueness; UpdateVirtualMCP never changes the slug (immutable after creation).
+	CreateVirtualMCP(ctx context.Context, def *tables.TableVirtualMCP) error
+	GetVirtualMCPByID(ctx context.Context, id uint) (*tables.TableVirtualMCP, error)
+	// GetVirtualMCPByName resolves the unique name a declaration refers to. Returns ErrNotFound
+	// when nothing matches.
+	GetVirtualMCPByName(ctx context.Context, name string) (*tables.TableVirtualMCP, error)
+	GetVirtualMCPsPaginated(ctx context.Context, params VirtualMCPsQueryParams) ([]tables.TableVirtualMCP, int64, error)
+	UpdateVirtualMCP(ctx context.Context, def *tables.TableVirtualMCP) error
+	DeleteVirtualMCP(ctx context.Context, id uint) error
+	AttachVirtualMCPToVirtualKey(ctx context.Context, vmcpID uint, virtualKeyID string) error
+	DetachVirtualMCPFromVirtualKey(ctx context.Context, vmcpID uint, virtualKeyID string) error
+	GetVirtualKeyIDsForVirtualMCP(ctx context.Context, vmcpID uint) ([]string, error)
+	// GetVirtualKeyIDsForVirtualMCPs returns assigned virtual-key IDs for a set of Virtual MCPs in one
+	// query, grouped by Virtual MCP ID. Used by the list view to avoid a per-row lookup.
+	GetVirtualKeyIDsForVirtualMCPs(ctx context.Context, vmcpIDs []uint) (map[uint][]string, error)
+	// GetVirtualMCPIDsForVirtualKey returns the IDs of the Virtual MCPs a virtual key is assigned to,
+	// the reverse of GetVirtualKeyIDsForVirtualMCP, so the VK detail view can show its assignments.
+	GetVirtualMCPIDsForVirtualKey(ctx context.Context, virtualKeyID string) ([]uint, error)
+
 	// Team CRUD
 	GetTeams(ctx context.Context, customerID string) ([]tables.TableTeam, error)
 	GetTeamsPaginated(ctx context.Context, params TeamsQueryParams) ([]tables.TableTeam, int64, error)
-	GetTeam(ctx context.Context, id string) (*tables.TableTeam, error)
+	GetTeam(ctx context.Context, id string, tx ...*gorm.DB) (*tables.TableTeam, error)
 	GetTeamByName(ctx context.Context, name string, customerID string) (*tables.TableTeam, error)
 	GetTeamBySourceID(ctx context.Context, sourceID string) (*tables.TableTeam, error)
 	CreateTeam(ctx context.Context, team *tables.TableTeam, tx ...*gorm.DB) error
 	UpdateTeam(ctx context.Context, team *tables.TableTeam, tx ...*gorm.DB) error
-	DeleteTeam(ctx context.Context, id string) error
+	DeleteTeam(ctx context.Context, id string, tx ...*gorm.DB) error
 
 	// Customer CRUD
 	GetCustomers(ctx context.Context) ([]tables.TableCustomer, error)
 	GetCustomersPaginated(ctx context.Context, params CustomersQueryParams) ([]tables.TableCustomer, int64, error)
-	GetCustomer(ctx context.Context, id string) (*tables.TableCustomer, error)
+	GetCustomer(ctx context.Context, id string, tx ...*gorm.DB) (*tables.TableCustomer, error)
 	CreateCustomer(ctx context.Context, customer *tables.TableCustomer, tx ...*gorm.DB) error
 	UpdateCustomer(ctx context.Context, customer *tables.TableCustomer, tx ...*gorm.DB) error
-	DeleteCustomer(ctx context.Context, id string) error
+	DeleteCustomer(ctx context.Context, id string, tx ...*gorm.DB) error
 
 	// Rate limit CRUD
 	GetRateLimits(ctx context.Context) ([]tables.TableRateLimit, error)
@@ -237,12 +523,27 @@ type ConfigStore interface {
 	// Budget CRUD
 	GetBudgets(ctx context.Context) ([]tables.TableBudget, error)
 	GetBudget(ctx context.Context, id string, tx ...*gorm.DB) (*tables.TableBudget, error)
+	// GetVirtualKeyBudgets returns the budgets a virtual key holds directly, through virtual_key_id:
+	// the ones config.json declares inline on the key. Budgets held through a model config are not
+	// included.
+	GetVirtualKeyBudgets(ctx context.Context, virtualKeyID string, tx ...*gorm.DB) ([]tables.TableBudget, error)
+	// GetVirtualKeyProviderConfigBudgets returns the budgets a virtual key provider config holds
+	// directly, through provider_config_id. Budgets held through a model config are not included.
+	GetVirtualKeyProviderConfigBudgets(ctx context.Context, providerConfigID uint, tx ...*gorm.DB) ([]tables.TableBudget, error)
 	CreateBudget(ctx context.Context, budget *tables.TableBudget, tx ...*gorm.DB) error
 	UpdateBudget(ctx context.Context, budget *tables.TableBudget, tx ...*gorm.DB) error
+	// UpdateBudgetOverride updates only the override state and returns the refreshed budget.
+	//
+	// A finite grant is anchored at the budget's current window boundary so every
+	// cluster node derives the same remaining-cycle count from it. calendarAligned
+	// must come from the owning entity (virtual key, team, customer or access
+	// profile) because the budget row does not persist it, and getting it wrong
+	// anchors the grant on the wrong lattice.
+	UpdateBudgetOverride(ctx context.Context, id string, amount float64, mode tables.BudgetOverrideMode, cyclesTotal int, calendarAligned bool, tx ...*gorm.DB) (*tables.TableBudget, error)
 	UpdateBudgets(ctx context.Context, budgets []*tables.TableBudget, tx ...*gorm.DB) error
 	DeleteBudget(ctx context.Context, id string, tx ...*gorm.DB) error
-	UpdateBudgetUsage(ctx context.Context, id string, currentUsage float64) error
-	UpdateRateLimitUsage(ctx context.Context, id string, tokenCurrentUsage int64, requestCurrentUsage int64) error
+	UpdateBudgetUsage(ctx context.Context, id string, currentUsage float64, tx ...*gorm.DB) error
+	UpdateRateLimitUsage(ctx context.Context, id string, tokenCurrentUsage int64, requestCurrentUsage int64, tx ...*gorm.DB) error
 
 	// Routing Rules CRUD
 	GetRoutingRules(ctx context.Context) ([]tables.TableRoutingRule, error)
@@ -252,17 +553,32 @@ type ConfigStore interface {
 	GetRoutingRulesPaginated(ctx context.Context, params RoutingRulesQueryParams) ([]tables.TableRoutingRule, int64, error)
 	CreateRoutingRule(ctx context.Context, rule *tables.TableRoutingRule, tx ...*gorm.DB) error
 	UpdateRoutingRule(ctx context.Context, rule *tables.TableRoutingRule, tx ...*gorm.DB) error
+	// SyncRoutingRules applies a batch of creates and updates atomically, deferring the
+	// unique-priority-per-scope check until all rules are written so that a valid permutation
+	// (e.g. swapping two rules' priorities) succeeds despite a transient intermediate collision.
+	SyncRoutingRules(ctx context.Context, toAdd []tables.TableRoutingRule, toUpdate []tables.TableRoutingRule, tx ...*gorm.DB) error
 	DeleteRoutingRule(ctx context.Context, id string, tx ...*gorm.DB) error
 
 	// Model config CRUD
+	// GetModelConfigs reads every model config with no row-visibility scope. It serves internal
+	// callers that must see all rows (the governance load, the name collision check); a listing
+	// for a caller goes through GetModelConfigsPaginated.
 	GetModelConfigs(ctx context.Context) ([]tables.TableModelConfig, error)
+	GetModelConfigsByScopeAndScopeIDs(ctx context.Context, scope string, scopeIDs []string, tx ...*gorm.DB) ([]tables.TableModelConfig, error)
+	GetProviderGovernanceModelConfigs(ctx context.Context) ([]tables.TableModelConfig, error)
 	GetModelConfigsPaginated(ctx context.Context, params ModelConfigsQueryParams) ([]tables.TableModelConfig, int64, error)
-	GetModelConfig(ctx context.Context, modelName string, provider *string) (*tables.TableModelConfig, error)
+	GetModelConfig(ctx context.Context, scope string, scopeID *string, modelName string, provider *string) (*tables.TableModelConfig, error)
 	GetModelConfigByID(ctx context.Context, id string) (*tables.TableModelConfig, error)
 	CreateModelConfig(ctx context.Context, modelConfig *tables.TableModelConfig, tx ...*gorm.DB) error
 	UpdateModelConfig(ctx context.Context, modelConfig *tables.TableModelConfig, tx ...*gorm.DB) error
 	UpdateModelConfigs(ctx context.Context, modelConfigs []*tables.TableModelConfig, tx ...*gorm.DB) error
-	DeleteModelConfig(ctx context.Context, id string) error
+	DeleteModelConfig(ctx context.Context, id string, tx ...*gorm.DB) error
+	// DeleteModelConfigsForScope deletes all model configs (and their owned budgets/rate-limits) for a scope owner. Must run inside the owner-delete transaction.
+	DeleteModelConfigsForScope(ctx context.Context, tx *gorm.DB, scope, scopeID string) error
+	// GetModelConfigsForScope loads all model configs (with Budgets/RateLimit) for a scope owner
+	// within the given transaction, so a caller mid-transaction sees its own uncommitted writes
+	// (e.g. deletions staged earlier in the same tx) rather than the last-committed state.
+	GetModelConfigsForScope(ctx context.Context, tx *gorm.DB, scope, scopeID string) ([]tables.TableModelConfig, error)
 
 	// Governance config CRUD
 	GetGovernanceConfig(ctx context.Context) (*GovernanceConfig, error)
@@ -298,6 +614,7 @@ type ConfigStore interface {
 	// Model pricing CRUD
 	GetModelPrices(ctx context.Context) ([]tables.TableModelPricing, error)
 	UpsertModelPrices(ctx context.Context, pricing *tables.TableModelPricing, tx ...*gorm.DB) error
+	UpsertModelPricesBatch(ctx context.Context, pricing []tables.TableModelPricing, tx ...*gorm.DB) error
 	DeleteModelPrices(ctx context.Context, tx ...*gorm.DB) error
 
 	// UpsertModelPricingAttributes writes only the additional_attributes column
@@ -313,10 +630,17 @@ type ConfigStore interface {
 	UpdatePricingOverride(ctx context.Context, override *tables.TablePricingOverride, tx ...*gorm.DB) error
 	DeletePricingOverride(ctx context.Context, id string, tx ...*gorm.DB) error
 
+	// Datasheet overrides: user edits re-applied on top of every datasheet sync
+	GetDatasheetOverrides(ctx context.Context) ([]tables.TableDatasheetOverride, error)
+	GetDatasheetOverrideByID(ctx context.Context, id string) (*tables.TableDatasheetOverride, error)
+	UpsertDatasheetOverride(ctx context.Context, override *tables.TableDatasheetOverride, tx ...*gorm.DB) error
+	DeleteDatasheetOverride(ctx context.Context, id string, tx ...*gorm.DB) error
+
 	// Model parameters
 	GetModelParameters(ctx context.Context) ([]tables.TableModelParameters, error)
 	GetModelParametersByModel(ctx context.Context, model string) (*tables.TableModelParameters, error)
 	UpsertModelParameters(ctx context.Context, params *tables.TableModelParameters, tx ...*gorm.DB) error
+	UpsertModelParametersBatch(ctx context.Context, params []tables.TableModelParameters, tx ...*gorm.DB) error
 
 	// Key management
 	GetKeysByIDs(ctx context.Context, ids []string) ([]tables.TableKey, error)
@@ -352,37 +676,155 @@ type ConfigStore interface {
 	// OAuth config CRUD
 	GetOauthConfigByID(ctx context.Context, id string) (*tables.TableOauthConfig, error)
 	GetOauthConfigsByIDs(ctx context.Context, ids []string) (map[string]*tables.TableOauthConfig, error)
-	GetOauthConfigByState(ctx context.Context, state string) (*tables.TableOauthConfig, error)
-	GetOauthConfigByTokenID(ctx context.Context, tokenID string) (*tables.TableOauthConfig, error)
 	CreateOauthConfig(ctx context.Context, config *tables.TableOauthConfig) error
-	UpdateOauthConfig(ctx context.Context, config *tables.TableOauthConfig) error
+	UpdateOauthConfig(ctx context.Context, config *tables.TableOauthConfig, tx ...*gorm.DB) error
 
-	// OAuth token CRUD
-	GetOauthTokenByID(ctx context.Context, id string) (*tables.TableOauthToken, error)
-	GetExpiringOauthTokens(ctx context.Context, before time.Time) ([]*tables.TableOauthToken, error)
-	CreateOauthToken(ctx context.Context, token *tables.TableOauthToken) error
-	UpdateOauthToken(ctx context.Context, token *tables.TableOauthToken) error
+	// OAuth token CRUD. TableMCPOauthToken now holds every holder of an MCP
+	// OAuth credential (auth_mode 'shared' | 'user' | 'vk' | 'session' | 'admin'),
+	// not just the shared-client credential the method names below still imply.
+	//
+	// GetOauthTokenByID is not filtered by auth_mode: callers always feed it
+	// an ID already resolved from a trusted internal lookup (a token row just
+	// loaded, or GetSharedOauthTokenByConfigID's result), never an arbitrary
+	// externally-sourced ID — a primary-key lookup, already unambiguous. An
+	// auth_mode filter here would be inert, unlike GetOauthUserTokenByID
+	// below, which a caller does feed an arbitrary externally-sourced ID.
+	GetOauthTokenByID(ctx context.Context, id string) (*tables.TableMCPOauthToken, error)
+	// GetSharedOauthTokenByConfigID resolves the single shared-mode token row
+	// for a config, the replacement for the retired TableOauthConfig.TokenID
+	// FK shortcut. Not filtered by status — callers that only want a usable
+	// credential (GetAccessToken) check token.Status themselves; RevokeToken
+	// needs to reach the row regardless of status to delete it. Returns
+	// (nil, nil) when no shared token exists for this config.
+	GetSharedOauthTokenByConfigID(ctx context.Context, oauthConfigID string) (*tables.TableMCPOauthToken, error)
+	// GetAdminOauthTokenByMCPClientID is GetSharedOauthTokenByConfigID's
+	// admin-mode counterpart — resolves the retained bootstrap-verification
+	// token for a per-user client's periodic tool-discovery refresh. Keyed
+	// by mcp_client_id because every admin row carries it, whether or not
+	// the credential has an oauth_configs template behind it. Not filtered
+	// by status. Returns (nil, nil) when no admin row exists.
+	GetAdminOauthTokenByMCPClientID(ctx context.Context, mcpClientID string) (*tables.TableMCPOauthToken, error)
+	// GetAdminOauthTokensByMCPClientIDs is GetAdminOauthTokenByMCPClientID's
+	// batch counterpart: resolves the retained admin-mode token row for each
+	// of the given MCP client IDs in one query, keyed by MCPClientID. Not
+	// filtered by status; clients with no admin row are absent from the map.
+	GetAdminOauthTokensByMCPClientIDs(ctx context.Context, mcpClientIDs []string) (map[string]*tables.TableMCPOauthToken, error)
+	// GetSharedOauthTokensByConfigIDs is GetSharedOauthTokenByConfigID's batch
+	// counterpart: resolves the shared-mode token row for each of the given
+	// oauth config IDs in one query, keyed by OauthConfigID. Same
+	// active-first ordering, so a stale duplicate can't shadow the live row.
+	// Not filtered by status; configs with no shared row are absent.
+	GetSharedOauthTokensByConfigIDs(ctx context.Context, oauthConfigIDs []string) (map[string]*tables.TableMCPOauthToken, error)
+	// PromoteSharedOauthTokenToAdmin transactionally installs the config's
+	// fresh shared-mode token as the retained admin-mode discovery credential
+	// for mcpClientID: if an admin row already exists its credential fields
+	// are replaced in place (preserving ID and CreatedAt) and the shared row
+	// is deleted; otherwise the shared row is retagged to auth_mode='admin'.
+	// Errors if the shared row is missing or not status='active'.
+	PromoteSharedOauthTokenToAdmin(ctx context.Context, oauthConfigID, mcpClientID string) error
+	// GetExpiringOauthTokens is filtered to authModes via `auth_mode IN
+	// (...)`. Backs OAuthTokenRefreshWorker, whose AuthModes field decides which
+	// holder types get proactive background refresh (defaults to shared +
+	// admin — other per-user tokens otherwise refresh lazily/inline on
+	// lookup via GetOauthUserTokenByMode).
+	GetExpiringOauthTokens(ctx context.Context, before time.Time, authModes []string) ([]*tables.TableMCPOauthToken, error)
+	// CreateOauthToken creates or replaces an MCP OAuth token row, any
+	// auth_mode alike (shared/user/vk/session/admin). Upserts by looking up
+	// any existing row for the same binding (mcp_client_id alone for shared
+	// and admin; identity column + mcp_client_id for per-identity modes) and
+	// reusing its ID, matching this table's partial unique indexes. Was two separate
+	// methods (a plain-insert CreateOauthToken for the shared flow, an
+	// upserting CreateOauthUserToken for per-identity) until the shared flow
+	// gained its own upsert need too: reauthorizing an already-authorized
+	// shared client must update its existing token row, not insert a
+	// duplicate. Accepts an optional caller-supplied transaction (tx) so it
+	// can participate atomically in a larger operation (e.g. CompleteOAuthFlow
+	// linking the new/updated token to its oauth_config in the same
+	// transaction) instead of always committing on its own.
+	CreateOauthToken(ctx context.Context, token *tables.TableMCPOauthToken, tx ...*gorm.DB) error
+	UpdateOauthToken(ctx context.Context, token *tables.TableMCPOauthToken) error
+	// RefreshOauthTokenFieldsIfActive persists a successful refresh's new
+	// access_token/refresh_token/expires_at/last_refreshed_at onto the row
+	// with the given id, but ONLY while the row is still 'active' AND its
+	// stored refresh_token still equals expectedPriorRefreshToken (the value
+	// the caller read and redeemed upstream before this call) — a targeted,
+	// compare-and-swap column update, not a full-row Save, so it can't
+	// clobber either (a) a status a concurrent credential rotation
+	// (RotateMCPOAuthConfig) already flipped to 'needs_reauth', or (b) a
+	// newer refresh_token a different, concurrently-running refresh of this
+	// same row (typically from another cluster node, since nothing today
+	// prevents two nodes from independently redeeming the same refresh_token
+	// upstream) already wrote, while this refresh's network round-trip was
+	// in flight. Returns updated=false (no error) when either guard failed
+	// to hold at write time; the caller must treat that as its own refresh
+	// having lost the race rather than a successful one — its freshly
+	// redeemed credentials must be discarded, not retried, since the
+	// refresh_token they were redeemed against is no longer the row's live
+	// one.
+	RefreshOauthTokenFieldsIfActive(ctx context.Context, id string, expectedPriorRefreshToken, accessToken, refreshToken string, expiresAt *time.Time, lastRefreshedAt time.Time) (updated bool, err error)
 	DeleteOauthToken(ctx context.Context, id string) error
+	// DeleteSharedOauthTokensByConfigID deletes every auth_mode='shared' row
+	// for oauthConfigID, not just the one GetSharedOauthTokenByConfigID would
+	// pick. Used to guarantee revocation and shared-flow re-completion can't
+	// leave a duplicate row behind (see GetSharedOauthTokenByConfigID's doc
+	// comment for why more than one can otherwise exist).
+	DeleteSharedOauthTokensByConfigID(ctx context.Context, oauthConfigID string, tx ...*gorm.DB) error
 
-	// Per-user OAuth session CRUD
-	GetOauthUserSessionByID(ctx context.Context, id string) (*tables.TableOauthUserSession, error)
-	ClaimOauthUserSessionByState(ctx context.Context, state string) (*tables.TableOauthUserSession, error)
+	// Flow-row CRUD (mcp_oauth_flows / TableMCPOauthFlow). Method names keep
+	// their historical "OauthUserSession" naming even though the backing
+	// table now also carries FlowMode='admin' rows — same convention PR1
+	// used for the token-table merge (GetOauthTokenByID etc. kept their
+	// names when retargeted to the unified table).
+	GetOauthUserSessionByID(ctx context.Context, id string) (*tables.TableMCPOauthFlow, error)
+	// GetOauthFlowByID is GetOauthUserSessionByID's admin-mode counterpart:
+	// looks up a flow_mode='admin' row by its own ID. See GetOauthUserSessionByID's
+	// implementation doc for why these stay separate (a per-user-facing
+	// caller-supplied-ID lookup must never reach an admin-mode row).
+	GetOauthFlowByID(ctx context.Context, id string) (*tables.TableMCPOauthFlow, error)
+	// GetOauthUserSessionByState is a non-mutating lookup by state, any
+	// status or flow_mode. Unlike ClaimOauthUserSessionByState /
+	// ClaimOauthFlowByState it does not gate on status='pending' or flip it
+	// to 'claiming' — used by callback-error handling, which only needs to
+	// classify the flow and mark it failed, not consume it.
+	GetOauthUserSessionByState(ctx context.Context, state string) (*tables.TableMCPOauthFlow, error)
+	// ClaimOauthUserSessionByState atomically claims a pending per-identity
+	// flow row (flow_mode IN ('user','vk','session')) by its state token.
+	// Scoped away from flow_mode='admin' so it can never claim the row an
+	// in-flight ClaimOauthFlowByState call is targeting on the same table.
+	ClaimOauthUserSessionByState(ctx context.Context, state string) (*tables.TableMCPOauthFlow, error)
+	// ClaimOauthFlowByState is ClaimOauthUserSessionByState's admin-mode
+	// counterpart: atomically claims a pending flow_mode='admin' row by
+	// state. The two claim methods partition the table by flow_mode, so a
+	// given state can only ever be claimed by one of them.
+	ClaimOauthFlowByState(ctx context.Context, state string) (*tables.TableMCPOauthFlow, error)
+	// CompleteOauthUserSession consumes the claimed per-identity flow row
+	// sessionID and stores the token it produced, in one transaction. Returns
+	// ErrNotFound, storing nothing, when the row is gone: a revoke deletes the
+	// binding's flows before its token, so a completion that finishes after a
+	// revoke cannot bring the token back.
+	CompleteOauthUserSession(ctx context.Context, sessionID string, token *tables.TableMCPOauthToken) error
 	// GetOauthUserSessionByModeIdentityAndMCPClient returns the canonical flow
 	// row for an (identity, mcp_client) binding. Used at flow-init time as the
 	// single source of truth: reauth updates this row in place rather than
 	// inserting a new one. Returns (nil, nil) when no row exists.
-	GetOauthUserSessionByModeIdentityAndMCPClient(ctx context.Context, mode schemas.MCPAuthMode, identity, mcpClientID string) (*tables.TableOauthUserSession, error)
-	CreateOauthUserSession(ctx context.Context, session *tables.TableOauthUserSession) error
-	UpdateOauthUserSession(ctx context.Context, session *tables.TableOauthUserSession) error
+	GetOauthUserSessionByModeIdentityAndMCPClient(ctx context.Context, mode schemas.MCPAuthMode, identity, mcpClientID string) (*tables.TableMCPOauthFlow, error)
+	CreateOauthUserSession(ctx context.Context, session *tables.TableMCPOauthFlow) error
+	UpdateOauthUserSession(ctx context.Context, session *tables.TableMCPOauthFlow) error
+	// RecordOAuthFlowIssuer writes only a flow's expected issuer, while the flow is still pending with
+	// state; it reports whether the row matched.
+	RecordOAuthFlowIssuer(ctx context.Context, id, state, issuer string, issParameterSupported bool) (bool, error)
 
-	// Per-user OAuth token CRUD
+	// Per-user OAuth token CRUD. These operate on the same TableMCPOauthToken /
+	// oauth_tokens rows as the shared-token methods above, scoped to
+	// auth_mode IN ('user','vk','session') so a 'shared' row can never be
+	// read, mutated, or deleted through a per-user code path.
+	//
 	// GetOauthUserTokenByMode looks up the active token row keyed by a single
 	// identity dimension. Filters status='active'. identity is the user ID for
 	// AuthModeUser, the VK row ID for AuthModeVK, and the session ID for
 	// AuthModeSession.
-	GetOauthUserTokenByMode(ctx context.Context, mode schemas.MCPAuthMode, identity, mcpClientID string) (*tables.TableOauthUserToken, error)
-	CreateOauthUserToken(ctx context.Context, token *tables.TableOauthUserToken) error
-	UpdateOauthUserToken(ctx context.Context, token *tables.TableOauthUserToken) error
+	GetOauthUserTokenByMode(ctx context.Context, mode schemas.MCPAuthMode, identity, mcpClientID string) (*tables.TableMCPOauthToken, error)
+	UpdateOauthUserToken(ctx context.Context, token *tables.TableMCPOauthToken) error
 	DeleteOauthUserToken(ctx context.Context, id string) error
 	// DeleteOauthUserSession hard-deletes a single flow row by primary key.
 	// Used by CompleteUserOAuthFlow on terminal transitions so completed,
@@ -393,16 +835,72 @@ type ConfigStore interface {
 	// rows matching the given identity column + MCP client. Used by revoke
 	// across all auth modes so subsequent OAuth init starts from a clean slate.
 	DeleteOauthUserSessionsByModeIdentityAndMCPClient(ctx context.Context, mode schemas.MCPAuthMode, identity, mcpClientID string) error
-	// MarkOauthUserTokenNeedsReauthByID flips status to 'needs_reauth'
-	// on a single token row. Called by the refresh-failure path when
-	// the upstream credential is permanently rejected: the row stays
-	// (preserves audit + binding for re-auth), but is filtered from
-	// active lookups so the next inference triggers a fresh OAuth
-	// flow that upserts the row back to 'active'.
-	MarkOauthUserTokenNeedsReauthByID(ctx context.Context, tokenID string) error
-	// GetOauthUserTokenByID looks up a single token row by primary key.
-	// Returns nil, nil when not found.
-	GetOauthUserTokenByID(ctx context.Context, id string) (*tables.TableOauthUserToken, error)
+	// MarkOauthUserTokenNeedsReauthByID flips status to 'needs_reauth' on a
+	// single token row, regardless of auth_mode ('shared' included). Called
+	// by the unified refresh function when the upstream credential is
+	// permanently rejected: the row stays (preserves audit + binding for
+	// re-auth), but is filtered from active lookups so the next
+	// inference/access triggers a fresh OAuth flow that upserts (per-identity)
+	// or reauthorizes (shared) the row back to 'active'. Despite the
+	// "UserToken" name (kept for historical continuity with the other
+	// per-user-named methods on this merged table, see GetOauthUserTokenByMode's
+	// comment), this is not scoped away from 'shared' — the tokenID handed in
+	// always comes from an internal lookup already, never an arbitrary
+	// caller-supplied ID. reason is recorded as the row's StatusReason (the
+	// provider's rejection, e.g. "provider rejected the refresh (HTTP 400,
+	// invalid_grant: Token has been expired or revoked)") so the UI and the
+	// client's connection-failure record can say what actually failed rather
+	// than only that the row is no longer usable.
+	MarkOauthUserTokenNeedsReauthByID(ctx context.Context, tokenID string, reason string) error
+	// MarkOauthTokenNeedsReauthIfUnrenewable flips one token row to 'needs_reauth' only while it is
+	// still active, has no refresh token and its access token has expired, so a reauthorize that
+	// landed in between is not overwritten. Reports whether the row was flipped.
+	MarkOauthTokenNeedsReauthIfUnrenewable(ctx context.Context, tokenID string, reason string) (bool, error)
+	// MarkTokensNeedsReauthByConfigID flips status to 'needs_reauth' on every
+	// token row bound to an OAuth config in one bulk UPDATE, with no
+	// auth_mode filter — rotating an oauth_configs row's client_id/client_secret
+	// invalidates every existing holder's cached credential (shared, per-user,
+	// vk, session, admin alike), not just the shared one.
+	MarkTokensNeedsReauthByConfigID(ctx context.Context, oauthConfigID string, reason string, tx ...*gorm.DB) error
+	// MarkAdminExchangeTokenNeedsReauthByMCPClientID flips status to
+	// 'needs_reauth' on a token_exchange client's retained admin bootstrap
+	// credential (auth_mode='admin', mcp_client_id=<id>, oauth_config_id='' —
+	// token_exchange rows have no oauth_configs template, unlike
+	// per_user_oauth's admin row, so this is keyed by MCP client rather than
+	// oauth_config_id the way MarkTokensNeedsReauthByConfigID is). Called
+	// when an admin edits a token_exchange client's audience/client_id/
+	// client_secret/scopes/authorization_server_url. Unlike OAuth rotation,
+	// there is no per-user row to cascade to: end-user exchanged tokens are
+	// cached in-memory only, never persisted (see GetExchangedAccessToken's
+	// doc comment) — the admin row is the only persisted state a
+	// token_exchange config edit can invalidate.
+	MarkAdminExchangeTokenNeedsReauthByMCPClientID(ctx context.Context, mcpClientID string, reason string) error
+	// RotateMCPOAuthConfig updates every field of an oauth_configs row in
+	// place when ANY of them differs from what's stored (client_id,
+	// client_secret, authorize_url, token_url, registration_url, resource,
+	// scopes), and — only when something actually changed — cascades every
+	// token bound to that config to needs_reauth in the same transaction,
+	// regardless of which auth_mode holds it. Shared by the
+	// update-MCP-client API handler and the config.json sync path so OAuth
+	// config changes behave identically from both entry points. Returns
+	// whether a rotation actually happened.
+	RotateMCPOAuthConfig(ctx context.Context, existingOauthConfig *tables.TableOauthConfig, fields MCPOAuthConfigFields) (bool, error)
+	// BindOAuthConfigIssuer writes only an oauth config's issuer binding, while its stored issuer and
+	// token_url are still the expected ones; it reports whether the row matched.
+	BindOAuthConfigIssuer(ctx context.Context, id, expectedIssuer, expectedTokenURL, issuer string, issParameterSupported bool) (bool, error)
+	// GetOauthUserTokenByID looks up a single per-user token row by primary
+	// key. Returns nil, nil when not found. Unlike GetOauthTokenByID above,
+	// this DOES filter to auth_mode IN ('user','vk','session'): the sessions
+	// handler feeds this an ID taken directly from a URL path parameter
+	// (POST /api/mcp/sessions/{id}/reauth, DELETE /api/mcp/sessions/{id})
+	// and then dispatches on the returned row's AuthMode to decide how to
+	// re-authenticate or revoke it — a caller-supplied ID that happened to
+	// belong to a 'shared' row would otherwise be readable (and, downstream,
+	// revocable) through an endpoint that's scoped to per-user credentials
+	// only. Primary-key uniqueness alone isn't enough here because the
+	// vulnerability isn't ambiguity, it's a per-user-only caller getting
+	// handed a row it never should have matched.
+	GetOauthUserTokenByID(ctx context.Context, id string) (*tables.TableMCPOauthToken, error)
 	// ListOauthUserTokens returns token rows matching the supplied filters,
 	// regardless of status. The sessions UI renders all three states
 	// (active / orphaned / needs_reauth) with distinct affordances, so
@@ -410,18 +908,30 @@ type ConfigStore interface {
 	// to act on rows that need their attention; status filtering is the
 	// caller's responsibility via params.Statuses. Runtime token lookups
 	// apply their own status='active' filter and don't go through this
-	// method.
-	ListOauthUserTokens(ctx context.Context, params MCPSessionsFilterParams) ([]tables.TableOauthUserToken, error)
+	// method. Always excludes auth_mode='shared' so shared credentials never
+	// leak into the per-identity sessions UI.
+	ListOauthUserTokens(ctx context.Context, params MCPSessionsFilterParams) ([]tables.TableMCPOauthToken, error)
 	// ListPendingOauthUserSessions returns pending OAuth flow rows matching
 	// the supplied filters. Companion to ListOauthUserTokens for the admin
-	// view. Always restricted to status='pending' AND expires_at > now;
-	// params.Statuses further narrows within that set.
-	ListPendingOauthUserSessions(ctx context.Context, params MCPSessionsFilterParams) ([]tables.TableOauthUserSession, error)
+	// view. Always restricted to status='pending' AND expires_at > now, and
+	// always excludes flow_mode='admin' — mirrors ListOauthUserTokens'
+	// auth_mode='shared' exclusion so an admin-mode flow row never leaks
+	// into the per-identity sessions UI. params.Statuses further narrows
+	// within that set.
+	ListPendingOauthUserSessions(ctx context.Context, params MCPSessionsFilterParams) ([]tables.TableMCPOauthFlow, error)
 	// DeleteExpiredOauthUserSessions hard-deletes pending OAuth flow rows
 	// whose ExpiresAt has passed. Returns the number of rows removed.
 	DeleteExpiredOauthUserSessions(ctx context.Context) (int64, error)
+	// DeleteAbandonedOauthConfigs hard-deletes 'pending' or 'failed'
+	// oauth_configs rows older than olderThan that no MCP client, live flow,
+	// or token row references. Returns the number of rows removed.
+	DeleteAbandonedOauthConfigs(ctx context.Context, olderThan time.Duration) (int64, error)
 	// DeleteOrphanedOauthUserTokens hard-deletes token rows where status='orphaned'
 	// and updated_at is older than olderThan. Returns the number of rows removed.
+	// Scoped to auth_mode IN ('user','vk','session') — a shared token can't
+	// reach status='orphaned' today (only VK/grant reconciliation sets it),
+	// but the filter is here so that stays true by construction rather than
+	// by coincidence once shared tokens share this table.
 	DeleteOrphanedOauthUserTokens(ctx context.Context, olderThan time.Duration) (int64, error)
 
 	// Per-user MCP header credential CRUD. Storage analog of per-user OAuth
@@ -430,13 +940,20 @@ type ConfigStore interface {
 	// mcp_client_id).
 	GetMCPPerUserHeaderCredentialByMode(ctx context.Context, mode schemas.MCPAuthMode, identity, mcpClientID string) (*tables.TableMCPPerUserHeaderCredential, error)
 	GetMCPPerUserHeaderCredentialByID(ctx context.Context, id string) (*tables.TableMCPPerUserHeaderCredential, error)
+	// GetAdminMCPPerUserHeaderCredentialsByClientIDs resolves the retained
+	// admin-mode header credential for each of the given MCP client IDs in
+	// one query, keyed by MCPClientID. Not filtered by status; clients with
+	// no admin row are absent from the map.
+	GetAdminMCPPerUserHeaderCredentialsByClientIDs(ctx context.Context, mcpClientIDs []string) (map[string]*tables.TableMCPPerUserHeaderCredential, error)
 	UpsertMCPPerUserHeaderCredential(ctx context.Context, cred *tables.TableMCPPerUserHeaderCredential) error
 	DeleteMCPPerUserHeaderCredential(ctx context.Context, id string) error
 	// ListMCPPerUserHeaderCredentials returns credential rows matching the
 	// supplied filters, regardless of status. Mirrors ListOauthUserTokens —
 	// the sessions UI surfaces non-active states (needs_update / orphaned)
 	// with distinct affordances, so status filtering is the caller's
-	// responsibility via params.Statuses.
+	// responsibility via params.Statuses. Always excludes auth_mode='admin'
+	// so the retained admin discovery credential never leaks into the
+	// per-identity sessions UI.
 	ListMCPPerUserHeaderCredentials(ctx context.Context, params MCPSessionsFilterParams) ([]tables.TableMCPPerUserHeaderCredential, error)
 	// MarkMCPPerUserHeaderCredentialsNeedsUpdate flips status to 'needs_update'
 	// for every row tied to mcpClientID. Called when the admin changes
@@ -447,6 +964,36 @@ type ConfigStore interface {
 	// DeleteOrphanedMCPPerUserHeaderCredentials hard-deletes rows where
 	// status='orphaned' and updated_at is older than olderThan.
 	DeleteOrphanedMCPPerUserHeaderCredentials(ctx context.Context, olderThan time.Duration) (int64, error)
+
+	// Per-user MCP discovery CRUD, for clients with per_user_discovery on.
+	// One row per (auth_mode, identity, mcp_client_id) binding — the same key
+	// the per-user credential rows use — holding the tools and instructions
+	// discovered with that caller's own credential. There is no staleness
+	// sweep: rows are refreshed only by the caller's manual refresh and die
+	// with their credential or their client.
+	GetMCPPerUserDiscoveryByMode(ctx context.Context, mode schemas.MCPAuthMode, identity, mcpClientID string) (*tables.TableMCPPerUserDiscovery, error)
+	// GetMCPPerUserDiscoveryBindings lists who holds a discovery on one
+	// client: the user and virtual-key rows with only their identity columns
+	// and discovery hash filled.
+	GetMCPPerUserDiscoveryBindings(ctx context.Context, mcpClientID string) ([]tables.TableMCPPerUserDiscovery, error)
+	// GetMCPPerUserDiscoveryToolCallerCounts returns, for each of the clients,
+	// every tool name in its user and virtual-key callers' discoveries with how
+	// many of those discoveries include it. Clients no caller holds a discovery
+	// of are left out.
+	GetMCPPerUserDiscoveryToolCallerCounts(ctx context.Context, mcpClientIDs []string) (map[string]map[string]int, error)
+	// GetMCPPerUserDiscoveryNames returns, for each of the clients, the union
+	// of the tool and prompt names and the resource and template URIs its user
+	// and virtual-key callers' discoveries hold. Clients no caller holds a
+	// discovery of are left out.
+	GetMCPPerUserDiscoveryNames(ctx context.Context, mcpClientIDs []string) (map[string]MCPPerUserDiscoveryNames, error)
+	// GetMCPPerUserDiscoverySummaries returns the discovery each of the user
+	// and virtual-key bindings holds, keyed by binding, with only the identity
+	// columns, the counts and discovered_at read. Bindings without one, and
+	// bindings of any other mode, are left out.
+	GetMCPPerUserDiscoverySummaries(ctx context.Context, bindings []MCPPerUserDiscoveryBinding) (map[MCPPerUserDiscoveryBinding]tables.TableMCPPerUserDiscovery, error)
+	UpsertMCPPerUserDiscovery(ctx context.Context, discovery *tables.TableMCPPerUserDiscovery) error
+	DeleteMCPPerUserDiscovery(ctx context.Context, mode schemas.MCPAuthMode, identity, mcpClientID string) error
+	DeleteMCPPerUserDiscoveriesByClient(ctx context.Context, mcpClientID string) error
 
 	// Per-user-headers submission flow CRUD. Mirrors the OAuth user-session
 	// surface — the resolver creates a pending flow row when the inline-401
@@ -470,6 +1017,11 @@ type ConfigStore interface {
 	// DeleteOauthUserSessionsByModeIdentityAndMCPClient.
 	DeleteMCPPerUserHeaderFlowsByModeIdentityAndMCPClient(ctx context.Context, mode schemas.MCPAuthMode, identity, mcpClientID string) error
 	DeleteMCPPerUserHeaderFlow(ctx context.Context, id string) error
+	// CompleteMCPPerUserHeaderFlow consumes the submission flow row flowID and
+	// upserts the credential it produced, in one transaction. Returns
+	// ErrNotFound, storing nothing, when the row is gone: revoked, swept as
+	// expired, or already consumed by a concurrent submit.
+	CompleteMCPPerUserHeaderFlow(ctx context.Context, flowID string, cred *tables.TableMCPPerUserHeaderCredential) error
 	// ListPendingMCPPerUserHeaderFlows returns non-expired pending header
 	// submission flow rows matching the supplied filters. Mirrors
 	// ListPendingOauthUserSessions on the OAuth side. Always restricted to
@@ -488,7 +1040,7 @@ type ConfigStore interface {
 	// dashboard edit, AP propagation, SCIM auto-assign). Orphans
 	// vk-keyed credentials whose MCP is no longer in the VK's effective
 	// allowlist (explicit per-VK row ∪ MCPs with
-	// AllowOnAllVirtualKeys=true) and reactivates orphaned rows when the
+	// AllowByDefault=true) and reactivates orphaned rows when the
 	// grant returns. Pending flow rows for lost grants are hard-deleted.
 	//
 	// Session-keyed rows are never touched — they carry no notion of
@@ -499,7 +1051,7 @@ type ConfigStore interface {
 	ReconcileOauthAfterVKChange(ctx context.Context, vkID string) error
 	ReconcileMCPHeadersAfterVKChange(ctx context.Context, vkID string) error
 	// MCP-side variants: called when the change originates on the MCP
-	// client (vk_configs edit OR AllowOnAllVirtualKeys toggle). Each
+	// client (vk_configs edit OR AllowByDefault toggle). Each
 	// re-evaluates every VK that holds a credential for the changed MCP.
 	ReconcileOauthAfterMCPChange(ctx context.Context, mcpClientID string) error
 	ReconcileMCPHeadersAfterMCPChange(ctx context.Context, mcpClientID string) error
@@ -529,6 +1081,23 @@ type ConfigStore interface {
 	CreatePromptVersion(ctx context.Context, version *tables.TablePromptVersion) error
 	DeletePromptVersion(ctx context.Context, id uint) error
 
+	// Skills Repository
+	CreateSkill(ctx context.Context, skill *tables.TableSkill, version string, objectStore objectstore.ObjectStore) error
+	GetSkill(ctx context.Context, id string) (*tables.TableSkill, error)
+	GetSkillLean(ctx context.Context, id string) (*tables.TableSkill, error)
+	GetSkillByName(ctx context.Context, name string) (*tables.TableSkill, error)
+	GetSkillVersion(ctx context.Context, skillID, version string) (*tables.TableSkillVersion, error)
+	ListSkillVersions(ctx context.Context, skillID string, params SkillVersionListQueryParams) ([]tables.TableSkillVersion, int64, error)
+	UpdateSkill(ctx context.Context, skill *tables.TableSkill, version string, serve bool, objectStore objectstore.ObjectStore) error
+	DeleteSkill(ctx context.Context, id string, objectStore objectstore.ObjectStore) error
+	ListSkills(ctx context.Context, params SkillListQueryParams) ([]tables.TableSkill, int64, error)
+	ShiftSkillVersion(ctx context.Context, skillID string, targetVersion string, objectStore objectstore.ObjectStore) error
+	GetAllSkillsVersion(ctx context.Context) (string, error)
+	BumpAllSkillsVersion(ctx context.Context, bump string) (string, error)
+	CreateSkillFileBlob(ctx context.Context, blob *tables.TableSkillFileBlob) error
+	CleanupOrphanSkillFileBlobs(ctx context.Context, force bool) (int64, error)
+	UpdateSkillConfigHash(ctx context.Context, skillID string, configHash string) error
+
 	// Prompt Repository - Sessions
 	GetPromptSessions(ctx context.Context, promptID string) ([]tables.TablePromptSession, error)
 	GetPromptSessionByID(ctx context.Context, id uint) (*tables.TablePromptSession, error)
@@ -537,14 +1106,98 @@ type ConfigStore interface {
 	RenamePromptSession(ctx context.Context, id uint, name string) error
 	DeletePromptSession(ctx context.Context, id uint) error
 
+	// Sidekiq - generic durable background jobs
+	CreateSidekiqJob(ctx context.Context, job *tables.TableSidekiqJob) error
+	GetSidekiqJob(ctx context.Context, id string) (*tables.TableSidekiqJob, error)
+	ClaimSidekiqJob(ctx context.Context, id, runnerID string, staleBefore time.Time) (bool, error)
+	ClaimPartitionedSidekiqJob(ctx context.Context, id, runnerID string, staleBefore time.Time, partitioningKey string, createdAt time.Time) (bool, error)
+	HeartbeatSidekiqJob(ctx context.Context, id, runnerID string) (bool, error)
+	UpdateSidekiqJobProgress(ctx context.Context, id, runnerID, metadata string) error
+	CompleteSidekiqJob(ctx context.Context, id, runnerID, metadata string) error
+	FailSidekiqJob(ctx context.Context, id, runnerID, metadata, lastErr string) error
+	CancelSidekiqJob(ctx context.Context, id string) (bool, error)
+	FinalizeCancelledSidekiqJob(ctx context.Context, id, runnerID, metadata string) error
+	ListClaimableSidekiqJobs(ctx context.Context, staleBefore time.Time) ([]tables.TableSidekiqJob, error)
+	GetInFlightSidekiqJobByKind(ctx context.Context, kind string) (*tables.TableSidekiqJob, error)
+	GetLatestSidekiqJobByKind(ctx context.Context, kind string) (*tables.TableSidekiqJob, error)
+	ListSidekiqJobs(ctx context.Context, terminalSince time.Time, limit int, quietKinds []string) ([]tables.TableSidekiqJob, error)
+	MarkStaleSidekiqJobsFailed(ctx context.Context, staleBefore time.Time) (int64, error)
+
+	// Phrase-suggestion schedule state: the next run of a router's schedule,
+	// claimed by one node when due. On the interface rather than read off the
+	// concrete store, so a store that wraps it keeps the shared schedule.
+	GetComplexitySuggestionSchedule(ctx context.Context, routerID string) (*tables.TableComplexitySuggestionSchedule, error)
+	SetComplexitySuggestionSchedule(ctx context.Context, routerID, scheduleHash string, nextRunAt time.Time, readVersion *int64) (bool, error)
+	ClaimComplexitySuggestionRun(ctx context.Context, routerID string, version int64, dueAt, nextRunAt time.Time, runID string) (bool, error)
+
+	// Batch jobs - mutable coordination state for delayed batch accounting
+	UpsertProviderJob(ctx context.Context, job *tables.TableProviderJob) error
+	GetProviderJob(ctx context.Context, jobID string) (*tables.TableProviderJob, error)
+	// GetProviderJobsByIDs returns the provider jobs among the given stable ids
+	// that exist; ids with no row are simply absent from the result.
+	GetProviderJobsByIDs(ctx context.Context, jobIDs []string) ([]*tables.TableProviderJob, error)
+	ListDueProviderJobs(ctx context.Context, kind, provider string, now time.Time, limit int) ([]*tables.TableProviderJob, error)
+	ClaimProviderJob(ctx context.Context, jobID, runnerID string, staleBefore time.Time, allowUnpriceable bool) (bool, error)
+	MarkProviderJobAggregateLogWritten(ctx context.Context, jobID, runnerID string) error
+	MarkProviderJobGovernanceReported(ctx context.Context, jobID, runnerID string) error
+	CompleteProviderJob(ctx context.Context, jobID, runnerID string) error
+	MarkProviderJobUnpriceable(ctx context.Context, jobID, runnerID, reason string, err error) error
+	FailProviderJob(ctx context.Context, jobID, runnerID string, err error) error
+	// GetProviderJobsByFileIDs returns the provider jobs on provider whose input,
+	// output or error file is one of fileIDs.
+	GetProviderJobsByFileIDs(ctx context.Context, provider string, fileIDs []string) ([]*tables.TableProviderJob, error)
+	// GetProviderJobsByJobIDSuffixes returns the provider jobs of kind on provider
+	// whose provider-side id ends in "/"+one of suffixes: full resource names
+	// addressed by their last segment.
+	GetProviderJobsByJobIDSuffixes(ctx context.Context, kind, provider string, suffixes []string) ([]*tables.TableProviderJob, error)
+
+	// Provider objects - which virtual key created a provider-side object
+	UpsertProviderObject(ctx context.Context, object *tables.TableProviderObject) error
+	// GetProviderObjectsByIDs returns the provider objects among the given stable
+	// ids that exist; ids with no row are simply absent from the result.
+	GetProviderObjectsByIDs(ctx context.Context, ids []string) ([]*tables.TableProviderObject, error)
+	// GetProviderObjectsByObjectIDSuffixes returns the provider objects of kind on
+	// provider whose provider-side id ends in "/"+one of suffixes: full resource
+	// names addressed by their last segment.
+	GetProviderObjectsByObjectIDSuffixes(ctx context.Context, kind, provider string, suffixes []string) ([]*tables.TableProviderObject, error)
+	// GetProviderObjectsByObjectID returns the provider objects of kind recorded for
+	// objectID under any provider name, in no particular order.
+	GetProviderObjectsByObjectID(ctx context.Context, kind, objectID string) ([]*tables.TableProviderObject, error)
+	DeleteProviderObject(ctx context.Context, id string) error
+	// DeleteProviderObjectsByObjectIDSuffix forgets the provider objects of kind on
+	// provider that virtualKeyID created and whose provider-side id ends in
+	// "/"+suffix: a full resource name addressed by its last segment.
+	DeleteProviderObjectsByObjectIDSuffix(ctx context.Context, kind, provider, suffix, virtualKeyID string) error
+
+	// Webhook Endpoints
+	GetWebhookEndpoints(ctx context.Context) ([]tables.TableWebhookEndpoint, error)
+	GetWebhookEndpointsPaginated(ctx context.Context, params WebhookEndpointsQueryParams) ([]tables.TableWebhookEndpoint, int64, error)
+	GetWebhookEndpointByID(ctx context.Context, id string) (*tables.TableWebhookEndpoint, error)
+	GetWebhookEndpointByName(ctx context.Context, name string) (*tables.TableWebhookEndpoint, error)
+	CreateWebhookEndpoint(ctx context.Context, endpoint *tables.TableWebhookEndpoint) error
+	UpdateWebhookEndpoint(ctx context.Context, endpoint *tables.TableWebhookEndpoint) error
+	DeleteWebhookEndpoint(ctx context.Context, id string) error
+	RotateWebhookEndpointSecret(ctx context.Context, id string) (*tables.TableWebhookEndpoint, error)
+	RecordWebhookEndpointSuccess(ctx context.Context, id string) error
+	RecordWebhookEndpointFailure(ctx context.Context, id string) (int, error)
+
+	// Webhook Jobs - in-flight webhook delivery work queue
+	CreateWebhookJob(ctx context.Context, job *tables.TableWebhookJob) error
+	ListDueWebhookJobs(ctx context.Context, limit int) ([]tables.TableWebhookJob, error)
+	ClaimWebhookJob(ctx context.Context, id, runnerID string, leaseUntil time.Time) (bool, error)
+	RescheduleWebhookJob(ctx context.Context, id, runnerID string, leaseUntil, nextAttemptAt time.Time) error
+	DeleteWebhookJob(ctx context.Context, id, runnerID string, leaseUntil time.Time) error
+
 	// DB returns the underlying database connection.
 	DB() *gorm.DB
 
 	// ScopedDB returns the underlying DB bound to ctx with any
-	// QueryScope on ctx pre-applied. Use this in read paths that
+	// QueryScope on ctx pre-applied, or the caller's transaction when one is
+	// passed, so a read taken inside a transaction sees that transaction's own
+	// writes. The scope is applied either way. Use this in read paths that
 	// should respect caller-driven row visibility; use DB().WithContext(ctx)
 	// for writes and internal lookups that must bypass scoping.
-	ScopedDB(ctx context.Context) *gorm.DB
+	ScopedDB(ctx context.Context, tx ...*gorm.DB) *gorm.DB
 
 	// RunMigration opens a throwaway *gorm.DB against the same
 	// backing database, invokes fn with it, and closes the connection. Use
@@ -566,12 +1219,86 @@ type ConfigStore interface {
 	// pool, whose connections carry no cached plans. SQLite is a no-op.
 	RefreshConnectionPool(ctx context.Context) error
 
+	// GetOAuth2SigningKey returns the signing key, creating and persisting one
+	// on first call. Always returns a usable key — never nil on a nil error.
+	GetOAuth2SigningKey(ctx context.Context) (*tables.OAuth2SigningKey, error)
+
+	// OAuth2 clients (DCR)
+	CreateOAuth2Client(ctx context.Context, client *tables.TableOAuth2Client) error
+	GetOAuth2ClientByClientID(ctx context.Context, clientID string) (*tables.TableOAuth2Client, error)
+
+	// OAuth2 authorize requests
+	CreateOAuth2AuthorizeRequest(ctx context.Context, req *tables.TableOAuth2AuthorizeRequest) error
+	GetOAuth2AuthorizeRequestByID(ctx context.Context, id string) (*tables.TableOAuth2AuthorizeRequest, error)
+	// GetOAuth2AuthorizeRequestByCodeHash returns the request an auth code was
+	// minted for while it is consented or already exchanged (code_issued), so the
+	// token endpoint can tell a replayed code from an unknown one.
+	GetOAuth2AuthorizeRequestByCodeHash(ctx context.Context, codeHash string) (*tables.TableOAuth2AuthorizeRequest, error)
+	// GetOAuth2AuthorizeRequestByDeviceCodeHash returns the device-grant request
+	// for a device_code hash in any status, so the token endpoint can answer
+	// authorization_pending, expired_token or issue tokens.
+	GetOAuth2AuthorizeRequestByDeviceCodeHash(ctx context.Context, deviceCodeHash string) (*tables.TableOAuth2AuthorizeRequest, error)
+	// GetPendingOAuth2AuthorizeRequestByUserCodeHash returns the still-pending,
+	// unexpired device-grant request for a user_code hash.
+	GetPendingOAuth2AuthorizeRequestByUserCodeHash(ctx context.Context, userCodeHash string) (*tables.TableOAuth2AuthorizeRequest, error)
+	// ConsentOAuth2AuthorizeRequest atomically transitions a still-pending request
+	// to consented (recording the code hash and resolved identity) — returns
+	// ErrNotFound when no longer pending, so concurrent double-consent can't
+	// overwrite an already-minted code.
+	ConsentOAuth2AuthorizeRequest(ctx context.Context, req *tables.TableOAuth2AuthorizeRequest) error
+	// DenyOAuth2AuthorizeRequest atomically transitions a still-pending request to
+	// revoked when the person on the consent page refuses it - returns ErrNotFound
+	// when no longer pending.
+	DenyOAuth2AuthorizeRequest(ctx context.Context, id string) error
+	SweepExpiredOAuth2AuthorizeRequests(ctx context.Context) error
+
+	// OAuth2 refresh tokens
+	GetOAuth2RefreshTokenByHash(ctx context.Context, hash string) (*tables.TableOAuth2RefreshToken, error)
+	// GetOAuth2RefreshTokenByHashAny returns the row including revoked tokens,
+	// used to detect token reuse attacks and trigger family revocation.
+	GetOAuth2RefreshTokenByHashAny(ctx context.Context, hash string) (*tables.TableOAuth2RefreshToken, error)
+	// ConsumeOAuth2AuthorizeRequest atomically marks the authorize request as
+	// code_issued and creates the refresh token — if either fails the client can retry.
+	ConsumeOAuth2AuthorizeRequest(ctx context.Context, requestID string, rt *tables.TableOAuth2RefreshToken) error
+	// RotateOAuth2RefreshToken atomically revokes the old token and creates the
+	// new one — if either fails the old token stays active and the client can retry.
+	RotateOAuth2RefreshToken(ctx context.Context, oldID string, newRT *tables.TableOAuth2RefreshToken) error
+	// RevokeOAuth2RefreshTokensByFamilyID revokes all active tokens in a family
+	// when a stolen-token reuse is detected (RFC 9700 §2.2.2), and returns how many it revoked.
+	RevokeOAuth2RefreshTokensByFamilyID(ctx context.Context, familyID string) (int64, error)
+	// RevokeOAuth2RefreshTokensByMode revokes all active tokens for a given mode.
+	RevokeOAuth2RefreshTokensByMode(ctx context.Context, bfMode string) error
+	// RevokeOAuth2GrantsBySubject revokes, in one transaction, every grant bound to
+	// one identity (bf_mode + bf_sub): its consented but not yet exchanged
+	// authorization codes and its active refresh tokens. Used when a virtual key
+	// rotates; pass tx to commit it together with the key update. Returns the number of refresh tokens revoked.
+	RevokeOAuth2GrantsBySubject(ctx context.Context, bfMode, bfSub string, tx ...*gorm.DB) (int64, error)
+	// SweepOAuth2RefreshTokens deletes revoked tokens older than the given duration.
+	SweepOAuth2RefreshTokens(ctx context.Context, revokedOlderThan time.Duration) (int64, error)
+	// SweepOrphanedOAuth2Clients deletes registered clients that back no refresh
+	// token and were registered before the grace cutoff. Run after the refresh
+	// token sweep so clients are not collected while their tokens are still
+	// retained for reuse detection.
+	SweepOrphanedOAuth2Clients(ctx context.Context, registeredOlderThan time.Duration) (int64, error)
+	// ListOAuth2Sessions returns a page of active downstream grants for the
+	// Connected Clients UI, plus the total count matching the filters (before
+	// the limit/offset are applied). Filtering and pagination are pushed to SQL.
+	ListOAuth2Sessions(ctx context.Context, params OAuth2SessionsQueryParams) ([]OAuth2SessionRow, int64, error)
+	// GetOAuth2SessionByID returns a single active grant row for permission checks.
+	GetOAuth2SessionByID(ctx context.Context, id string) (*tables.TableOAuth2RefreshToken, error)
+	// RevokeOAuth2Session revokes a specific downstream grant by refresh token ID.
+	RevokeOAuth2Session(ctx context.Context, id string) error
+
 	// Cleanup
 	Close(ctx context.Context) error
 }
 
 // NewConfigStore creates a new config store based on the configuration
-func NewConfigStore(ctx context.Context, config *Config, logger schemas.Logger) (ConfigStore, error) {
+func NewConfigStore(ctx context.Context, config *Config, logger schemas.Logger, opts ...Option) (ConfigStore, error) {
+	var o storeOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	if config == nil {
 		return nil, fmt.Errorf("config cannot be nil")
 	}
@@ -587,7 +1314,7 @@ func NewConfigStore(ctx context.Context, config *Config, logger schemas.Logger) 
 		return nil, fmt.Errorf("invalid sqlite config: %T", config.Config)
 	case ConfigStoreTypePostgres:
 		if postgresConfig, ok := config.Config.(*PostgresConfig); ok {
-			return newPostgresConfigStore(ctx, postgresConfig, logger)
+			return newPostgresConfigStore(ctx, postgresConfig, logger, o.migrationMatViewPause)
 		}
 		return nil, fmt.Errorf("invalid postgres config: %T", config.Config)
 	}

@@ -200,8 +200,33 @@ const (
 
 // CohereResponseFormat represents the response format configuration for Cohere chat requests
 type CohereResponseFormat struct {
-	Type       CohereResponseFormatType `json:"type"`             // Required: Response format type
-	JSONSchema *interface{}             `json:"schema,omitempty"` // Optional: JSON schema for structured output (not used when type is "text")
+	Type CohereResponseFormatType `json:"type"` // Required: Response format type
+	// Optional: JSON schema for structured output (not used when type is "text").
+	// Cohere v2 names this field `json_schema` (docs.cohere.com/reference/chat); tagging only
+	// `schema` meant a real Cohere request lost its schema silently and the model answered
+	// with unconstrained - often markdown-fenced - JSON. UnmarshalJSON accepts both spellings.
+	JSONSchema *interface{} `json:"json_schema,omitempty"`
+}
+
+// UnmarshalJSON accepts both `json_schema` (Cohere's spelling) and the legacy `schema` alias.
+func (r *CohereResponseFormat) UnmarshalJSON(data []byte) error {
+	type alias CohereResponseFormat
+	aux := &struct {
+		*alias
+		SchemaAlias *interface{} `json:"schema,omitempty"`
+	}{alias: (*alias)(r)}
+
+	if err := sonic.Unmarshal(data, aux); err != nil {
+		return err
+	}
+	// Keyed on PRESENCE of json_schema, not on whether it decoded to nil. *interface{} decodes an
+	// explicit `{"json_schema": null}` to nil, which is indistinguishable from the key being absent
+	// - so a nil check let the legacy `schema` alias override a caller who had explicitly sent null.
+	// Canonical spelling wins whenever it is present at all.
+	if !providerUtils.GetJSONField(data, "json_schema").Exists() && aux.SchemaAlias != nil {
+		r.JSONSchema = aux.SchemaAlias
+	}
+	return nil
 }
 
 // CohereResponseFormatType represents the type of response format
@@ -272,6 +297,7 @@ type CohereEmbeddingRequest struct {
 	OutputDimension *int                   `json:"output_dimension,omitempty"` // Optional: Embedding dimensions (256, 512, 1024, 1536)
 	EmbeddingTypes  []string               `json:"embedding_types,omitempty"`  // Optional: Types of embeddings to return
 	Truncate        *string                `json:"truncate,omitempty"`         // Optional: How to handle long inputs
+	Priority        *int                   `json:"priority,omitempty"`         // Optional: Priority of the request
 	ExtraParams     map[string]interface{} `json:"-"`                          // Optional: Extra parameters
 }
 
@@ -291,16 +317,30 @@ type CohereEmbeddingResponse struct {
 	ResponseType *string                    `json:"response_type,omitempty"` // Response type (embeddings_floats, embeddings_by_type)
 	Texts        []string                   `json:"texts,omitempty"`         // Original text entries
 	Images       []CohereEmbeddingImageInfo `json:"images,omitempty"`        // Original image entries
+	Inputs       []CohereEmbeddingInputEcho `json:"inputs,omitempty"`        // Original mixed entries
 	Meta         *CohereEmbeddingMeta       `json:"meta,omitempty"`          // Response metadata
+}
+
+// CohereEmbeddingInputEcho is one echoed inputs[] entry. The response reports an
+// image under "image" as metadata, not "image_url" as a URL.
+type CohereEmbeddingInputEcho struct {
+	Content []CohereEmbeddingContentEcho `json:"content"`
+}
+
+// CohereEmbeddingContentEcho is one echoed content block.
+type CohereEmbeddingContentEcho struct {
+	Type  CohereContentBlockType    `json:"type"`
+	Text  *string                   `json:"text,omitempty"`
+	Image *CohereEmbeddingImageInfo `json:"image,omitempty"`
 }
 
 // CohereEmbeddingData represents the embeddings object with different types
 type CohereEmbeddingData struct {
 	Float   [][]float64 `json:"float,omitempty"`   // Float embeddings
 	Int8    [][]int8    `json:"int8,omitempty"`    // Int8 embeddings
-	Uint8   [][]uint8   `json:"uint8,omitempty"`   // Uint8 embeddings
+	Uint8   [][]int32   `json:"uint8,omitempty"`   // Uint8 embeddings; int32 avoids []byte→base64 JSON issue
 	Binary  [][]int8    `json:"binary,omitempty"`  // Binary embeddings
-	Ubinary [][]uint8   `json:"ubinary,omitempty"` // Unsigned binary embeddings
+	Ubinary [][]int32   `json:"ubinary,omitempty"` // Unsigned binary embeddings; int32 avoids []byte→base64 JSON issue
 	Base64  []string    `json:"base64,omitempty"`  // Base64 embeddings
 }
 
@@ -380,6 +420,8 @@ type CohereBilledUnits struct {
 	OutputTokens    *int `json:"output_tokens,omitempty"`   // Number of billed output tokens
 	SearchUnits     *int `json:"search_units,omitempty"`    // Number of billed search units
 	Classifications *int `json:"classifications,omitempty"` // Number of billed classification units
+	Images          *int `json:"images,omitempty"`          // Number of billed images
+	ImageTokens     *int `json:"image_tokens,omitempty"`    // Number of billed image tokens
 }
 
 // CohereTokenUsage represents detailed token usage
@@ -592,6 +634,7 @@ type CohereStreamContent struct {
 
 // CohereError represents an error response from the Cohere  API
 type CohereError struct {
+	ID      string  `json:"id,omitempty"`   // Request ID
 	Type    string  `json:"type"`           // Error type
 	Message string  `json:"message"`        // Error message
 	Code    *string `json:"code,omitempty"` // Optional error code

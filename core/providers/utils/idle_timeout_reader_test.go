@@ -3,13 +3,16 @@ package utils
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/valyala/fasthttp"
 )
 
 // ---------------------------------------------------------------------------
@@ -31,7 +34,12 @@ type syncedPanicBody struct {
 	panicTrigger chan struct{}
 	allowReturn  chan struct{}
 	closeOnce    sync.Once
+	closes       atomic.Int32
 }
+
+// closeCount reports how many times the stream was closed, so a test can assert
+// that nothing closed it rather than only that a read stayed blocked.
+func (s *syncedPanicBody) closeCount() int { return int(s.closes.Load()) }
 
 func newSyncedPanicBody() *syncedPanicBody {
 	return &syncedPanicBody{
@@ -46,6 +54,7 @@ func (s *syncedPanicBody) Read(_ []byte) (int, error) {
 }
 
 func (s *syncedPanicBody) Close() error {
+	s.closes.Add(1)
 	s.closeOnce.Do(func() { close(s.panicTrigger) })
 	<-s.allowReturn
 	return nil
@@ -57,6 +66,58 @@ type panicReader struct{}
 
 func (panicReader) Read([]byte) (int, error) {
 	panic(errPanicReader)
+}
+
+// timerPanicCloser mimics fasthttp's streaming body when the underlying
+// connection has already been released to / reused from the pool: CloseWithError
+// nil-derefs in (*HostClient).CloseConn and panics. It implements
+// streamCloserWithError (not io.Closer) so closeBodyStream takes the
+// CloseWithError branch — the path the idle timer hits.
+//
+// called is closed the instant CloseWithError is entered (just before the
+// panic), so a test can deterministically wait for the guarded path to be
+// exercised rather than rely on a fixed sleep — which a slow runner could
+// outrun, letting cleanup stop the timer before it ever fired and passing the
+// test without touching the recover.
+type timerPanicCloser struct {
+	called chan struct{}
+}
+
+func newTimerPanicCloser() *timerPanicCloser {
+	return &timerPanicCloser{called: make(chan struct{})}
+}
+
+func (*timerPanicCloser) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (c *timerPanicCloser) CloseWithError(error) error {
+	close(c.called)
+	panic("simulated fasthttp CloseConn nil-deref")
+}
+
+// captureLogger records Debug messages so a test can assert that a recovered
+// panic value is logged (not silently swallowed). It embeds noopLogger to
+// satisfy the rest of the schemas.Logger interface.
+type captureLogger struct {
+	noopLogger
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (c *captureLogger) Debug(format string, args ...any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.msgs = append(c.msgs, fmt.Sprintf(format, args...))
+}
+
+func (c *captureLogger) contains(sub string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, m := range c.msgs {
+		if strings.Contains(m, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 type blockingCloserSpy struct {
@@ -391,6 +452,64 @@ func TestIdleTimeoutReader_RecoversReadPanicAfterTimeout(t *testing.T) {
 	}
 }
 
+// TestIdleTimeoutReader_RecoversCloseStreamPanicOnTimerFire verifies that a
+// panic raised by closeBodyStream WHEN THE IDLE TIMER FIRES — e.g. fasthttp's
+// CloseWithError nil-dereffing in (*HostClient).CloseConn because the stream's
+// connection was already released to / reused from the pool (an orphaned timer
+// on a completed stream) — is recovered inside the timer goroutine and does not
+// crash the process.
+//
+// This is the timer-callback counterpart to RecoversReadPanicAfterTimeout
+// (#3677), which guarded the Read() path but not the AfterFunc's own
+// closeBodyStream call. Without the recover in the AfterFunc, the panic runs in
+// the timer goroutine, is unrecoverable by callers, and takes the whole process
+// down (observed crashing a router under sustained streaming load).
+func TestIdleTimeoutReader_RecoversCloseStreamPanicOnTimerFire(t *testing.T) {
+	t.Parallel()
+	body := newTimerPanicCloser()
+	_, cleanup := NewIdleTimeoutReader(&readCloserSpy{}, body, 10*time.Millisecond, nil)
+
+	// Wait until the timer goroutine has actually entered CloseWithError (about to
+	// panic). This proves the guarded path was exercised; a fixed sleep could be
+	// outrun by a slow runner, letting cleanup stop the timer before it fired and
+	// passing the test without ever touching the recover.
+	select {
+	case <-body.called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("idle timer never fired CloseWithError within 2s")
+	}
+
+	// cleanup() blocks on timerDone, closed only after the (now-recovered) timer
+	// callback returns — so reaching the end proves the panic was recovered in the
+	// timer goroutine. Without the recover, the process would already have crashed.
+	cleanup()
+}
+
+// TestIdleTimeoutReader_LogsRecoveredTimerPanic verifies that the recovered
+// panic value is logged (not silently swallowed), so an unexpected future
+// panic on this path leaves a forensic trace. Not parallel: it swaps the
+// package-global logger and restores it via t.Cleanup before parallel tests
+// resume.
+func TestIdleTimeoutReader_LogsRecoveredTimerPanic(t *testing.T) {
+	capLog := &captureLogger{}
+	prev := getLogger()
+	SetLogger(capLog)
+	t.Cleanup(func() { SetLogger(prev) })
+
+	body := newTimerPanicCloser()
+	_, cleanup := NewIdleTimeoutReader(&readCloserSpy{}, body, 10*time.Millisecond, nil)
+	select {
+	case <-body.called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("idle timer never fired CloseWithError within 2s")
+	}
+	cleanup() // blocks until the timer callback (recover + log) has returned
+
+	if !capLog.contains("idle-timeout timer") || !capLog.contains("nil-deref") {
+		t.Fatalf("expected recovered panic to be logged; got %v", capLog.msgs)
+	}
+}
+
 func TestIdleTimeoutReader_CleanupWaitsForRunningTimerCallback(t *testing.T) {
 	t.Parallel()
 	body := newBlockingCloserSpy()
@@ -423,19 +542,19 @@ func TestIdleTimeoutReader_CleanupWaitsForRunningTimerCallback(t *testing.T) {
 	}
 }
 
-// TestSetupStreamCancellation_NoPanicOnCancelledContext reproduces the race where
-// SetupStreamCancellation calls Close() before setting BifrostContextKeyConnectionClosed.
+// TestSetupStreamCancellation_NoPanicOnCancelledContext verifies that
+// cancelling a context unblocks a read that is already in flight, and that the
+// reader surfaces ErrStreamClosed rather than letting a panic escape.
 //
-// Timeline with current (unfixed) code:
-//  1. cancel() fires → SetupStreamCancellation goroutine calls closer.Close()
-//  2. Close() closes panicTrigger → Read goroutine unblocks and panics
-//  3. Close() blocks on allowReturn → flag is NOT yet set
-//  4. idleTimeoutReader.Read recover: r.fired=false, connectionClosed=false → re-panics (BUG)
+// The body's Close() blocks on allowReturn, so the flag is guaranteed to be
+// unset when idleTimeoutReader.Read's recover block runs - the worst-case
+// ordering.
 //
-// Timeline after fix (set flag before Close()):
-//  1. cancel() fires → SetupStreamCancellation sets flag → calls closer.Close()
-//  2. Close() closes panicTrigger → Read goroutine unblocks and panics
-//  3. idleTimeoutReader.Read recover: connectionClosed=true → returns ErrStreamClosed (OK)
+// Closing under an active reader is only safe on a fasthttp carrying upstream
+// commit fb3b29e (#2353), where clientStreamBody waits on its readLock before
+// pooling the *requestStream and the connection's *bufio.Reader. See
+// TestStreamCloseUnderActiveReaderIsSafe, which fails under -race on any
+// fasthttp without that fix, and maximhq/bifrost#6143 for what it cost.
 func TestSetupStreamCancellation_NoPanicOnCancelledContext(t *testing.T) {
 	t.Parallel()
 
@@ -445,14 +564,14 @@ func TestSetupStreamCancellation_NoPanicOnCancelledContext(t *testing.T) {
 
 	reader, cleanupReader := NewIdleTimeoutReader(body, body, time.Minute, bifrostCtx)
 	// Defers run LIFO: allowReturn first, then stopCancel, then cleanupReader.
-	// This order ensures Close() can return before we wait for the goroutine.
+	// This order lets Close() return before we wait for the goroutine.
 	defer cleanupReader()
 	stopCancel := SetupStreamCancellation(bifrostCtx, body, getLogger())
 	defer stopCancel()
 	defer close(body.allowReturn)
 
 	type readResult struct {
-		err     error
+		err      error
 		panicked any
 	}
 	resultCh := make(chan readResult, 1)
@@ -468,15 +587,12 @@ func TestSetupStreamCancellation_NoPanicOnCancelledContext(t *testing.T) {
 		_, res.err = reader.Read(buf)
 	}()
 
-	// Cancelling triggers SetupStreamCancellation → Close() → Read panics.
-	// Close() is blocked on allowReturn so the flag has not been set yet when
-	// the recover block in idleTimeoutReader.Read runs — worst-case ordering.
 	cancel()
 
 	select {
 	case res := <-resultCh:
 		if res.panicked != nil {
-			t.Errorf("Read re-panicked (flag not set before Close — BUG): %v", res.panicked)
+			t.Errorf("Read re-panicked instead of reporting a closed stream: %v", res.panicked)
 			return
 		}
 		if !errors.Is(res.err, ErrStreamClosed) {
@@ -484,5 +600,257 @@ func TestSetupStreamCancellation_NoPanicOnCancelledContext(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Error("Read goroutine did not unblock after context cancellation")
+	}
+}
+
+// TestSetupStreamCancellation_RecoversCloseStreamPanic verifies that a panic
+// raised by closeBodyStream inside the cancellation goroutine (fasthttp's
+// CloseWithError nil-dereffing in (*HostClient).CloseConn once the connection is
+// gone) is recovered and logged rather than taking the process down. This is the
+// cancellation-goroutine counterpart to
+// TestIdleTimeoutReader_RecoversCloseStreamPanicOnTimerFire. Not parallel: it
+// swaps the package-global logger.
+func TestSetupStreamCancellation_RecoversCloseStreamPanic(t *testing.T) {
+	capLog := &captureLogger{}
+	prev := getLogger()
+	SetLogger(capLog)
+	t.Cleanup(func() { SetLogger(prev) })
+
+	body := newTimerPanicCloser()
+	goCtx, cancel := context.WithCancel(context.Background())
+	bifrostCtx := schemas.NewBifrostContext(goCtx, time.Time{})
+
+	stopCancel := SetupStreamCancellation(bifrostCtx, body, getLogger())
+	cancel()
+	select {
+	case <-body.called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancellation goroutine never called CloseWithError within 2s")
+	}
+	stopCancel() // blocks until the goroutine (recover + log) has returned
+
+	if !capLog.contains("stream cancellation") || !capLog.contains("nil-deref") {
+		t.Fatalf("expected recovered panic to be logged; got %v", capLog.msgs)
+	}
+}
+
+// TestSetupStreamCancellation_ClosesExactlyOnce guards the ownership claim: the
+// cancellation goroutine, the idle-timeout timer and ReleaseStreamingResponse
+// all close the same stream, and only one of them may drive it.
+func TestSetupStreamCancellation_ClosesExactlyOnce(t *testing.T) {
+	t.Parallel()
+
+	body := newSyncedPanicBody()
+	close(body.allowReturn) // let Close() return immediately
+	goCtx, cancel := context.WithCancel(context.Background())
+	bifrostCtx := schemas.NewBifrostContext(goCtx, time.Time{})
+
+	stopCancel := SetupStreamCancellation(bifrostCtx, body, getLogger())
+	cancel()
+	// BifrostContext propagates its parent's cancellation through a watcher
+	// goroutine, so cancel() alone does not guarantee ctx.Err() is set yet.
+	// Waiting here keeps the assertion about close ownership rather than about
+	// how fast that propagation happens.
+	<-bifrostCtx.Done()
+	stopCancel()
+
+	if got := body.closeCount(); got != 1 {
+		t.Errorf("body stream closed %d times, want exactly 1", got)
+	}
+}
+
+// countingStreamCloser models fasthttp's non-idempotent streaming body handle:
+// it implements streamCloserWithError (CloseWithError) and io.Reader, counting
+// closes and reads. The whole point of the atomic-claim fix is that the
+// underlying close runs at most once across the cancellation goroutine, the
+// idle-timeout timer, and ReleaseStreamingResponse — a second close would
+// re-run fasthttp's releaseRequestStream and double-Put the pooled struct.
+type countingStreamCloser struct {
+	closeCount atomic.Int32
+	readCount  atomic.Int32
+}
+
+func (c *countingStreamCloser) Read([]byte) (int, error) {
+	c.readCount.Add(1)
+	return 0, io.EOF
+}
+
+func (c *countingStreamCloser) CloseWithError(error) error {
+	c.closeCount.Add(1)
+	return nil
+}
+
+// TestStreamClose_ExactlyOnceAcrossOwners drives the idle-timeout timer and the
+// cancellation goroutine concurrently against one shared stream + context and
+// asserts the underlying CloseWithError fires exactly once. Before the fix the
+// two owners used a racy Value-then-SetValue guard and could both close, which
+// double-released the pooled fasthttp requestStream and poisoned another
+// request (the `slice bounds out of range [:-680]` crash). Run with -race.
+func TestStreamClose_ExactlyOnceAcrossOwners(t *testing.T) {
+	t.Parallel()
+
+	for i := 0; i < 100; i++ {
+		body := &countingStreamCloser{}
+		goCtx, cancel := context.WithCancel(context.Background())
+		ctx := schemas.NewBifrostContext(goCtx, time.Time{})
+
+		// Tiny idle timeout so the timer races the cancellation.
+		_, cleanup := NewIdleTimeoutReader(body, body, time.Millisecond, ctx)
+		stop := SetupStreamCancellation(ctx, body, getLogger())
+
+		go cancel() // fire cancellation concurrently with the idle timer
+
+		// Wait (bounded) until at least one owner has performed the close, rather
+		// than relying on a fixed sleep that can miss both close paths on slow CI.
+		deadline := time.Now().Add(2 * time.Second)
+		for body.closeCount.Load() == 0 && time.Now().Before(deadline) {
+			time.Sleep(50 * time.Microsecond)
+		}
+		stop()
+		cleanup()
+
+		if got := body.closeCount.Load(); got != 1 {
+			t.Fatalf("iteration %d: CloseWithError called %d times, want exactly 1", i, got)
+		}
+	}
+}
+
+// TestConnectionClosedClaim_SerializesOwners verifies the primitive the fix
+// relies on: GetAndSetValue on BifrostContextKeyConnectionClosed is an atomic
+// compare-and-claim, so exactly one of many concurrent owners observes the
+// prior `false` and is permitted to perform the underlying close.
+func TestConnectionClosedClaim_SerializesOwners(t *testing.T) {
+	t.Parallel()
+
+	const owners = 64
+	ctx := schemas.NewBifrostContext(context.Background(), time.Time{})
+
+	var winners atomic.Int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < owners; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if prev, _ := ctx.GetAndSetValue(schemas.BifrostContextKeyConnectionClosed, true).(bool); !prev {
+				winners.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := winners.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 owner to win the close claim, got %d", got)
+	}
+}
+
+// TestReleaseStreamingResponse_SkipsWhenAlreadyClaimed asserts that once a
+// cancel/timeout owner has claimed the close, ReleaseStreamingResponse neither
+// drains nor releases the body stream — preventing fasthttp.ReleaseResponse
+// from triggering a second releaseRequestStream on an already-relinquished
+// pooled struct.
+func TestReleaseStreamingResponse_SkipsWhenAlreadyClaimed(t *testing.T) {
+	t.Parallel()
+
+	ctx := schemas.NewBifrostContext(context.Background(), time.Time{})
+	// A prior owner already claimed + closed the stream.
+	ctx.GetAndSetValue(schemas.BifrostContextKeyConnectionClosed, true)
+
+	body := &countingStreamCloser{}
+	resp := fasthttp.AcquireResponse()
+	resp.SetBodyStream(body, -1)
+
+	ReleaseStreamingResponse(ctx, resp)
+
+	if got := body.readCount.Load(); got != 0 {
+		t.Fatalf("ReleaseStreamingResponse drained the body despite a prior close claim (read %d times)", got)
+	}
+	if got := body.closeCount.Load(); got != 0 {
+		t.Fatalf("ReleaseStreamingResponse closed an already-claimed stream (%d times)", got)
+	}
+
+	// The claim was lost, so resp was intentionally not released (the
+	// production GC-leak trade-off). Release it here to keep the test clean.
+	fasthttp.ReleaseResponse(resp)
+}
+
+// TestReleaseStreamingResponse_NoBodyDoesNotClaimConnection covers the
+// pre-response error path: fasthttp.Do can fail before installing a body stream.
+// Releasing that empty response must not mark the request context as
+// connection-closed, because retries/fallbacks reuse the same BifrostContext.
+func TestReleaseStreamingResponse_NoBodyDoesNotClaimConnection(t *testing.T) {
+	t.Parallel()
+
+	ctx := schemas.NewBifrostContext(context.Background(), time.Time{})
+	resp := fasthttp.AcquireResponse()
+
+	ReleaseStreamingResponse(ctx, resp)
+
+	if closed, _ := ctx.Value(schemas.BifrostContextKeyConnectionClosed).(bool); closed {
+		t.Fatal("ReleaseStreamingResponse claimed connection ownership without a body stream")
+	}
+}
+
+type closeRecorder struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *closeRecorder) Read([]byte) (int, error) { <-c.closed; return 0, io.EOF }
+func (c *closeRecorder) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+// A missed first-token deadline closes the attempt's body and claims the
+// connection, while the request context stays live for the fallback.
+func TestSetupStreamCancellation_FirstTokenDeadlineClosesBody(t *testing.T) {
+	bifrostCtx := schemas.NewBifrostContext(context.Background(), time.Time{})
+	abort := NewAttemptAbort(50 * time.Millisecond)
+	bifrostCtx.SetValue(schemas.BifrostContextKeyStreamAttemptAbort, abort)
+	body := &closeRecorder{closed: make(chan struct{})}
+
+	stop := SetupStreamCancellation(bifrostCtx, body, getLogger())
+	defer stop()
+	select {
+	case <-body.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first-token deadline never closed the body")
+	}
+	if claimed, _ := bifrostCtx.Value(schemas.BifrostContextKeyConnectionClosed).(bool); !claimed {
+		t.Fatal("the abort must claim connection_closed so ReleaseStreamingResponse does not drain")
+	}
+	if bifrostCtx.Err() != nil {
+		t.Fatal("a TTFT miss must not cancel the request context")
+	}
+}
+
+// After the first token (Disarm) the body stays open, and ctx cancellation
+// still closes it.
+func TestSetupStreamCancellation_DisarmedDeadlineStillHonoursCtx(t *testing.T) {
+	goCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bifrostCtx := schemas.NewBifrostContext(goCtx, time.Time{})
+	abort := NewAttemptAbort(50 * time.Millisecond)
+	bifrostCtx.SetValue(schemas.BifrostContextKeyStreamAttemptAbort, abort)
+	body := &closeRecorder{closed: make(chan struct{})}
+
+	stop := SetupStreamCancellation(bifrostCtx, body, getLogger())
+	defer stop()
+	if !abort.Disarm() {
+		t.Fatal("disarm lost to a 50ms deadline")
+	}
+	select {
+	case <-body.closed:
+		t.Fatal("a disarmed deadline closed the body")
+	case <-time.After(150 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case <-body.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ctx cancellation no longer closes the body after disarm")
 	}
 }

@@ -14,6 +14,49 @@ import (
 	"github.com/maximhq/vt10x"
 )
 
+func TestRelayTerminalInputForwardsAndStops(t *testing.T) {
+	source, sourceWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	defer sourceWriter.Close()
+	destination, destinationWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destination.Close()
+	defer destinationWriter.Close()
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go relayTerminalInput(destinationWriter, source, stop, done)
+
+	if _, err := sourceWriter.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if err := destination.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	received := make([]byte, len("hello"))
+	if _, err := io.ReadFull(destination, received); err != nil {
+		t.Fatal(err)
+	}
+	if string(received) != "hello" {
+		t.Fatalf("relayed input = %q, want hello", received)
+	}
+
+	close(stop)
+	if err := source.SetReadDeadline(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("terminal input relay did not stop")
+	}
+}
+
 func TestAddPendingTabDisablesCommandMode(t *testing.T) {
 	t.Parallel()
 
@@ -452,6 +495,60 @@ func TestHandleCommandKeyEscapeClearsStickyErrorAndStaysInCommandMode(t *testing
 	}
 }
 
+func TestHandleCommandKeyEscapeClearsStickyErrorBeforeQuitConfirm(t *testing.T) {
+	t.Parallel()
+
+	tm := &TabManager{
+		stdout:       io.Discard,
+		rows:         24,
+		cols:         80,
+		commandMode:  true,
+		quitConfirm:  true,
+		noticeText:   "oops",
+		noticeLevel:  TabNoticeError,
+		noticeSticky: true,
+		tabs:         []*Tab{{id: 1, label: "Codex"}},
+	}
+
+	tm.handleCommandKey(nil, nil, nil, 0x1b)
+
+	if tm.noticeText != "" {
+		t.Fatalf("expected sticky error notice to clear before quit confirm, got %q", tm.noticeText)
+	}
+	if !tm.commandMode {
+		t.Fatal("expected command mode to remain active after clearing sticky error")
+	}
+}
+
+func TestClearStickyErrorOnEscapeWorksDuringScrollMode(t *testing.T) {
+	t.Parallel()
+
+	tm := &TabManager{
+		stdout:       io.Discard,
+		rows:         24,
+		cols:         80,
+		commandMode:  true,
+		scrollMode:   true,
+		noticeText:   "oops",
+		noticeLevel:  TabNoticeError,
+		noticeSticky: true,
+		tabs:         []*Tab{{id: 1, label: "Codex"}},
+	}
+
+	if !tm.clearStickyErrorOnEscape([]byte{0x1b}) {
+		t.Fatal("expected escape to clear sticky error before scroll mode consumes it")
+	}
+	if tm.noticeText != "" {
+		t.Fatalf("expected sticky error notice to clear, got %q", tm.noticeText)
+	}
+	if !tm.commandMode {
+		t.Fatal("expected command mode to remain active after clearing sticky error")
+	}
+	if !tm.scrollMode {
+		t.Fatal("expected sticky error clear not to mutate scroll mode directly")
+	}
+}
+
 func TestHandleCommandKeyEnterDoesNotResumeWhileStickyErrorIsShown(t *testing.T) {
 	t.Parallel()
 
@@ -649,6 +746,34 @@ func TestIsPrefixSequenceSupportsColonSuffix(t *testing.T) {
 	}
 	if !isPrefixSequence([]byte("\x1b[27;5;103~")) {
 		t.Fatal("expected ctrl+g modifyOtherKeys (CSI 27 ~) to be recognized")
+	}
+}
+
+func TestIsCtrlTabDoesNotConsumeCtrlShiftTab(t *testing.T) {
+	t.Parallel()
+
+	if !isCtrlTab([]byte("\x1b[9;5u")) {
+		t.Fatal("expected CSI u ctrl+tab to be recognized")
+	}
+	if isCtrlTab([]byte("\x1b[9;6u")) {
+		t.Fatal("did not expect CSI u ctrl+shift+tab to be consumed as ctrl+tab")
+	}
+	if !isCtrlTab([]byte("\x1b[27;5;9~")) {
+		t.Fatal("expected modifyOtherKeys ctrl+tab to be recognized")
+	}
+	if isCtrlTab([]byte("\x1b[27;6;9~")) {
+		t.Fatal("did not expect modifyOtherKeys ctrl+shift+tab to be consumed as ctrl+tab")
+	}
+}
+
+func TestDecodeCSIuPreservesShiftTab(t *testing.T) {
+	t.Parallel()
+
+	if got := string(decodeCSIu([]byte("\x1b[9;2u"))); got != "\x1b[Z" {
+		t.Fatalf("decodeCSIu(shift+tab) = %q, want backtab", got)
+	}
+	if got := string(decodeCSIu([]byte("\x1b[9;2:1u"))); got != "\x1b[Z" {
+		t.Fatalf("decodeCSIu(shift+tab press event) = %q, want backtab", got)
 	}
 }
 

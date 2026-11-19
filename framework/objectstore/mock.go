@@ -4,14 +4,18 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"strings"
 	"sync"
+	"time"
 )
 
 // InMemoryObjectStore is an in-memory ObjectStore implementation for testing.
 type InMemoryObjectStore struct {
-	mu      sync.RWMutex
-	objects map[string][]byte
-	tags    map[string]map[string]string
+	mu        sync.RWMutex
+	objects   map[string][]byte
+	tags      map[string]map[string]string
+	types     map[string]string
+	createdAt map[string]time.Time
 
 	// PutErr, if set, is returned by Put for simulating failures.
 	PutErr error
@@ -22,12 +26,20 @@ type InMemoryObjectStore struct {
 // NewInMemoryObjectStore creates a new in-memory object store.
 func NewInMemoryObjectStore() *InMemoryObjectStore {
 	return &InMemoryObjectStore{
-		objects: make(map[string][]byte),
-		tags:    make(map[string]map[string]string),
+		objects:   make(map[string][]byte),
+		tags:      make(map[string]map[string]string),
+		types:     make(map[string]string),
+		createdAt: make(map[string]time.Time),
 	}
 }
 
-func (m *InMemoryObjectStore) Put(_ context.Context, key string, data []byte, tags map[string]string) error {
+func (m *InMemoryObjectStore) Put(ctx context.Context, key string, data []byte, tags map[string]string) error {
+	return m.PutWithOptions(ctx, key, data, tags, PutOptions{})
+}
+
+// PutWithOptions stores data as is (the in-memory store never compresses) and
+// records the content type for ContentType.
+func (m *InMemoryObjectStore) PutWithOptions(_ context.Context, key string, data []byte, tags map[string]string, opts PutOptions) error {
 	if m.PutErr != nil {
 		return m.PutErr
 	}
@@ -37,6 +49,14 @@ func (m *InMemoryObjectStore) Put(_ context.Context, key string, data []byte, ta
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	m.objects[key] = cp
+	contentType := opts.ContentType
+	if contentType == "" {
+		contentType = ContentTypeJSON
+	}
+	m.types[key] = contentType
+	if _, exists := m.createdAt[key]; !exists {
+		m.createdAt[key] = time.Now()
+	}
 	if len(tags) > 0 {
 		tagsCp := make(map[string]string, len(tags))
 		maps.Copy(tagsCp, tags)
@@ -55,11 +75,23 @@ func (m *InMemoryObjectStore) Get(_ context.Context, key string) ([]byte, error)
 	defer m.mu.RUnlock()
 	data, ok := m.objects[key]
 	if !ok {
-		return nil, fmt.Errorf("objectstore: object not found: %s", key)
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, key)
 	}
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	return cp, nil
+}
+
+func (m *InMemoryObjectStore) ListByPrefix(_ context.Context, prefix string) ([]ObjectInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	objects := make([]ObjectInfo, 0)
+	for key := range m.objects {
+		if key != "" && strings.HasPrefix(key, prefix) {
+			objects = append(objects, ObjectInfo{Key: key, LastModified: m.createdAt[key]})
+		}
+	}
+	return objects, nil
 }
 
 func (m *InMemoryObjectStore) Delete(_ context.Context, key string) error {
@@ -67,6 +99,8 @@ func (m *InMemoryObjectStore) Delete(_ context.Context, key string) error {
 	defer m.mu.Unlock()
 	delete(m.objects, key)
 	delete(m.tags, key)
+	delete(m.types, key)
+	delete(m.createdAt, key)
 	return nil
 }
 
@@ -76,6 +110,8 @@ func (m *InMemoryObjectStore) DeleteBatch(_ context.Context, keys []string) erro
 	for _, key := range keys {
 		delete(m.objects, key)
 		delete(m.tags, key)
+		delete(m.types, key)
+		delete(m.createdAt, key)
 	}
 	return nil
 }
@@ -101,6 +137,13 @@ func (m *InMemoryObjectStore) GetTags(key string) map[string]string {
 	return cp
 }
 
+// ContentType returns the content type recorded for key (test helper).
+func (m *InMemoryObjectStore) ContentType(key string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.types[key]
+}
+
 // Len returns the number of stored objects. For testing assertions.
 func (m *InMemoryObjectStore) Len() int {
 	m.mu.RLock()
@@ -117,4 +160,11 @@ func (m *InMemoryObjectStore) Keys() []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+// SetCreatedAt overrides the creation time for the given key. For testing assertions.
+func (m *InMemoryObjectStore) SetCreatedAt(key string, t time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.createdAt[key] = t
 }

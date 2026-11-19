@@ -517,7 +517,7 @@ function LeakTable({
 					{candidates.length === 0 && (
 						<tr>
 							<td colSpan={8} className="px-4 py-8 text-center text-zinc-500">
-								No obvious leak signatures — all live allocations have normal retention ratios.
+								No obvious leak signatures; all live allocations have normal retention ratios.
 							</td>
 						</tr>
 					)}
@@ -900,7 +900,7 @@ export default function PprofPage() {
 								<span className="text-sm text-zinc-500">(last 5 min)</span>
 							</div>
 							<div className="h-64">
-								<ResponsiveContainer width="100%" height="100%">
+								<ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 1, height: 1 }}>
 									<AreaChart data={cpuChartData}>
 										<defs>
 											<linearGradient id="cpuGradient" x1="0" y1="0" x2="0" y2="1">
@@ -981,7 +981,7 @@ export default function PprofPage() {
 								<span className="text-sm text-zinc-500">(last 5 min)</span>
 							</div>
 							<div className="h-64">
-								<ResponsiveContainer width="100%" height="100%">
+								<ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 1, height: 1 }}>
 									<AreaChart data={memoryChartData}>
 										<defs>
 											<linearGradient id="allocGradient" x1="0" y1="0" x2="0" y2="1">
@@ -1076,7 +1076,7 @@ export default function PprofPage() {
 								<span className="text-sm text-zinc-500">({sortedInuseAllocations.length} sites)</span>
 							</div>
 							<p className="mt-1 text-xs text-zinc-500">
-								Call stacks currently holding memory on the heap right now — expand a row to see the full stack.
+								Call stacks currently holding memory on the heap right now. Expand a row to see the full stack.
 							</p>
 						</div>
 						<AllocationTable
@@ -1100,7 +1100,7 @@ export default function PprofPage() {
 								<span className="text-sm text-zinc-500">({sortedAllocations.length} sites)</span>
 							</div>
 							<p className="mt-1 text-xs text-zinc-500">
-								Total bytes allocated since process start (includes memory already freed) — expand a row to see the full stack.
+								Total bytes allocated since process start (includes memory already freed). Expand a row to see the full stack.
 							</p>
 						</div>
 						<AllocationTable

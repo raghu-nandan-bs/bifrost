@@ -39,8 +39,8 @@ func handleOpenAILargePayloadPassthrough(
 	ctx *schemas.BifrostContext,
 	client *fasthttp.Client,
 	url string,
-	key schemas.Key,
-	extraHeaders map[string]string,
+	authHeader map[string]string,
+	extraHeaders map[string]schemas.SecretVar,
 	providerName schemas.ModelProvider,
 	logger schemas.Logger,
 ) (*largePayloadResult, *schemas.BifrostError, bool) {
@@ -57,8 +57,8 @@ func handleOpenAILargePayloadPassthrough(
 	providerUtils.SetExtraHeaders(ctx, req, extraHeaders, nil)
 	req.SetRequestURI(url)
 	req.Header.SetMethod(http.MethodPost)
-	if key.Value.GetValue() != "" {
-		req.Header.Set("Authorization", "Bearer "+key.Value.GetValue())
+	for k, v := range authHeader {
+		req.Header.Set(k, v)
 	}
 
 	// Rewrite model prefix and stream request body to upstream.

@@ -1,8 +1,20 @@
 package perplexity
 
 import (
+	"strings"
+
 	"github.com/maximhq/bifrost/core/schemas"
 )
+
+// isPerplexityResponsesSupported reports whether the model should use /v1/responses vs /chat/completions.
+// Denylist by design: /chat/completions serves only the Sonar family, so base "sonar" and the sonar-*
+// variants go to chat (/v1/responses rejects them with `model "sonar" is not supported`) and every other
+// model goes to responses. This keeps newly-shipped non-Sonar models working without a code change;
+// they'd fail on chat, which doesn't serve them.
+func isPerplexityResponsesSupported(model string) bool {
+	bare := strings.ToLower(strings.TrimPrefix(model, "perplexity/"))
+	return bare != "sonar" && !strings.HasPrefix(bare, "sonar-")
+}
 
 // ToPerplexityResponsesRequest converts a BifrostResponsesRequest to PerplexityChatRequest
 func ToPerplexityResponsesRequest(bifrostReq *schemas.BifrostResponsesRequest) *PerplexityChatRequest {
@@ -20,6 +32,12 @@ func ToPerplexityResponsesRequest(bifrostReq *schemas.BifrostResponsesRequest) *
 		perplexityReq.MaxTokens = bifrostReq.Params.MaxOutputTokens
 		perplexityReq.Temperature = bifrostReq.Params.Temperature
 		perplexityReq.TopP = bifrostReq.Params.TopP
+
+		// Structured output: Perplexity speaks chat-completions, so the Responses
+		// text.format has to be carried over as response_format. Without this a
+		// Responses request reaches Perplexity with no schema at all. An explicit
+		// response_format in ExtraParams still wins; it is applied further below.
+		perplexityReq.ResponseFormat = schemas.ChatResponseFormatFromResponsesFormat(bifrostReq.Params.Text.GetFormat())
 
 		// Handle reasoning effort mapping
 		if bifrostReq.Params.Reasoning != nil && bifrostReq.Params.Reasoning.Effort != nil {
@@ -210,7 +228,7 @@ func ToPerplexityResponsesRequest(bifrostReq *schemas.BifrostResponsesRequest) *
 
 	// Process ResponsesInput (which contains the Responses messages)
 	if bifrostReq.Input != nil {
-		perplexityReq.Messages = schemas.ToChatMessages(bifrostReq.Input)
+		perplexityReq.Messages = schemas.ToChatMessages(bifrostReq.Input, nil)
 	}
 
 	return perplexityReq

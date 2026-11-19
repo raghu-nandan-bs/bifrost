@@ -59,14 +59,16 @@ import (
 	"os"
 	"strings"
 	"time"
+	_ "time/tzdata" // Calendar log periods need IANA zones and the Alpine image ships none; clickhouse-go embeds this too, but do not rely on that
 
 	_ "go.uber.org/automaxprocs" // Automatically set GOMAXPROCS based on container cgroup limits
 
 	bifrost "github.com/maximhq/bifrost/core"
 	schemas "github.com/maximhq/bifrost/core/schemas"
-	"github.com/maximhq/bifrost/transports/bifrost-http/handlers"
-	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
-	bifrostServer "github.com/maximhq/bifrost/transports/bifrost-http/server"
+	"github.com/maximhq/bifrost/transports/v2/bifrost-http/handlers"
+	"github.com/maximhq/bifrost/transports/v2/bifrost-http/lib"
+	"github.com/maximhq/bifrost/transports/v2/bifrost-http/profiling"
+	bifrostServer "github.com/maximhq/bifrost/transports/v2/bifrost-http/server"
 )
 
 //go:embed all:ui
@@ -83,6 +85,7 @@ var server *bifrostServer.BifrostHTTPServer
 //   - host: Host to bind the server to (default: localhost, can be overridden with BIFROST_HOST env var)
 //   - port: Server port (default: 8080)
 //   - app-dir: Application data directory (default: current directory)
+//   - base-path: URL path prefix behind a reverse proxy, e.g. /bifrost (default: none, can be overridden with BIFROST_BASE_PATH env var; "/" forces the domain root over server.base_path)
 //   - log-level: Logger level (debug, info, warn, error). Default is info.
 //   - log-style: Logger output type (json or pretty). Default is JSON.
 
@@ -105,6 +108,7 @@ func init() {
 	flag.StringVar(&server.Port, "port", bifrostServer.DefaultPort, "Port to run the server on")
 	flag.StringVar(&server.Host, "host", defaultHost, "Host to bind the server to (default: localhost, override with BIFROST_HOST env var)")
 	flag.StringVar(&server.AppDir, "app-dir", bifrostServer.DefaultAppDir, "Application data directory (contains config.json and logs)")
+	flag.StringVar(&server.BasePath, "base-path", os.Getenv("BIFROST_BASE_PATH"), "URL path prefix to serve under behind a reverse proxy, e.g. /bifrost (default: none, override with BIFROST_BASE_PATH env var or server.base_path in config.json; \"/\" forces the domain root over config.json)")
 	flag.StringVar(&server.LogLevel, "log-level", defaultLogLevel, "Logger level (debug, info, warn, error). Default is info.")
 	flag.StringVar(&server.LogOutputStyle, "log-style", bifrostServer.DefaultLogOutputStyle, "Logger output type (json or pretty). Default is JSON.")
 }
@@ -137,6 +141,9 @@ func main() {
 
 `, versionLine)
 
+	// Start profiling
+	pprofServer := profiling.Start()
+
 	// Configure logger from flags
 	logger.SetOutputType(schemas.LoggerOutputType(server.LogOutputStyle))
 	logger.SetLevel(schemas.LogLevel(server.LogLevel))
@@ -157,6 +164,16 @@ func main() {
 	if err != nil {
 		logger.Error("failed to start server: %v", err)
 		os.Exit(1)
+	}
+	// server.Start() blocks until SIGINT/SIGTERM triggers graceful shutdown, so
+	// by here the main server is draining/done. Shut the pprof server down too
+	// to let any in-flight profile requests finish instead of being killed.
+	if pprofServer != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		if err := pprofServer.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("pprof server shutdown error: %v", err)
+		}
 	}
 	logger.Info("🏁 server stopped")
 }

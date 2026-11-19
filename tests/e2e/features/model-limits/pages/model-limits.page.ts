@@ -3,6 +3,18 @@ import { expect } from '../../../core/fixtures/base.fixture'
 import { BasePage } from '../../../core/pages/base.page'
 import { fillSelect, waitForNetworkIdle } from '../../../core/utils/test-helpers'
 
+const resetPeriodLabels: Record<string, string> = {
+  '1m': 'Every Minute',
+  '5m': 'Every 5 Minutes',
+  '15m': 'Every 15 Minutes',
+  '30m': 'Every 30 Minutes',
+  '1h': 'Hourly',
+  '6h': 'Every 6 Hours',
+  '1d': 'Daily',
+  '1w': 'Weekly',
+  '1M': 'Monthly',
+}
+
 export interface ModelLimitConfig {
   provider: string
   modelName: string
@@ -15,6 +27,10 @@ export interface ModelLimitConfig {
 
 function toTestIdPart(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 export class ModelLimitsPage extends BasePage {
@@ -57,6 +73,23 @@ export class ModelLimitsPage extends BasePage {
     await actionsBtn.click()
   }
 
+  private async preserveBudgetUsageIfPrompted(): Promise<void> {
+    const dialog = this.page.getByTestId('model-limit-budget-reset-dialog')
+    const dialogVisible = dialog.waitFor({ state: 'visible', timeout: 5000 }).then(() => 'dialog' as const)
+    const sheetClosed = this.sheet.waitFor({ state: 'hidden', timeout: 5000 }).then(() => 'sheet' as const)
+
+    let winner: 'dialog' | 'sheet'
+    try {
+      winner = await Promise.race([dialogVisible, sheetClosed])
+    } catch {
+      return
+    }
+    if (winner !== 'dialog') return
+
+    await this.page.getByTestId('model-limit-budget-reset-dialog-preserve-btn').click()
+    await dialog.waitFor({ state: 'hidden', timeout: 3000 })
+  }
+
   private async waitForSheetClosedAfterSave(): Promise<void> {
     const closed = await expect(this.sheet)
       .not.toBeVisible({ timeout: 5000 })
@@ -66,10 +99,31 @@ export class ModelLimitsPage extends BasePage {
       await this.page.keyboard.press('Escape')
       await expect(this.sheet).not.toBeVisible({ timeout: 5000 })
     }
+  }
 
-    await expect(this.page.locator('html'))
-      .not.toHaveClass(/bprogress-busy/, { timeout: 10000 })
-      .catch(() => {})
+  private async setBudget(config?: { maxLimit: number; resetDuration?: string }): Promise<void> {
+    if (!config) return
+
+    const budgetLines = this.page.locator('[data-testid^="model-limit-budget-lines-line-"]')
+    const existingCount = await budgetLines.count()
+    if (existingCount === 0) {
+      await this.page.getByTestId('model-limit-budget-lines-add-btn').click()
+    }
+
+    const budgetInput = this.page.getByTestId('model-limit-budget-lines-amount-0')
+    await budgetInput.click()
+    await budgetInput.fill('')
+    await budgetInput.pressSequentially(String(config.maxLimit))
+
+    if (config.resetDuration) {
+      const resetPeriodLabel = resetPeriodLabels[config.resetDuration]
+      if (!resetPeriodLabel) {
+        throw new Error(`unsupported resetDuration: ${config.resetDuration}`)
+      }
+      const budgetLine = this.page.getByTestId('model-limit-budget-lines-line-0')
+      await budgetLine.getByRole('combobox').click()
+      await this.page.getByRole('option', { name: resetPeriodLabel }).click()
+    }
   }
 
   /**
@@ -89,20 +143,19 @@ export class ModelLimitsPage extends BasePage {
       config.provider === 'all' ? 'All Providers' : config.provider
     )
 
-    // Model multiselect - search and select requested model deterministically
+    // Model select - type and pick the requested model from the results
     const modelSelectContainer = this.sheet.getByTestId('model-limit-model-select')
-    const modelInput = modelSelectContainer.locator('input')
-    await modelInput.fill(config.modelName)
-    await this.page.waitForSelector('[role="option"]', { timeout: 10000 })
-    const targetOption = this.page.getByRole('option', { name: config.modelName, exact: true })
+    const modelInput = modelSelectContainer.getByRole('combobox')
+    await modelInput.click()
+    // ModelSelector searches server-side from the input inside its popover.
+    await this.page.getByPlaceholder('Search models...').fill(config.modelName)
+    const targetOption = this.page.getByRole('option', { name: config.modelName, exact: true }).first()
     await expect(targetOption).toBeVisible({ timeout: 10000 })
     await targetOption.click()
+    await this.page.keyboard.press('Tab')
     const selectedModelName = config.modelName
 
-    if (config.budget?.maxLimit !== undefined) {
-      const budgetInput = this.page.locator('#modelBudgetMaxLimit')
-      await budgetInput.fill(String(config.budget.maxLimit))
-    }
+    await this.setBudget(config.budget)
 
     if (config.rateLimit?.tokenMaxLimit !== undefined) {
       await this.page.locator('#modelTokenMaxLimit').fill(String(config.rateLimit.tokenMaxLimit))
@@ -127,11 +180,7 @@ export class ModelLimitsPage extends BasePage {
     await expect(this.sheet).toBeVisible({ timeout: 5000 })
     await this.waitForSheetAnimation()
 
-    if (updates.budget?.maxLimit !== undefined) {
-      const budgetInput = this.page.locator('#modelBudgetMaxLimit')
-      await budgetInput.clear()
-      await budgetInput.fill(String(updates.budget.maxLimit))
-    }
+    await this.setBudget(updates.budget)
 
     if (updates.rateLimit?.tokenMaxLimit !== undefined) {
       const tokenInput = this.page.locator('#modelTokenMaxLimit')
@@ -147,6 +196,7 @@ export class ModelLimitsPage extends BasePage {
     const saveBtn = this.page.getByRole('button', { name: /Save Changes|Create Limit/i })
     await expect(saveBtn).toBeEnabled({ timeout: 10000 })
     await saveBtn.click()
+    await this.preserveBudgetUsageIfPrompted()
     await this.waitForSheetClosedAfterSave()
     await expect(this.getModelLimitRow(modelName, provider)).toBeVisible({ timeout: 15000 })
   }

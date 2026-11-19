@@ -2,6 +2,9 @@ package plugins
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maximhq/bifrost/core/network"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -116,6 +120,25 @@ func TestDynamicPluginLifecycle(t *testing.T) {
 		assert.Equal(t, "transport-post-hook-value", resp.Headers["x-hello-world-plugin"], "Plugin should have added custom header")
 	})
 
+	// Test optional HTTPTransportResponseHeadersHook
+	t.Run("HTTPTransportResponseHeadersHook", func(t *testing.T) {
+		ctx := context.Background()
+		pluginCtx, cancel := schemas.NewBifrostContextWithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		req := &schemas.HTTPRequest{Method: "POST", Path: "/api"}
+		resp := &schemas.HTTPResponseMetadata{
+			StatusCode: http.StatusOK,
+			Headers:    map[string]string{"Content-Type": "text/event-stream"},
+		}
+
+		httpTransportPlugin, ok := plugin.(schemas.HTTPTransportPlugin)
+		require.True(t, ok, "Plugin should implement HTTPTransportPlugin")
+		err := httpTransportPlugin.HTTPTransportResponseHeadersHook(pluginCtx, req, resp)
+		require.NoError(t, err, "HTTPTransportResponseHeadersHook should not return error")
+		assert.Equal(t, "response-headers-hook-value", resp.Header("x-hello-world-response-header"))
+	})
+
 	// Test PreLLMHook
 	t.Run("PreLLMHook", func(t *testing.T) {
 		ctx := context.Background()
@@ -198,6 +221,16 @@ func TestDynamicPluginLifecycle(t *testing.T) {
 		err := plugin.Cleanup()
 		assert.NoError(t, err, "Cleanup should not return error")
 	})
+}
+
+func TestAsHTTPTransportPluginRecognizesResponseHeadersOnlyDynamicPlugin(t *testing.T) {
+	dp := &DynamicPlugin{
+		httpTransportResponseHeadersHook: func(_ *schemas.BifrostContext, _ *schemas.HTTPRequest, _ *schemas.HTTPResponseMetadata) error {
+			return nil
+		},
+	}
+
+	require.Same(t, dp, AsHTTPTransportPlugin(dp))
 }
 
 // TestLoadPlugins_DisabledPlugin tests that disabled plugins are not loaded
@@ -322,6 +355,21 @@ func TestDynamicPlugin_ContextPropagation(t *testing.T) {
 	}
 	_, _, err = plugin.PostLLMHook(pluginCtx, resp, nil)
 	require.NoError(t, err, "PostLLMHook should succeed with context")
+}
+
+func TestDynamicPlugin_ResponseHeadersHookIsOptional(t *testing.T) {
+	plugin := &DynamicPlugin{
+		getName: func() string { return "legacy-plugin" },
+		cleanup: func() error { return nil },
+	}
+	resp := &schemas.HTTPResponseMetadata{
+		StatusCode: http.StatusOK,
+		Headers:    map[string]string{"Content-Type": "text/event-stream"},
+	}
+
+	err := plugin.HTTPTransportResponseHeadersHook(nil, nil, resp)
+	require.NoError(t, err)
+	assert.Equal(t, "text/event-stream", resp.Header("Content-Type"))
 }
 
 // TestDynamicPlugin_ConcurrentCalls tests concurrent plugin calls
@@ -806,4 +854,43 @@ func TestLoadPluginWithOptionalHooks(t *testing.T) {
 		err := dynamicPlugin.Inject(ctx, trace)
 		assert.NoError(t, err, "Inject should not error for unimplemented hook")
 	})
+}
+
+// TestSharedObjectPluginLoader_ZeroValueBlocksPrivateDownload verifies the zero-value
+// loader (used at every call site that predates the allowlist) still refuses to reach a
+// private/loopback host for a URL-based plugin path - a useful zero value must default to
+// the secure behavior, not to "no SSRF protection".
+func TestSharedObjectPluginLoader_ZeroValueBlocksPrivateDownload(t *testing.T) {
+	t.Setenv(PluginURLAllowlistEnv, "*")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	loader := &SharedObjectPluginLoader{}
+	_, err := loader.VerifyBasePlugin(server.URL)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "non-public address")
+}
+
+// TestNewSharedObjectPluginLoader_AllowlistPermitsConfiguredHost verifies a loader built
+// with an allowlist covering the target host gets past the SSRF gate - the resulting error
+// (if any) comes from plugin.Open failing on non-plugin bytes, not from the SSRF guard.
+func TestNewSharedObjectPluginLoader_AllowlistPermitsConfiguredHost(t *testing.T) {
+	t.Setenv(PluginURLAllowlistEnv, "*")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("not a real plugin binary"))
+	}))
+	defer server.Close()
+
+	u, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	allow, err := network.NewAllowlist([]string{u.Hostname()})
+	require.NoError(t, err)
+
+	loader := NewSharedObjectPluginLoader(allow)
+	_, err = loader.VerifyBasePlugin(server.URL)
+	require.Error(t, err) // fails at plugin.Open - the bytes aren't a real .so
+	assert.NotContains(t, err.Error(), "non-public address")
 }

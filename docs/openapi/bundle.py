@@ -14,9 +14,15 @@ This is fully generic - adding new component types (securitySchemes, headers,
 requestBodies, links, callbacks, etc.) to openapi.yaml requires no changes here.
 
 Usage:
-    python bundle.py                    # Output to openapi.json
-    python bundle.py --output spec.json # Output to custom file
+    python bundle.py                    # Output to openapi.json, and openapi-oss.json beside it
+    python bundle.py --output spec.json # Output to custom file (that file only)
     python bundle.py --format yaml      # Output as YAML
+    python bundle.py --edition oss --output openapi-oss.json  # OSS operations only
+
+The default run writes both specs: openapi.json (every operation, what an
+enterprise gateway serves) and openapi-oss.json (enterprise-only operations
+removed, what an OSS gateway's /v1/mcp builds its tools from). Regenerating one
+regenerates the other, so the two cannot drift.
 
 Requirements:
     pip install pyyaml
@@ -312,6 +318,8 @@ class OpenAPIBundler:
                     else value
                 )
 
+        annotate_deprecated_operations(output)
+
         return output
 
     def _resolve_paths(self, paths: Dict[str, Any], entry_path: Path) -> Dict[str, Any]:
@@ -332,6 +340,116 @@ class OpenAPIBundler:
             else:
                 resolved[path_name] = self._resolve_value(path_ref, entry_path)
         return resolved
+
+
+# -----------------------------------------------------------------------------
+# Deprecation annotations
+# -----------------------------------------------------------------------------
+
+HTTP_METHODS = ("get", "post", "put", "patch", "delete", "options", "head", "trace")
+
+REMOVAL_PHRASES = {
+    "following-major-release": "the following major release",
+}
+
+DEPRECATION_TAG = "Removing soon"
+DEPRECATED_SUMMARY_SUFFIX = " (deprecated path)"
+
+
+def annotate_deprecated_operations(spec: Dict[str, Any]) -> int:
+    """
+    Mark every operation carrying `x-bifrost-successor` as deprecating soon.
+
+    Legacy aliases $ref their successor operation, so they inherit its summary
+    verbatim. Mintlify derives a page route from tag + summary, meaning an alias
+    and its successor would collide on the same route. Suffixing the summary both
+    disambiguates the route and labels the endpoint in the navigation.
+
+    Runs on the bundled output so the annotations stay in sync with the
+    successor operations the aliases are defined against.
+    """
+    annotated = 0
+    for path_item in spec.get("paths", {}).values():
+        if not isinstance(path_item, dict):
+            continue
+        for method in HTTP_METHODS:
+            operation = path_item.get(method)
+            if not isinstance(operation, dict):
+                continue
+            successor = operation.get("x-bifrost-successor")
+            if not successor:
+                continue
+
+            operation["deprecated"] = True
+
+            summary = str(operation.get("summary") or "")
+            if not summary.endswith(DEPRECATED_SUMMARY_SUFFIX):
+                operation["summary"] = summary + DEPRECATED_SUMMARY_SUFFIX
+
+            removal = REMOVAL_PHRASES.get(
+                str(operation.get("x-bifrost-removal") or ""), "a future major release"
+            )
+            notice = (
+                "<Warning>\n"
+                f"  This path is deprecated and will be removed in {removal}.\n"
+                f"  Use `{successor}` instead.\n"
+                "</Warning>\n"
+            )
+
+            # x-mint is inherited from the successor - copy before mutating so the
+            # successor's own metadata is left untouched.
+            x_mint = copy.deepcopy(operation.get("x-mint") or {})
+            metadata = dict(x_mint.get("metadata") or {})
+            metadata["tag"] = DEPRECATION_TAG
+            x_mint["metadata"] = metadata
+            x_mint["content"] = notice + str(x_mint.get("content") or "")
+            operation["x-mint"] = x_mint
+
+            annotated += 1
+    return annotated
+
+
+# -----------------------------------------------------------------------------
+# Editions
+# -----------------------------------------------------------------------------
+
+ENTERPRISE_TAG = "Enterprise"
+
+
+def is_enterprise_operation(operation: Dict[str, Any]) -> bool:
+    """An operation marked enterprise-only with `x-mint.metadata.tag: Enterprise`."""
+    metadata = (operation.get("x-mint") or {}).get("metadata") or {}
+    return metadata.get("tag") == ENTERPRISE_TAG
+
+
+def filter_oss_edition(spec: Dict[str, Any]) -> int:
+    """
+    Drop the enterprise-only operations, leaving the OSS gateway's API.
+
+    A deprecated alias carries the deprecation tag rather than its successor's
+    (see annotate_deprecated_operations), so it goes with its successor: it is
+    dropped when the operation it redirects to is enterprise-only. Paths left
+    with no operation are removed. Returns the number of operations dropped.
+    """
+    paths = spec.get("paths", {})
+
+    def successor_is_enterprise(operation: Dict[str, Any], method: str) -> bool:
+        successor = paths.get(str(operation.get("x-bifrost-successor") or ""))
+        return isinstance(successor, dict) and isinstance(successor.get(method), dict) and is_enterprise_operation(successor[method])
+
+    dropped = [
+        (path, method)
+        for path, item in paths.items()
+        if isinstance(item, dict)
+        for method in HTTP_METHODS
+        if isinstance(item.get(method), dict)
+        and (is_enterprise_operation(item[method]) or successor_is_enterprise(item[method], method))
+    ]
+    for path, method in dropped:
+        del paths[path][method]
+    for path in [p for p, item in paths.items() if isinstance(item, dict) and not any(m in item for m in HTTP_METHODS)]:
+        del paths[path]
+    return len(dropped)
 
 
 # -----------------------------------------------------------------------------
@@ -359,6 +477,10 @@ def main() -> None:
         "--indent", type=int, default=2,
         help="Indentation level for output (default: 2)",
     )
+    parser.add_argument(
+        "--edition", choices=["full", "oss"], default="full",
+        help="full: every operation (default); oss: enterprise-only operations removed",
+    )
 
     args = parser.parse_args()
 
@@ -368,6 +490,8 @@ def main() -> None:
     try:
         bundler = OpenAPIBundler(base_path)
         spec = bundler.bundle(args.input)
+        if args.edition == "oss":
+            print(f"  - Enterprise-only operations removed: {filter_oss_edition(spec)}")
 
         output_path = base_path / args.output
         with open(output_path, "w", encoding="utf-8") as f:
@@ -377,6 +501,17 @@ def main() -> None:
                 yaml.dump(spec, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
 
         print(f"✓ Bundled specification written to: {output_path}")
+
+        # The default run also writes the OSS edition beside openapi.json, so the
+        # committed pair always comes from one bundle. A custom --output (a check
+        # bundling to a temp file) writes only what it asked for.
+        if args.edition == "full" and args.format == "json" and args.output == "openapi.json":
+            oss_spec = copy.deepcopy(spec)
+            removed = filter_oss_edition(oss_spec)
+            oss_path = base_path / "openapi-oss.json"
+            with open(oss_path, "w", encoding="utf-8") as f:
+                json.dump(oss_spec, f, indent=args.indent, ensure_ascii=False)
+            print(f"✓ OSS edition written to: {oss_path} ({removed} enterprise-only operations removed)")
 
         paths_count = len(spec.get("paths", {}))
         print(f"  - Paths: {paths_count}")

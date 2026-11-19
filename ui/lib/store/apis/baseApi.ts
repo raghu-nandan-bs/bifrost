@@ -1,51 +1,58 @@
 import { IS_ENTERPRISE } from "@/lib/constants/config";
+import i18n from "@/lib/i18n";
 import { BifrostErrorResponse } from "@/lib/types/config";
 import { getApiBaseUrl } from "@/lib/utils/port";
 import { createBaseQueryWithRefresh } from "@enterprise/lib/store/utils/baseQueryWithRefresh";
 import { clearOAuthStorage } from "@enterprise/lib/store/utils/tokenManager";
+import { getViewAsUserId } from "@enterprise/lib/store/utils/viewAs";
 import { createApi, fetchBaseQuery } from "@reduxjs/toolkit/query/react";
 import { getActiveTempToken, getSuppressGlobal401 } from "./tempToken";
+import { getCurrentAppPath, stripBasePath } from "@/lib/utils/basePath";
+import { buildLoginHref } from "@/lib/utils/loginGoto";
 
 // Auth tokens are now stored in HTTP-only cookies (set by server)
 // No client-side token needed — handled by credentials: "include"
 export const getTokenFromStorage = (): Promise<string | null> => {
-  return Promise.resolve(null);
+	return Promise.resolve(null);
 };
 
 // Helper function to set auth token
 // Non-enterprise: no-op — auth relies on HTTPOnly cookies set by the server
 // Enterprise: handled separately via tokenManager
 export const setAuthToken = (_token: string | null) => {
-  // Non-enterprise auth is cookie-based; no client-side token storage needed.
-  // Enterprise token management is handled by the tokenManager module.
+	// Non-enterprise auth is cookie-based; no client-side token storage needed.
+	// Enterprise token management is handled by the tokenManager module.
 };
 
 // Helper function to clear all auth-related storage
 export const clearAuthStorage = () => {
-  if (typeof window === "undefined") {
-    return;
-  }
-  try {
-    // Clear traditional auth token
-    localStorage.removeItem("bifrost-auth-token");
+	if (typeof window === "undefined") {
+		return;
+	}
+	try {
+		// Clear traditional auth token
+		localStorage.removeItem("bifrost-auth-token");
 
-    // Clear enterprise OAuth tokens using tokenManager
-    if (IS_ENTERPRISE) {
-      clearOAuthStorage();
-    }
-  } catch (error) {
-    console.error("Error clearing auth storage:", error);
-  }
+		// Clear enterprise OAuth tokens using tokenManager
+		if (IS_ENTERPRISE) {
+			clearOAuthStorage();
+		}
+	} catch (error) {
+		console.error("Error clearing auth storage:", error);
+	}
 };
 
 // Define the base query with authentication headers
 const baseQuery = fetchBaseQuery({
 	baseUrl: getApiBaseUrl(),
 	credentials: "include",
-	prepareHeaders: async (headers) => {
-    if (!headers.has("Content-Type")) {
-      headers.set("Content-Type", "application/json");
-    }
+	prepareHeaders: async (headers, { arg }) => {
+		// Skip the JSON default for multipart/FormData uploads so the browser
+		// can set Content-Type with the multipart boundary itself (e.g. uploadSkillFile).
+		const isFormData = arg !== null && typeof arg === "object" && arg.body instanceof FormData;
+		if (!isFormData && !headers.has("Content-Type")) {
+			headers.set("Content-Type", "application/json");
+		}
 		// Automatically include token from localStorage in Authorization header
 		const token = await getTokenFromStorage();
 		if (token) {
@@ -59,6 +66,11 @@ const baseQuery = fetchBaseQuery({
 		if (tempToken) {
 			headers.set("X-Bifrost-Temp-Token", tempToken);
 		}
+		// While an admin views the gateway as another user, every call reads as that user.
+		const viewAsUserId = getViewAsUserId();
+		if (viewAsUserId) {
+			headers.set("X-Bifrost-View-As", viewAsUserId);
+		}
 		return headers;
 	},
 });
@@ -67,17 +79,13 @@ const baseQuery = fetchBaseQuery({
 const baseQueryWithRefresh = createBaseQueryWithRefresh(baseQuery);
 
 // Enhanced base query with error handling
-const baseQueryWithErrorHandling: typeof baseQueryWithRefresh = async (
-  args: any,
-  api: any,
-  extraOptions: any,
-) => {
-  // First apply refresh logic (enterprise-specific, handles 401)
-  const result = await baseQueryWithRefresh(args, api, extraOptions);
+const baseQueryWithErrorHandling: typeof baseQueryWithRefresh = async (args: any, api: any, extraOptions: any) => {
+	// First apply refresh logic (enterprise-specific, handles 401)
+	const result = await baseQueryWithRefresh(args, api, extraOptions);
 
-  // Then handle other error types
-  if (result.error) {
-    const error = result.error as any;
+	// Then handle other error types
+	if (result.error) {
+		const error = result.error as any;
 
 		// Handle 401 for non-enterprise (no refresh available)
 		if (error?.status === 401 && !IS_ENTERPRISE) {
@@ -88,145 +96,191 @@ const baseQueryWithErrorHandling: typeof baseQueryWithRefresh = async (
 				return result;
 			}
 			clearAuthStorage();
-			if (typeof window !== "undefined" && !window.location.pathname.includes("/login")) {
-				const goto = window.location.pathname + window.location.search;
-				window.location.href = `/login?goto=${encodeURIComponent(goto)}`;
+			if (typeof window !== "undefined" && !stripBasePath(window.location.pathname).includes("/login")) {
+				const goto = getCurrentAppPath();
+				window.location.href = buildLoginHref(goto);
 			}
 			return result;
 		}
 
-    // Handle specific error types
-    if (error?.status === "FETCH_ERROR") {
-      // Network error
-      return {
-        ...result,
-        error: {
-          ...error,
-          data: {
-            error: {
-              message: "Network error: Unable to connect to the server",
-            },
-          },
-        },
-      };
-    }
+		// Handle specific error types
+		if (error?.status === "FETCH_ERROR") {
+			// Network error
+			return {
+				...result,
+				error: {
+					...error,
+					data: {
+						error: {
+							message: i18n.t("apiErrors.networkUnreachable"),
+						},
+					},
+				},
+			};
+		}
 
-    // Handle other errors with proper BifrostErrorResponse format
-    if (error?.data) {
-      const errorData = error.data as BifrostErrorResponse;
-      if (errorData.error?.message) {
-        return result;
-      }
-    }
+		// Handle other errors with proper BifrostErrorResponse format
+		if (error?.data) {
+			const errorData = error.data as BifrostErrorResponse;
+			if (errorData.error?.message) {
+				return result;
+			}
+		}
 
-    // Fallback error message
-    return {
-      ...result,
-      error: {
-        ...error,
-        data: {
-          error: {
-            message: "An unexpected error occurred",
-          },
-        },
-      },
-    };
-  }
+		// Fallback error message
+		return {
+			...result,
+			error: {
+				...error,
+				data: {
+					error: {
+						message: i18n.t("apiErrors.unexpected"),
+					},
+				},
+			},
+		};
+	}
 
-  return result;
+	return result;
 };
 
 // Create the base API
 export const baseApi = createApi({
-  reducerPath: "api",
-  baseQuery: baseQueryWithErrorHandling,
-  tagTypes: [
-    "Logs",
-    "MCPLogs",
-    "Providers",
-    "MCPClients",
-    "Config",
-    "CacheConfig",
-    "VirtualKeys",
-    "Teams",
-    "Customers",
-    "Budgets",
-    "RateLimits",
-    "UsageStats",
-    "DebugStats",
-    "HealthCheck",
-    "DBKeys",
-    "ProviderKeys",
-    "Models",
-    "BaseModels",
-    "ModelConfigs",
-    "ProviderGovernance",
-    "Plugins",
-    "SCIMProviders",
-    "User",
-    "Guardrails",
-    "ClusterNodes",
-    "Users",
-    "GuardrailRules",
-    "Roles",
-    "Resources",
-    "Operations",
-    "Permissions",
-    "APIKeys",
-    "OAuth2Config",
-    "RoutingRules",
-    "PricingOverrides",
-    "MCPToolGroups",
-    "AuditLogs",
-    "UserGovernance",
-    "LargePayloadConfig",
-    "Folders",
-    "Prompts",
-    "Versions",
-    "Sessions",
-    "AccessProfiles",
-    "BusinessUnits",
-    "PromptDeployments",
-    "AuthType",
-    "MCPSessions",
-    "MCPPerUserHeaderCredentials",
-    "FeatureFlags",
-  ],
-  endpoints: () => ({}),
+	reducerPath: "api",
+	baseQuery: baseQueryWithErrorHandling,
+	tagTypes: [
+		"Datasheet",
+		"Logs",
+		"MCPLogs",
+		"Providers",
+		"MCPClients",
+		"MCPClientOpenAPISpec",
+		"Config",
+		"CacheConfig",
+		"VirtualKeys",
+		"Teams",
+		"Customers",
+		"Budgets",
+		"RateLimits",
+		"UsageStats",
+		"DebugStats",
+		"HealthCheck",
+		"DBKeys",
+		"ProviderKeys",
+		"Models",
+		"BaseModels",
+		"ModelConfigs",
+		"ProviderGovernance",
+		"Plugins",
+		"SCIMProviders",
+		"User",
+		"Guardrails",
+		"ClusterNodes",
+		"ClusterMetrics",
+		"ClusterIncidents",
+		"ClusterMonitorConfig",
+		"ClusterStorage",
+		"Users",
+		"GuardrailRules",
+		"Roles",
+		"Resources",
+		"Operations",
+		"Permissions",
+		"APIKeys",
+		"OAuth2Config",
+		"RoutingRules",
+		"PricingOverrides",
+		"MCPToolGroups",
+		"VirtualMCPs",
+		"AuditLogs",
+		"UserGovernance",
+		"LargePayloadConfig",
+		"LoadBalancerConfig",
+		"LoadBalancerHistory",
+		"Folders",
+		"Prompts",
+		"Versions",
+		"Sessions",
+		"AccessProfiles",
+		// The profile a team, business unit or customer holds. Separate from AccessProfiles so
+		// attaching to one entity does not refetch every template list on the page.
+		"EntityAccessProfiles",
+		"Projects",
+		"BusinessUnits",
+		"PromptDeployments",
+		"AuthType",
+		"MCPSessions",
+		"MCPPerUserHeaderCredentials",
+		"MCPLibrary",
+		"FeatureFlags",
+		"ComplexityAnalyzerConfig",
+		"ModelRouters",
+		"ComplexitySuggestions",
+		"Skills",
+		"OAuth2Grants",
+		"IDJAGClients",
+		"WorkloadIdentities",
+		"UserAgentMappings",
+		"Branding",
+		"Devices",
+		"CircuitBreakerPolicies",
+		"CircuitBreakerState",
+		"AlertChannels",
+		"AlertRules",
+		"AlertHistory",
+		"WebhookEndpoints",
+		"WebhookDeliveries",
+		"EdgeApps",
+		"EdgeMCPServers",
+		"EdgeConfig",
+		"Notifications",
+		"RSSFeeds",
+		"RSSItems",
+		"RSSSettings",
+		"SidekiqJobs",
+		"WarpConfig",
+		"WarpBackfillStatus",
+		"WarpConversations",
+		"Agents",
+		"AgentLogs",
+		"Relays",
+		"RelayLogs",
+	],
+	endpoints: () => ({}),
 });
+
+export const getErrorCode = (error: unknown): string | undefined => {
+	if (typeof error !== "object" || !error || !("data" in error)) {
+		return undefined;
+	}
+	const data = (error as { data?: BifrostErrorResponse }).data;
+	return typeof data?.error?.code === "string" ? data.error.code : undefined;
+};
 
 // Helper function to extract error message from RTK Query error
 export const getErrorMessage = (error: unknown): string => {
-  if (error === undefined || error === null) {
-    return "An unexpected error occurred";
-  }
-  if (error instanceof Error) {
-    return error.message;
-  }
-  if (
-    typeof error === "object" &&
-    error &&
-    "data" in error &&
-    error.data &&
-    typeof error.data === "object" &&
-    "error" in error.data &&
-    error.data.error &&
-    typeof error.data.error === "object" &&
-    "message" in error.data.error &&
-    typeof error.data.error.message === "string"
-  ) {
-    return (
-      error.data.error.message.charAt(0).toUpperCase() +
-      error.data.error.message.slice(1)
-    );
-  }
-  if (
-    typeof error === "object" &&
-    error &&
-    "message" in error &&
-    typeof error.message === "string"
-  ) {
-    return error.message;
-  }
-  return "An unexpected error occurred";
+	if (error === undefined || error === null) {
+		return "An unexpected error occurred";
+	}
+	if (error instanceof Error) {
+		return error.message;
+	}
+	if (
+		typeof error === "object" &&
+		error &&
+		"data" in error &&
+		error.data &&
+		typeof error.data === "object" &&
+		"error" in error.data &&
+		error.data.error &&
+		typeof error.data.error === "object" &&
+		"message" in error.data.error &&
+		typeof error.data.error.message === "string"
+	) {
+		return error.data.error.message.charAt(0).toUpperCase() + error.data.error.message.slice(1);
+	}
+	if (typeof error === "object" && error && "message" in error && typeof error.message === "string") {
+		return error.message;
+	}
+	return "An unexpected error occurred";
 };

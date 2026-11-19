@@ -1,6 +1,8 @@
+import i18n from "@/lib/i18n";
 import { Message, type CompletionUsage, type ToolCall, type VariableMap, replaceVariablesInMessages } from "@/lib/message";
 import { getErrorMessage } from "@/lib/store";
 import type { ModelParams } from "@/lib/types/prompts";
+import { getExampleBaseUrl } from "@/lib/utils/port";
 
 export interface ExecutionConfig {
 	provider: string;
@@ -11,12 +13,9 @@ export interface ExecutionConfig {
 	customHeaders?: Record<string, string>;
 }
 
+/** Origin (plus base path) that playground requests are sent to. */
 function getBaseUrl() {
-	if (process.env.NODE_ENV === "development") {
-		return "http://localhost:8080";
-	} else {
-		return "";
-	}
+	return getExampleBaseUrl();
 }
 
 function buildHeaders(config: Pick<ExecutionConfig, "apiKeyId" | "customHeaders">): Record<string, string> {
@@ -118,7 +117,7 @@ export async function executePrompt(
 			}
 		} else {
 			const reader = response.body?.getReader();
-			if (!reader) throw new Error("No response body");
+			if (!reader) throw new Error(i18n.t("promptRepo.noResponseBody", { ns: "config" }));
 
 			const decoder = new TextDecoder();
 			let assistantContent = "";
@@ -221,10 +220,7 @@ export class MCPAuthRequiredError extends Error {
 	}
 }
 
-export async function executeToolCall(
-	toolCall: ToolCall,
-	config: Pick<ExecutionConfig, "apiKeyId" | "customHeaders">,
-): Promise<string> {
+export async function executeToolCall(toolCall: ToolCall, config: Pick<ExecutionConfig, "apiKeyId" | "customHeaders">): Promise<string> {
 	const headers = buildHeaders(config);
 
 	const response = await fetch(`${getBaseUrl()}/v1/mcp/tool/execute`, {
@@ -251,7 +247,7 @@ export async function executeToolCall(
 			if (authRequired) {
 				throw new MCPAuthRequiredError({
 					kind: authRequired.kind,
-					mcpClientName: authRequired.mcp_client_name || "MCP server",
+					mcpClientName: authRequired.mcp_client_name || i18n.t("promptRepo.mcpServerFallback", { ns: "config" }),
 					authorizeUrl: authRequired.authorize_url || authRequired.submit_url || "",
 					message: authRequired.message || errorMessage,
 				});

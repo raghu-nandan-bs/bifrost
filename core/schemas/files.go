@@ -19,11 +19,12 @@ const (
 type FileStatus string
 
 const (
-	FileStatusUploaded   FileStatus = "uploaded"
-	FileStatusProcessed  FileStatus = "processed"
-	FileStatusProcessing FileStatus = "processing"
-	FileStatusError      FileStatus = "error"
-	FileStatusDeleted    FileStatus = "deleted"
+	FileStatusUploaded      FileStatus = "uploaded"
+	FileStatusProcessed     FileStatus = "processed"
+	FileStatusProcessing    FileStatus = "processing"
+	FileStatusPendingUpload FileStatus = "pending_upload" // resumable session minted, bytes not yet received (Vertex)
+	FileStatusError         FileStatus = "error"
+	FileStatusDeleted       FileStatus = "deleted"
 )
 
 // FileStorageBackend represents the storage backend type.
@@ -44,6 +45,8 @@ type FileObject struct {
 	CreatedAt     int64       `json:"created_at"`
 	UpdatedAt     int64       `json:"updated_at,omitempty"`
 	Filename      string      `json:"filename"`
+	ContentType   string      `json:"content_type,omitempty"` // MIME type reported by the provider
+	Downloadable  *bool       `json:"downloadable,omitempty"` // Nil when the provider does not report downloadability
 	Purpose       FilePurpose `json:"purpose"`
 	Status        FileStatus  `json:"status,omitempty"`
 	StatusDetails *string     `json:"status_details,omitempty"`
@@ -57,6 +60,7 @@ type BifrostFileUploadRequest struct {
 
 	// File content
 	File        []byte      `json:"-"`                      // Raw file content (not serialized)
+	FileSource  BodySource  `json:"-"`                      // File as a handle (HTTP uploads), used instead of File; see FileSourceUploader
 	Filename    string      `json:"filename"`               // Original filename
 	Purpose     FilePurpose `json:"purpose"`                // Purpose of the file (e.g., "batch")
 	ContentType *string     `json:"content_type,omitempty"` // MIME type of the file
@@ -104,6 +108,8 @@ type BifrostFileUploadResponse struct {
 	Bytes         int64       `json:"bytes"`
 	CreatedAt     int64       `json:"created_at"`
 	Filename      string      `json:"filename"`
+	ContentType   string      `json:"content_type,omitempty"` // MIME type reported by the provider
+	Downloadable  *bool       `json:"downloadable,omitempty"` // Nil when the provider does not report downloadability
 	Purpose       FilePurpose `json:"purpose"`
 	Status        FileStatus  `json:"status,omitempty"`
 	StatusDetails *string     `json:"status_details,omitempty"`
@@ -112,6 +118,10 @@ type BifrostFileUploadResponse struct {
 	// Storage backend info
 	StorageBackend FileStorageBackend `json:"storage_backend,omitempty"`
 	StorageURI     string             `json:"storage_uri,omitempty"` // S3/GCS URI if applicable
+
+	// GCS resumable upload session URL (Vertex only, set when File bytes are not provided).
+	// Client PUTs file bytes directly to this URL; Bifrost stays out of the data path.
+	UploadURL *string `json:"upload_url,omitempty"`
 
 	ExtraFields BifrostResponseExtraFields `json:"extra_fields"`
 }
@@ -182,6 +192,8 @@ type BifrostFileRetrieveResponse struct {
 	CreatedAt     int64       `json:"created_at"`
 	UpdatedAt     int64       `json:"updated_at,omitempty"`
 	Filename      string      `json:"filename"`
+	ContentType   string      `json:"content_type,omitempty"` // MIME type reported by the provider
+	Downloadable  *bool       `json:"downloadable,omitempty"` // Nil when the provider does not report downloadability
 	Purpose       FilePurpose `json:"purpose"`
 	Status        FileStatus  `json:"status,omitempty"`
 	StatusDetails *string     `json:"status_details,omitempty"`

@@ -1,14 +1,25 @@
 package integrations
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream"
+	"github.com/bytedance/sonic"
+	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/providers/bedrock"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/kvstore"
 	"github.com/maximhq/bifrost/framework/logstore"
-	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
+	"github.com/maximhq/bifrost/framework/modelcatalog"
+	"github.com/maximhq/bifrost/framework/modelcatalog/datasheet"
+	"github.com/maximhq/bifrost/transports/v2/bifrost-http/lib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
@@ -19,14 +30,18 @@ type mockHandlerStore struct {
 	headerMatcher              *lib.HeaderMatcher
 	availableProviders         []schemas.ModelProvider
 	mcpHeaderCombinedAllowlist schemas.WhiteList
+	modelCatalog               *modelcatalog.ModelCatalog
+	customProviders            map[schemas.ModelProvider]mockCustomProvider
+}
+
+// mockCustomProvider is what GetCustomProviderPassthrough reports for one custom provider.
+type mockCustomProvider struct {
+	base        schemas.ModelProvider
+	passthrough bool
 }
 
 func (m *mockHandlerStore) GetHeaderMatcher() *lib.HeaderMatcher {
 	return m.headerMatcher
-}
-
-func (m *mockHandlerStore) GetProvidersForModel(model string) []schemas.ModelProvider {
-	return m.availableProviders
 }
 
 func (m *mockHandlerStore) GetStreamChunkInterceptor() lib.StreamChunkInterceptor {
@@ -61,6 +76,28 @@ func (m *mockHandlerStore) ShouldAllowDirectKeys() bool {
 	return false
 }
 
+func (m *mockHandlerStore) ShouldSendExtraFieldsInHeaders() bool {
+	return false
+}
+
+func (m *mockHandlerStore) ShouldCaptureClientIP() bool {
+	return false
+}
+
+func (m *mockHandlerStore) IsProviderConfigured(provider schemas.ModelProvider) bool {
+	for _, p := range m.availableProviders {
+		if p == provider {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *mockHandlerStore) GetCustomProviderPassthrough(provider schemas.ModelProvider) (schemas.ModelProvider, bool, bool) {
+	custom, ok := m.customProviders[provider]
+	return custom.base, custom.passthrough, ok
+}
+
 func (m *mockHandlerStore) GetMCPExternalServerURL() string {
 	return ""
 }
@@ -69,8 +106,41 @@ func (m *mockHandlerStore) GetMCPExternalClientURL() string {
 	return ""
 }
 
+func (m *mockHandlerStore) GetModelCatalog() *modelcatalog.ModelCatalog {
+	return m.modelCatalog
+}
+
 // Ensure mockHandlerStore implements lib.HandlerStore
 var _ lib.HandlerStore = (*mockHandlerStore)(nil)
+
+func TestGenericRouter_ModelCatalogMarksDeprecatedListModels(t *testing.T) {
+	pricingPath := filepath.Join(t.TempDir(), "pricing.json")
+	pricingJSON := []byte(`{
+		"deprecated-model": {"provider":"openai","mode":"chat","base_model":"deprecated-model","is_deprecated":true},
+		"current-model": {"provider":"openai","mode":"chat","base_model":"current-model"}
+	}`)
+	require.NoError(t, os.WriteFile(pricingPath, pricingJSON, 0o600))
+	ds := datasheet.New(nil, nil, datasheet.Config{URL: "file://" + pricingPath})
+	require.NoError(t, ds.LoadFromURLIntoMemory(t.Context()))
+	router := NewGenericRouter(nil, &mockHandlerStore{modelCatalog: modelcatalog.NewTestCatalogWithDatasheet(ds)}, nil, nil, nil, nil)
+	resp := &schemas.BifrostListModelsResponse{Data: []schemas.Model{
+		{ID: "openai/deprecated-model"},
+		{ID: "openai/current-model"},
+		{ID: "openai/provider-deprecated", IsDeprecated: true},
+	}}
+
+	router.modelCatalog().EnrichListModelsResponse(resp)
+
+	// No models are removed; deprecated ones are flagged instead.
+	require.Len(t, resp.Data, 3)
+	byID := map[string]schemas.Model{}
+	for _, m := range resp.Data {
+		byID[m.ID] = m
+	}
+	assert.True(t, byID["openai/deprecated-model"].IsDeprecated)
+	assert.False(t, byID["openai/current-model"].IsDeprecated)
+	assert.True(t, byID["openai/provider-deprecated"].IsDeprecated)
+}
 
 func Test_parseS3URI(t *testing.T) {
 	tests := []struct {
@@ -179,6 +249,7 @@ func Test_createBedrockConverseStreamRouteConfig(t *testing.T) {
 	assert.Equal(t, "POST", route.Method)
 	assert.Equal(t, RouteConfigTypeBedrock, route.Type)
 	assert.NotNil(t, route.StreamConfig)
+	assert.NotNil(t, route.StreamConfig.ErrorConverter)
 	assert.NotNil(t, route.StreamConfig.ResponsesStreamResponseConverter)
 
 	// Verify request instance type
@@ -203,6 +274,206 @@ func Test_createBedrockInvokeRouteConfig(t *testing.T) {
 	assert.True(t, ok, "GetRequestTypeInstance should return *bedrock.BedrockInvokeRequest")
 }
 
+func TestBedrockInvokeEmbeddingResponseLangChainCohereAlias(t *testing.T) {
+	handlerStore := &mockHandlerStore{}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	response := &schemas.BifrostEmbeddingResponse{
+		Model: "cohere.embed-english-v3",
+		Data: []schemas.EmbeddingData{
+			{
+				Index:  0,
+				Object: "embedding",
+				Embedding: schemas.EmbeddingStruct{
+					EmbeddingArray: []float64{0.25, 0.75},
+				},
+			},
+		},
+		Object: "list",
+	}
+
+	bedrockRoute := createBedrockInvokeRouteConfig("/bedrock", handlerStore)
+	bedrockResult, err := bedrockRoute.EmbeddingResponseConverter(ctx, response)
+	require.NoError(t, err)
+	bedrockJSON, err := json.Marshal(bedrockResult)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"embeddings":[[0.25,0.75]],
+		"response_type":"embeddings_floats"
+	}`, string(bedrockJSON), "native Bedrock must retain the AWS Cohere envelope")
+
+	langChainRoute := withLangChainBedrockEmbeddingCompatibility([]RouteConfig{createBedrockInvokeRouteConfig("/langchain", handlerStore)})[0]
+	langChainResult, err := langChainRoute.EmbeddingResponseConverter(ctx, response)
+	require.NoError(t, err)
+	langChainJSON, err := json.Marshal(langChainResult)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"embedding":[0.25,0.75],
+		"embeddings":[[0.25,0.75]],
+		"response_type":"embeddings_floats"
+	}`, string(langChainJSON), "LangChain needs singular embedding while native clients retain embeddings")
+}
+
+func TestBedrockInvokeTypedCohereResponseLangChainAlias(t *testing.T) {
+	handlerStore := &mockHandlerStore{}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	response := &schemas.BifrostEmbeddingResponse{
+		Model:  "cohere.embed-v4:0",
+		Object: "list",
+		Data: []schemas.EmbeddingData{
+			{
+				Index:          0,
+				Object:         "embedding",
+				Embedding:      schemas.EmbeddingStruct{EmbeddingArray: []float64{0.25, 0.75}},
+				EncodingFormat: schemas.EmbeddingEncodingFloat,
+			},
+			{
+				Index:          0,
+				Object:         "embedding",
+				Embedding:      schemas.EmbeddingStruct{EmbeddingInt8Array: []int8{1, -1}},
+				EncodingFormat: schemas.EmbeddingEncodingInt8,
+			},
+		},
+	}
+
+	bedrockRoute := createBedrockInvokeRouteConfig("/bedrock", handlerStore)
+	bedrockResult, err := bedrockRoute.EmbeddingResponseConverter(ctx, response)
+	require.NoError(t, err)
+	bedrockJSON, err := json.Marshal(bedrockResult)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"response_type":"embeddings_by_type",
+		"embeddings":{"float":[[0.25,0.75]],"int8":[[1,-1]]}
+	}`, string(bedrockJSON), "native Bedrock must retain the typed AWS envelope")
+
+	langChainRoute := withLangChainBedrockEmbeddingCompatibility([]RouteConfig{createBedrockInvokeRouteConfig("/langchain", handlerStore)})[0]
+	result, err := langChainRoute.EmbeddingResponseConverter(ctx, response)
+	require.NoError(t, err)
+	resultJSON, err := json.Marshal(result)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"response_type":"embeddings_by_type",
+		"embedding":[0.25,0.75],
+		"embeddings":{"float":[[0.25,0.75]],"int8":[[1,-1]]}
+	}`, string(resultJSON), "the alias must expose the float representation LangChain expects")
+}
+
+func TestBedrockInvokeTypedCohereResponseWithoutFloatIsNotAliased(t *testing.T) {
+	handlerStore := &mockHandlerStore{}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	response := &schemas.BifrostEmbeddingResponse{
+		Model:  "cohere.embed-v4:0",
+		Object: "list",
+		Data: []schemas.EmbeddingData{
+			{
+				Index:          0,
+				Object:         "embedding",
+				Embedding:      schemas.EmbeddingStruct{EmbeddingInt8Array: []int8{1, -1}},
+				EncodingFormat: schemas.EmbeddingEncodingInt8,
+			},
+		},
+	}
+
+	// LangChain's BedrockEmbeddings reads a number[] and never requests typed
+	// encodings, so an int8-only envelope has nothing meaningful to alias.
+	langChainRoute := withLangChainBedrockEmbeddingCompatibility([]RouteConfig{createBedrockInvokeRouteConfig("/langchain", handlerStore)})[0]
+	result, err := langChainRoute.EmbeddingResponseConverter(ctx, response)
+	require.NoError(t, err)
+	resultJSON, err := json.Marshal(result)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"response_type":"embeddings_by_type",
+		"embeddings":{"int8":[[1,-1]]}
+	}`, string(resultJSON))
+}
+
+func TestBedrockInvokeEmbeddingResponseLangChainLeavesTitanUnchanged(t *testing.T) {
+	handlerStore := &mockHandlerStore{}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	response := &schemas.BifrostEmbeddingResponse{
+		Model: "amazon.titan-embed-text-v2:0",
+		Data: []schemas.EmbeddingData{
+			{
+				Index:  0,
+				Object: "embedding",
+				Embedding: schemas.EmbeddingStruct{
+					EmbeddingArray: []float64{0.25, 0.75},
+				},
+			},
+		},
+		Object: "list",
+	}
+
+	langChainRoute := withLangChainBedrockEmbeddingCompatibility([]RouteConfig{createBedrockInvokeRouteConfig("/langchain", handlerStore)})[0]
+	result, err := langChainRoute.EmbeddingResponseConverter(ctx, response)
+	require.NoError(t, err)
+	_, ok := result.(*bedrock.BedrockInvokeEmbeddingResp)
+	assert.True(t, ok)
+}
+
+func TestBedrockInvokeTypedTitanResponseLangChainLeavesEnvelopeUnchanged(t *testing.T) {
+	handlerStore := &mockHandlerStore{}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	response := &schemas.BifrostEmbeddingResponse{
+		Model:  "amazon.titan-embed-text-v2:0",
+		Object: "list",
+		Data: []schemas.EmbeddingData{
+			{
+				Index:          0,
+				Object:         "embedding",
+				Embedding:      schemas.EmbeddingStruct{EmbeddingArray: []float64{0.25, 0.75}},
+				EncodingFormat: schemas.EmbeddingEncodingFloat,
+			},
+			{
+				Index:          0,
+				Object:         "embedding",
+				Embedding:      schemas.EmbeddingStruct{EmbeddingInt8Array: []int8{1, 0}},
+				EncodingFormat: schemas.EmbeddingEncodingBinary,
+			},
+		},
+	}
+
+	langChainRoute := withLangChainBedrockEmbeddingCompatibility([]RouteConfig{createBedrockInvokeRouteConfig("/langchain", handlerStore)})[0]
+	result, err := langChainRoute.EmbeddingResponseConverter(ctx, response)
+	require.NoError(t, err)
+	resultJSON, err := json.Marshal(result)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"embedding":[0.25,0.75],
+		"embeddingsByType":{"float":[0.25,0.75],"binary":[1,0]},
+		"inputTextTokenCount":0
+	}`, string(resultJSON), "Titan already carries the singular field AWS defines; the alias must not touch it")
+}
+
+func TestBedrockInvokeTypedCohereResponseUsesResolvedModelForAlias(t *testing.T) {
+	handlerStore := &mockHandlerStore{}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	response := &schemas.BifrostEmbeddingResponse{
+		Object: "list",
+		ExtraFields: schemas.BifrostResponseExtraFields{
+			ResolvedModelUsed: "cohere.embed-v4:0",
+		},
+		Data: []schemas.EmbeddingData{
+			{
+				Index:          0,
+				Object:         "embedding",
+				Embedding:      schemas.EmbeddingStruct{EmbeddingArray: []float64{0.25, 0.75}},
+				EncodingFormat: schemas.EmbeddingEncodingFloat,
+			},
+		},
+	}
+
+	langChainRoute := withLangChainBedrockEmbeddingCompatibility([]RouteConfig{createBedrockInvokeRouteConfig("/langchain", handlerStore)})[0]
+	result, err := langChainRoute.EmbeddingResponseConverter(ctx, response)
+	require.NoError(t, err)
+	resultJSON, err := json.Marshal(result)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"response_type":"embeddings_by_type",
+		"embedding":[0.25,0.75],
+		"embeddings":{"float":[[0.25,0.75]]}
+	}`, string(resultJSON), "family resolution must fall back to the resolved model")
+}
+
 func Test_createBedrockInvokeWithResponseStreamRouteConfig(t *testing.T) {
 	handlerStore := &mockHandlerStore{}
 	route := createBedrockInvokeWithResponseStreamRouteConfig("/bedrock", handlerStore)
@@ -211,6 +482,7 @@ func Test_createBedrockInvokeWithResponseStreamRouteConfig(t *testing.T) {
 	assert.Equal(t, "POST", route.Method)
 	assert.Equal(t, RouteConfigTypeBedrock, route.Type)
 	assert.NotNil(t, route.StreamConfig)
+	assert.NotNil(t, route.StreamConfig.ErrorConverter)
 	assert.NotNil(t, route.StreamConfig.TextStreamResponseConverter)
 	assert.NotNil(t, route.StreamConfig.ResponsesStreamResponseConverter)
 
@@ -218,6 +490,118 @@ func Test_createBedrockInvokeWithResponseStreamRouteConfig(t *testing.T) {
 	reqInstance := route.GetRequestTypeInstance(context.Background())
 	_, ok := reqInstance.(*bedrock.BedrockInvokeRequest)
 	assert.True(t, ok, "GetRequestTypeInstance should return *bedrock.BedrockInvokeRequest")
+}
+
+func Test_bedrockStreamErrorConverterEncodesEventStreamException(t *testing.T) {
+	errType := "PluginDenied"
+	statusCode := fasthttp.StatusForbidden
+	bifrostErr := &schemas.BifrostError{
+		Type:       &errType,
+		StatusCode: &statusCode,
+		Error: &schemas.ErrorField{
+			Message: "blocked by policy",
+		},
+	}
+
+	converted := bedrockStreamErrorConverter(nil, bifrostErr)
+	exception, ok := converted.(*bedrockEventStreamException)
+	require.True(t, ok)
+
+	reader := lib.NewSSEStreamReader()
+	require.True(t, sendBedrockEventStreamException(reader, eventstream.NewEncoder(), exception, bifrost.NewNoOpLogger()))
+	reader.Done()
+
+	body, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.False(t, bytes.HasPrefix(body, []byte("data: ")), "Bedrock streaming errors must not be plain SSE")
+
+	msg, err := eventstream.NewDecoder().Decode(bytes.NewReader(body), nil)
+	require.NoError(t, err)
+	assert.Equal(t, "exception", eventStreamHeaderString(t, msg.Headers, ":message-type"))
+	assert.Equal(t, "PluginDenied", eventStreamHeaderString(t, msg.Headers, ":exception-type"))
+	assert.JSONEq(t, `{"__type":"PluginDenied","message":"blocked by policy"}`, string(msg.Payload))
+	assert.False(t, strings.Contains(string(body), "data:"), "AWS EventStream bytes must not contain SSE framing")
+}
+
+func Test_toBedrockEventStreamExceptionAcceptsBedrockError(t *testing.T) {
+	exception, ok := toBedrockEventStreamException(&bedrock.BedrockError{
+		Type:    "ValidationException",
+		Message: "invalid request",
+	})
+	require.True(t, ok)
+
+	reader := lib.NewSSEStreamReader()
+	require.True(t, sendBedrockEventStreamException(reader, eventstream.NewEncoder(), exception, bifrost.NewNoOpLogger()))
+	reader.Done()
+
+	body, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.False(t, bytes.HasPrefix(body, []byte("data: ")), "Bedrock streaming errors must not be plain SSE")
+
+	msg, err := eventstream.NewDecoder().Decode(bytes.NewReader(body), nil)
+	require.NoError(t, err)
+	assert.Equal(t, "exception", eventStreamHeaderString(t, msg.Headers, ":message-type"))
+	assert.Equal(t, "ValidationException", eventStreamHeaderString(t, msg.Headers, ":exception-type"))
+	assert.JSONEq(t, `{"__type":"ValidationException","message":"invalid request"}`, string(msg.Payload))
+}
+
+func Test_handleStreamingBedrockUnknownErrorResponseFallsBackToEventStreamException(t *testing.T) {
+	stream := make(chan *schemas.BifrostStreamChunk, 1)
+	statusCode := fasthttp.StatusInternalServerError
+	stream <- &schemas.BifrostStreamChunk{
+		BifrostError: &schemas.BifrostError{
+			StatusCode: &statusCode,
+			Error: &schemas.ErrorField{
+				Message: "plugin returned an unsupported error envelope",
+			},
+		},
+	}
+	close(stream)
+
+	router := NewGenericRouter(nil, &mockHandlerStore{}, nil, nil, nil, bifrost.NewNoOpLogger())
+	ctx := &fasthttp.RequestCtx{}
+	rec := newCancelRecorder()
+	router.handleStreaming(ctx, nil, RouteConfig{
+		Type: RouteConfigTypeBedrock,
+		StreamConfig: &StreamConfig{
+			ErrorConverter: func(ctx *schemas.BifrostContext, err *schemas.BifrostError) interface{} {
+				return map[string]interface{}{
+					"unexpected": "shape",
+				}
+			},
+		},
+	}, "", stream, rec.cancel)
+
+	body, err := io.ReadAll(ctx.Response.BodyStream())
+	require.NoError(t, err)
+	require.NotEmpty(t, body)
+	require.False(t, bytes.HasPrefix(body, []byte("data: ")), "Bedrock fallback errors must not be plain SSE")
+
+	msg, err := eventstream.NewDecoder().Decode(bytes.NewReader(body), nil)
+	require.NoError(t, err)
+	assert.Equal(t, "exception", eventStreamHeaderString(t, msg.Headers, ":message-type"))
+	assert.Equal(t, "InternalServerException", eventStreamHeaderString(t, msg.Headers, ":exception-type"))
+	assert.JSONEq(t, `{"__type":"InternalServerException","message":"An error occurred while processing your request"}`, string(msg.Payload))
+	// handleStreaming cancels the request context on every exit path, a clean end-of-stream
+	// included, so the client-disconnect watcher goroutine ConvertToBifrostContext started
+	// cannot outlive the request (see Test_handleStreaming_RetentionCancelsAndLeavesNoGoroutine).
+	// The cancel therefore no longer distinguishes a successful fallback write from a real
+	// client disconnect — the frame asserted above is what does: on a disconnect the producer
+	// returns early and no InternalServerException is ever written.
+	rec.requireCancelled(t, "handleStreaming did not cancel the request context after the stream ended")
+}
+
+func eventStreamHeaderString(t *testing.T, headers eventstream.Headers, name string) string {
+	t.Helper()
+	for _, header := range headers {
+		if header.Name == name {
+			value, ok := header.Value.Get().(string)
+			require.True(t, ok, "%s header must be a string", name)
+			return value
+		}
+	}
+	t.Fatalf("missing EventStream header %s", name)
+	return ""
 }
 
 func Test_createBedrockRerankRouteConfig(t *testing.T) {
@@ -241,6 +625,50 @@ func Test_createBedrockRerankRouteConfig(t *testing.T) {
 	assert.True(t, ok, "GetRequestTypeInstance should return *bedrock.BedrockRerankRequest")
 }
 
+func Test_createBedrockRerankResponseConverterEmitsBedrockShape(t *testing.T) {
+	handlerStore := &mockHandlerStore{}
+	route := createBedrockRerankRouteConfig("/bedrock", handlerStore)
+	require.NotNil(t, route.RerankResponseConverter)
+
+	resp := &schemas.BifrostRerankResponse{
+		Results: []schemas.RerankResult{
+			{Index: 1, RelevanceScore: 0.92, Document: &schemas.RerankDocument{Text: "Paris is capital of France"}},
+			{Index: 0, RelevanceScore: 0.11, Document: &schemas.RerankDocument{Text: "Berlin is capital of Germany"}},
+		},
+		Model: "arn:aws:bedrock:us-east-1::foundation-model/cohere.rerank-v3-5:0",
+		ExtraFields: schemas.BifrostResponseExtraFields{
+			Provider: schemas.Bedrock,
+		},
+	}
+
+	converted, err := route.RerankResponseConverter(nil, resp)
+	require.NoError(t, err)
+
+	bedrockResp, ok := converted.(*bedrock.BedrockRerankResponse)
+	require.True(t, ok, "converter should emit *bedrock.BedrockRerankResponse")
+	require.Len(t, bedrockResp.Results, 2)
+	assert.Equal(t, 1, bedrockResp.Results[0].Index)
+	assert.InDelta(t, 0.92, bedrockResp.Results[0].RelevanceScore, 1e-9)
+	require.NotNil(t, bedrockResp.Results[0].Document)
+	require.NotNil(t, bedrockResp.Results[0].Document.TextDocument)
+	assert.Equal(t, "Paris is capital of France", bedrockResp.Results[0].Document.TextDocument.Text)
+	assert.Equal(t, "Berlin is capital of Germany", bedrockResp.Results[1].Document.TextDocument.Text)
+
+	// AWS SDKs key off camelCase relevanceScore; the Bifrost shape must not leak.
+	encoded, err := sonic.Marshal(bedrockResp)
+	require.NoError(t, err)
+	var payload map[string]interface{}
+	require.NoError(t, sonic.Unmarshal(encoded, &payload))
+	assert.NotContains(t, payload, "model")
+	assert.NotContains(t, payload, "extra_fields")
+	results, ok := payload["results"].([]interface{})
+	require.True(t, ok)
+	first, ok := results[0].(map[string]interface{})
+	require.True(t, ok)
+	assert.Contains(t, first, "relevanceScore")
+	assert.NotContains(t, first, "relevance_score")
+}
+
 func Test_createBedrockRerankResponseConverterUsesRawResponse(t *testing.T) {
 	handlerStore := &mockHandlerStore{}
 	route := createBedrockRerankRouteConfig("/bedrock", handlerStore)
@@ -256,6 +684,25 @@ func Test_createBedrockRerankResponseConverterUsesRawResponse(t *testing.T) {
 	converted, err := route.RerankResponseConverter(nil, resp)
 	require.NoError(t, err)
 	assert.Equal(t, raw, converted)
+}
+
+func Test_createBedrockRerankResponseConverterConvertsForCrossProvider(t *testing.T) {
+	handlerStore := &mockHandlerStore{}
+	route := createBedrockRerankRouteConfig("/bedrock", handlerStore)
+
+	// A Cohere-shaped raw body must never reach a Bedrock client.
+	resp := &schemas.BifrostRerankResponse{
+		Results: []schemas.RerankResult{{Index: 0, RelevanceScore: 0.5}},
+		ExtraFields: schemas.BifrostResponseExtraFields{
+			Provider:    schemas.Cohere,
+			RawResponse: map[string]interface{}{"id": "r-123"},
+		},
+	}
+	converted, err := route.RerankResponseConverter(nil, resp)
+	require.NoError(t, err)
+	bedrockResp, ok := converted.(*bedrock.BedrockRerankResponse)
+	require.True(t, ok, "cross-provider responses must be converted, not passed through")
+	require.Len(t, bedrockResp.Results, 1)
 }
 
 func Test_createBedrockRerankRouteRequestConverter(t *testing.T) {
@@ -276,7 +723,7 @@ func Test_createBedrockRerankRouteRequestConverter(t *testing.T) {
 				Type: "INLINE",
 				InlineDocumentSource: bedrock.BedrockRerankInlineSource{
 					Type:         "TEXT",
-					TextDocument: bedrock.BedrockRerankTextValue{Text: "Paris is capital of France"},
+					TextDocument: &bedrock.BedrockRerankTextValue{Text: "Paris is capital of France"},
 				},
 			},
 		},
@@ -296,13 +743,17 @@ func Test_createBedrockRerankRouteRequestConverter(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, bifrostReq)
 	require.NotNil(t, bifrostReq.RerankRequest)
-	assert.Equal(t, schemas.Bedrock, bifrostReq.RerankRequest.Provider)
+	// Converters leave Provider empty; resolution happens later in the
+	// modelcatalogresolver PreRequestHook.
+	assert.Equal(t, schemas.ModelProvider(""), bifrostReq.RerankRequest.Provider)
 	assert.Equal(t, "capital of france", bifrostReq.RerankRequest.Query)
 	require.Len(t, bifrostReq.RerankRequest.Documents, 1)
 	assert.Equal(t, "Paris is capital of France", bifrostReq.RerankRequest.Documents[0].Text)
 	require.NotNil(t, bifrostReq.RerankRequest.Params)
 	require.NotNil(t, bifrostReq.RerankRequest.Params.TopN)
 	assert.Equal(t, 1, *bifrostReq.RerankRequest.Params.TopN)
+	// The live Rerank API returns no document, so the route must not force documents on.
+	assert.Nil(t, bifrostReq.RerankRequest.Params.ReturnDocuments)
 }
 
 func Test_createBedrockRouteConfigsIncludesRerankForCompositePrefixes(t *testing.T) {
@@ -933,4 +1384,94 @@ func createTestBifrostContextWithProvider(provider schemas.ModelProvider) *schem
 	bifrostCtx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
 	bifrostCtx.SetValue(bifrostContextKeyProvider, provider)
 	return bifrostCtx
+}
+
+// Test_createBedrockInvokeRouteConfig_MarksAnthropicInvokeIngress is the transport half of
+// #7649. AWS Converse never reports a thinking-token breakdown, so a request that arrives on
+// the InvokeModel-shaped ingress with thinking requested has to be served by InvokeModel
+// upstream to keep usage.output_tokens_details.thinking_tokens. The ingress cannot pick the
+// upstream API itself (that is the provider's call), so it marks the context and the Bedrock
+// provider's routing predicate keys on the marker. Both invoke routes must set it.
+func Test_createBedrockInvokeRouteConfig_MarksAnthropicInvokeIngress(t *testing.T) {
+	marker := schemas.BifrostContextKey("bedrock-anthropic-invoke-ingress")
+	body := `{"anthropic_version":"bedrock-2023-05-31","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive"}}`
+
+	for _, tc := range []struct {
+		name  string
+		route RouteConfig
+	}{
+		{name: "invoke", route: createBedrockInvokeRouteConfig("/bedrock", &mockHandlerStore{})},
+		{name: "invoke-with-response-stream", route: createBedrockInvokeWithResponseStreamRouteConfig("/bedrock", &mockHandlerStore{})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := &bedrock.BedrockInvokeRequest{}
+			require.NoError(t, sonic.Unmarshal([]byte(body), req))
+			req.ModelID = "bedrock/global.anthropic.claude-sonnet-5"
+
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			ctx.SetValue(schemas.BifrostContextKeyHTTPRequestType, schemas.ResponsesRequest)
+
+			bifrostReq, err := tc.route.RequestConverter(ctx, req)
+			require.NoError(t, err)
+			require.NotNil(t, bifrostReq.ResponsesRequest)
+			require.NotNil(t, bifrostReq.ResponsesRequest.Params)
+			require.NotNil(t, bifrostReq.ResponsesRequest.Params.Reasoning, "thinking must survive the ingress conversion")
+
+			marked, _ := ctx.Value(marker).(bool)
+			assert.True(t, marked, "the InvokeModel-shaped ingress must mark the context so the Bedrock provider can route thinking requests to InvokeModel upstream")
+		})
+	}
+}
+
+// Test_bedrockPreCallback_ReadsInvokeGuardrailHeaders pins the InvokeModel ingress half of
+// #7696's follow-up: the X-Amzn-Bedrock-Guardrail* request headers, the AWS-native way to
+// name a guardrail on InvokeModel, reach the canonical guardrailConfig extra param.
+func Test_bedrockPreCallback_ReadsInvokeGuardrailHeaders(t *testing.T) {
+	body := `{"anthropic_version":"bedrock-2023-05-31","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`
+	for _, tc := range []struct {
+		name  string
+		route RouteConfig
+	}{
+		{name: "invoke", route: createBedrockInvokeRouteConfig("/bedrock", &mockHandlerStore{})},
+		{name: "invoke-with-response-stream", route: createBedrockInvokeWithResponseStreamRouteConfig("/bedrock", &mockHandlerStore{})},
+	} {
+		t.Run(tc.name+"/headers present", func(t *testing.T) {
+			httpCtx := &fasthttp.RequestCtx{}
+			httpCtx.SetUserValue("modelId", "global.anthropic.claude-haiku-4-5-20251001-v1:0")
+			httpCtx.Request.Header.Set("X-Amzn-Bedrock-GuardrailIdentifier", "gr-header")
+			httpCtx.Request.Header.Set("X-Amzn-Bedrock-GuardrailVersion", "3")
+			httpCtx.Request.Header.Set("X-Amzn-Bedrock-Trace", "enabled")
+
+			req := &bedrock.BedrockInvokeRequest{}
+			require.NoError(t, sonic.Unmarshal([]byte(body), req))
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			ctx.SetValue(schemas.BifrostContextKeyHTTPRequestType, schemas.ResponsesRequest)
+			require.NoError(t, tc.route.PreCallback(httpCtx, ctx, req))
+
+			bifrostReq, err := tc.route.RequestConverter(ctx, req)
+			require.NoError(t, err)
+			require.NotNil(t, bifrostReq.ResponsesRequest)
+			require.NotNil(t, bifrostReq.ResponsesRequest.Params)
+			config, ok := bifrostReq.ResponsesRequest.Params.ExtraParams["guardrailConfig"].(map[string]interface{})
+			require.True(t, ok, "guardrail headers must reach the canonical guardrailConfig extra param: %v", bifrostReq.ResponsesRequest.Params.ExtraParams)
+			assert.Equal(t, "gr-header", config["guardrailIdentifier"])
+			assert.Equal(t, "3", config["guardrailVersion"])
+			assert.Equal(t, "enabled", config["trace"])
+		})
+		t.Run(tc.name+"/headers absent", func(t *testing.T) {
+			httpCtx := &fasthttp.RequestCtx{}
+			httpCtx.SetUserValue("modelId", "global.anthropic.claude-haiku-4-5-20251001-v1:0")
+			req := &bedrock.BedrockInvokeRequest{}
+			require.NoError(t, sonic.Unmarshal([]byte(body), req))
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			ctx.SetValue(schemas.BifrostContextKeyHTTPRequestType, schemas.ResponsesRequest)
+			require.NoError(t, tc.route.PreCallback(httpCtx, ctx, req))
+			bifrostReq, err := tc.route.RequestConverter(ctx, req)
+			require.NoError(t, err)
+			if bifrostReq.ResponsesRequest.Params != nil {
+				_, has := bifrostReq.ResponsesRequest.Params.ExtraParams["guardrailConfig"]
+				assert.False(t, has, "no guardrail must be invented without headers")
+			}
+		})
+	}
 }

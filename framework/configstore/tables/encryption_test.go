@@ -39,7 +39,9 @@ func setupTestDB(t *testing.T) *gorm.DB {
 		&SessionsTable{},
 		&TableOauthConfig{},
 		&TableOauthToken{},
+		&TableMCPOauthFlow{},
 		&TableVectorStoreConfig{},
+		&TableWebhookEndpoint{},
 	)
 	require.NoError(t, err)
 	return db
@@ -56,7 +58,7 @@ func rawRow(t *testing.T, db *gorm.DB, table string, id any) map[string]any {
 	return row
 }
 
-func envVarPtrValue(v *schemas.EnvVar) string {
+func secretVarPtrValue(v *schemas.SecretVar) string {
 	if v == nil {
 		return ""
 	}
@@ -75,7 +77,7 @@ func TestTableKey_EncryptDecrypt(t *testing.T) {
 		ProviderID: 1,
 		Provider:   "openai",
 		KeyID:      "key-uuid-1",
-		Value:      *schemas.NewEnvVar("sk-secret-api-key"),
+		Value:      *schemas.NewSecretVar("sk-secret-api-key"),
 	}
 
 	require.NoError(t, db.Create(key).Error)
@@ -94,20 +96,20 @@ func TestTableKey_EncryptDecrypt(t *testing.T) {
 func TestTableKey_AzureFieldsEncryptDecrypt(t *testing.T) {
 	db := setupTestDB(t)
 
-	endpoint := schemas.NewEnvVar("https://my-azure.openai.azure.com")
-	clientSecret := schemas.NewEnvVar("azure-secret-123")
+	endpoint := schemas.NewSecretVar("https://my-azure.openai.azure.com")
+	clientSecret := schemas.NewSecretVar("azure-secret-123")
 
 	key := &TableKey{
 		Name:       "azure-key",
 		ProviderID: 1,
 		Provider:   "azure",
 		KeyID:      "azure-uuid-1",
-		Value:      *schemas.NewEnvVar("azure-api-key"),
+		Value:      *schemas.NewSecretVar("azure-api-key"),
 		AzureKeyConfig: &schemas.AzureKeyConfig{
 			Endpoint:     *endpoint,
-			ClientID:     schemas.NewEnvVar("azure-client-id-123"),
+			ClientID:     schemas.NewSecretVar("azure-client-id-123"),
 			ClientSecret: clientSecret,
-			TenantID:     schemas.NewEnvVar("azure-tenant-id-456"),
+			TenantID:     schemas.NewSecretVar("azure-tenant-id-456"),
 		},
 	}
 
@@ -142,12 +144,12 @@ func TestTableKey_VertexFieldsEncryptDecrypt(t *testing.T) {
 		ProviderID: 1,
 		Provider:   "vertex",
 		KeyID:      "vertex-uuid-1",
-		Value:      *schemas.NewEnvVar("vertex-api-key"),
+		Value:      *schemas.NewSecretVar("vertex-api-key"),
 		VertexKeyConfig: &schemas.VertexKeyConfig{
-			ProjectID:       *schemas.NewEnvVar("my-project"),
-			ProjectNumber:   *schemas.NewEnvVar("123456789"),
-			Region:          *schemas.NewEnvVar("us-central1"),
-			AuthCredentials: *schemas.NewEnvVar(`{"type":"service_account"}`),
+			ProjectID:       *schemas.NewSecretVar("my-project"),
+			ProjectNumber:   *schemas.NewSecretVar("123456789"),
+			Region:          *schemas.NewSecretVar("us-central1"),
+			AuthCredentials: *schemas.NewSecretVar(`{"type":"service_account"}`),
 		},
 	}
 
@@ -169,6 +171,225 @@ func TestTableKey_VertexFieldsEncryptDecrypt(t *testing.T) {
 	assert.Equal(t, `{"type":"service_account"}`, found.VertexKeyConfig.AuthCredentials.GetValue())
 }
 
+func TestTableKey_OAuthFieldsEncryptDecrypt(t *testing.T) {
+	db := setupTestDB(t)
+
+	const pemBody = "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJB\n-----END RSA PRIVATE KEY-----"
+
+	key := &TableKey{
+		Name:       "oauth-key",
+		ProviderID: 1,
+		Provider:   "acme_openai",
+		KeyID:      "oauth-uuid-1",
+		OAuthKeyConfig: &schemas.OAuthKeyConfig{
+			GrantType:                schemas.OAuthGrantJWTBearer,
+			TokenURL:                 *schemas.NewSecretVar("https://idp.example/oauth2/token"),
+			ClientID:                 schemas.NewSecretVar("cid-123"),
+			ClientSecret:             schemas.NewSecretVar("client-secret-456"),
+			PrivateKey:               schemas.NewSecretVar(pemBody),
+			Scopes:                   []string{"inference", "models"},
+			Audience:                 "https://idp.example/oauth2/token",
+			Issuer:                   "client-123",
+			Subject:                  "svc@example",
+			KeyID:                    "kid-1",
+			SigningAlgorithm:         "RS512",
+			AuthStyle:                schemas.OAuthAuthStyleBody,
+			ExtraParams:              map[string]string{"resource": "api://x"},
+			AssertionLifetimeSeconds: 120,
+		},
+	}
+
+	require.NoError(t, db.Create(key).Error)
+
+	raw := rawRow(t, db, "config_keys", key.ID)
+	assert.Equal(t, "encrypted", raw["encryption_status"])
+	// The secret and the private key are the whole credential; none of the four may sit in
+	// the table as plaintext, and none may leak into the settings column.
+	assert.NotEqual(t, pemBody, raw["oauth_private_key"])
+	assert.NotEqual(t, "client-secret-456", raw["oauth_client_secret"])
+	assert.NotEqual(t, "cid-123", raw["oauth_client_id"])
+	assert.NotEqual(t, "https://idp.example/oauth2/token", raw["oauth_token_url"])
+	settings, _ := raw["oauth_settings_json"].(string)
+	assert.NotContains(t, settings, "client-secret-456")
+	assert.NotContains(t, settings, "MIIBOgIBAAJB")
+	assert.NotContains(t, settings, "cid-123")
+	// extra_params may carry a credential, so the settings column is encrypted at rest too.
+	assert.NotContains(t, settings, `"jwt_bearer"`)
+	assert.NotContains(t, settings, "api://x")
+	assert.NotEmpty(t, settings)
+
+	var found TableKey
+	require.NoError(t, db.First(&found, key.ID).Error)
+	require.NotNil(t, found.OAuthKeyConfig)
+	got := found.OAuthKeyConfig
+	assert.Equal(t, schemas.OAuthGrantJWTBearer, got.GrantType)
+	assert.Equal(t, "https://idp.example/oauth2/token", got.TokenURL.GetValue())
+	require.NotNil(t, got.ClientID)
+	assert.Equal(t, "cid-123", got.ClientID.GetValue())
+	require.NotNil(t, got.ClientSecret)
+	assert.Equal(t, "client-secret-456", got.ClientSecret.GetValue())
+	require.NotNil(t, got.PrivateKey)
+	assert.Equal(t, pemBody, got.PrivateKey.GetValue())
+	assert.Equal(t, []string{"inference", "models"}, got.Scopes)
+	assert.Equal(t, "https://idp.example/oauth2/token", got.Audience)
+	assert.Equal(t, "client-123", got.Issuer)
+	assert.Equal(t, "svc@example", got.Subject)
+	assert.Equal(t, "kid-1", got.KeyID)
+	assert.Equal(t, "RS512", got.SigningAlgorithm)
+	assert.Equal(t, schemas.OAuthAuthStyleBody, got.AuthStyle)
+	assert.Equal(t, map[string]string{"resource": "api://x"}, got.ExtraParams)
+	assert.Equal(t, 120, got.AssertionLifetimeSeconds)
+}
+
+func TestTableKey_OAuthClientCredentialsOmitsUnsetFields(t *testing.T) {
+	db := setupTestDB(t)
+
+	key := &TableKey{
+		Name:       "oauth-cc",
+		ProviderID: 1,
+		Provider:   "acme_openai",
+		KeyID:      "oauth-uuid-2",
+		OAuthKeyConfig: &schemas.OAuthKeyConfig{
+			GrantType:    schemas.OAuthGrantClientCredentials,
+			TokenURL:     *schemas.NewSecretVar("https://idp.example/token"),
+			ClientID:     schemas.NewSecretVar("id"),
+			ClientSecret: schemas.NewSecretVar("secret"),
+		},
+	}
+	require.NoError(t, db.Create(key).Error)
+
+	var found TableKey
+	require.NoError(t, db.First(&found, key.ID).Error)
+	require.NotNil(t, found.OAuthKeyConfig)
+	assert.Nil(t, found.OAuthKeyConfig.PrivateKey, "an unset private key must round-trip as nil, not as an empty secret")
+	assert.Empty(t, found.OAuthKeyConfig.Scopes)
+	assert.Equal(t, schemas.OAuthGrantClientCredentials, found.OAuthKeyConfig.GrantType)
+}
+
+func TestTableKey_NoOAuthConfig_LeavesNil(t *testing.T) {
+	db := setupTestDB(t)
+
+	key := &TableKey{
+		Name:       "static-key",
+		ProviderID: 1,
+		Provider:   "openai",
+		KeyID:      "static-uuid-1",
+		Value:      *schemas.NewSecretVar("sk-test"),
+	}
+	require.NoError(t, db.Create(key).Error)
+
+	var found TableKey
+	require.NoError(t, db.First(&found, key.ID).Error)
+	assert.Nil(t, found.OAuthKeyConfig, "a static key must not gain an empty oauth config on read")
+}
+
+// TestTableKey_AnthropicWorkloadIdentityEncryptDecrypt pins the anthropic_workload_identity_json
+// column: every field survives save and find, the identity token is never readable at rest, and an
+// env reference is stored as the reference rather than the value it resolves to.
+func TestTableKey_AnthropicWorkloadIdentityEncryptDecrypt(t *testing.T) {
+	db := setupTestDB(t)
+	t.Setenv("TEST_ANTHROPIC_WIF_ORG_ID", "8c1d0f5e-0000-4000-8000-000000000001")
+
+	const jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzeXN0ZW06c2VydmljZWFjY291bnQ6Ymlmcm9zdCJ9.c2lnbmF0dXJl"
+	key := &TableKey{
+		Name:       "anthropic-wif-key",
+		ProviderID: 1,
+		Provider:   "anthropic",
+		KeyID:      "anthropic-wif-uuid-1",
+		AnthropicKeyConfig: &schemas.AnthropicKeyConfig{
+			WorkloadIdentity: &schemas.AnthropicWorkloadIdentityConfig{
+				FederationRuleID: *schemas.NewSecretVar("fdrl_01abc"),
+				OrganizationID:   *schemas.NewSecretVar("env.TEST_ANTHROPIC_WIF_ORG_ID"),
+				ServiceAccountID: *schemas.NewSecretVar("svac_01def"),
+				WorkspaceID:      schemas.NewSecretVar("wrkspc_01ghi"),
+				IdentitySource:   &schemas.IdentitySource{Type: schemas.IdentitySourceInline, Token: schemas.NewSecretVar(jwt)},
+			},
+		},
+	}
+	require.NoError(t, db.Create(key).Error)
+
+	raw := rawRow(t, db, "config_keys", key.ID)
+	assert.Equal(t, "encrypted", raw["encryption_status"])
+	stored, _ := raw["anthropic_workload_identity_json"].(string)
+	require.NotEmpty(t, stored)
+	assert.NotContains(t, stored, jwt, "the identity token must be encrypted at rest")
+	assert.NotContains(t, stored, "fdrl_01abc", "the whole block is encrypted, not only the token")
+	plain, err := encrypt.Decrypt(stored)
+	require.NoError(t, err)
+	assert.Contains(t, plain, `"organization_id":"env.TEST_ANTHROPIC_WIF_ORG_ID"`)
+	assert.NotContains(t, plain, "8c1d0f5e", "the resolved env value must not be persisted")
+
+	var found TableKey
+	require.NoError(t, db.First(&found, key.ID).Error)
+	require.True(t, found.AnthropicKeyConfig.HasWorkloadIdentity())
+	got := found.AnthropicKeyConfig.WorkloadIdentity
+	assert.Equal(t, "fdrl_01abc", got.FederationRuleID.GetValue())
+	assert.True(t, got.OrganizationID.IsFromEnv(), "the env reference must survive persistence")
+	assert.Equal(t, "env.TEST_ANTHROPIC_WIF_ORG_ID", got.OrganizationID.GetRawRef())
+	assert.Equal(t, "8c1d0f5e-0000-4000-8000-000000000001", got.OrganizationID.GetValue())
+	assert.Equal(t, "svac_01def", got.ServiceAccountID.GetValue())
+	assert.Equal(t, "wrkspc_01ghi", secretVarPtrValue(got.WorkspaceID))
+	require.NotNil(t, got.IdentitySource)
+	assert.Equal(t, schemas.IdentitySourceInline, got.IdentitySource.Type)
+	assert.Equal(t, jwt, secretVarPtrValue(got.IdentitySource.Token))
+
+	// Clearing the block clears the column.
+	found.AnthropicKeyConfig = nil
+	require.NoError(t, db.Save(&found).Error)
+	assert.Nil(t, rawRow(t, db, "config_keys", key.ID)["anthropic_workload_identity_json"])
+	var cleared TableKey
+	require.NoError(t, db.First(&cleared, key.ID).Error)
+	assert.Nil(t, cleared.AnthropicKeyConfig)
+}
+
+func TestTableKey_AnthropicWorkloadIdentityOmitsUnsetFields(t *testing.T) {
+	db := setupTestDB(t)
+
+	key := &TableKey{
+		Name:       "anthropic-wif-file",
+		ProviderID: 1,
+		Provider:   "anthropic",
+		KeyID:      "anthropic-wif-uuid-2",
+		AnthropicKeyConfig: &schemas.AnthropicKeyConfig{
+			WorkloadIdentity: &schemas.AnthropicWorkloadIdentityConfig{
+				FederationRuleID: *schemas.NewSecretVar("fdrl_01abc"),
+				OrganizationID:   *schemas.NewSecretVar("org-uuid"),
+				ServiceAccountID: *schemas.NewSecretVar("svac_01def"),
+				IdentitySource:   &schemas.IdentitySource{Type: schemas.IdentitySourceFile, Path: schemas.NewSecretVar("/var/run/secrets/anthropic/token")},
+			},
+		},
+	}
+	require.NoError(t, db.Create(key).Error)
+
+	var found TableKey
+	require.NoError(t, db.First(&found, key.ID).Error)
+	require.True(t, found.AnthropicKeyConfig.HasWorkloadIdentity())
+	src := found.AnthropicKeyConfig.WorkloadIdentity.IdentitySource
+	require.NotNil(t, src)
+	assert.Equal(t, "/var/run/secrets/anthropic/token", secretVarPtrValue(src.Path))
+	assert.Nil(t, src.Token, "an unset identity token must round-trip as nil")
+	assert.Nil(t, found.AnthropicKeyConfig.WorkloadIdentity.WorkspaceID)
+	assert.NoError(t, found.AnthropicKeyConfig.WorkloadIdentity.Validate(), "the reloaded block must still validate")
+}
+
+func TestTableKey_NoAnthropicConfig_LeavesNil(t *testing.T) {
+	db := setupTestDB(t)
+
+	key := &TableKey{
+		Name:       "anthropic-static",
+		ProviderID: 1,
+		Provider:   "anthropic",
+		KeyID:      "anthropic-static-uuid-1",
+		Value:      *schemas.NewSecretVar("sk-ant-test"),
+	}
+	require.NoError(t, db.Create(key).Error)
+
+	assert.Nil(t, rawRow(t, db, "config_keys", key.ID)["anthropic_workload_identity_json"])
+	var found TableKey
+	require.NoError(t, db.First(&found, key.ID).Error)
+	assert.Nil(t, found.AnthropicKeyConfig, "a static key must not gain an empty anthropic config on read")
+}
+
 func TestTableKey_BedrockFieldsEncryptDecrypt(t *testing.T) {
 	db := setupTestDB(t)
 
@@ -177,13 +398,14 @@ func TestTableKey_BedrockFieldsEncryptDecrypt(t *testing.T) {
 		ProviderID: 1,
 		Provider:   "bedrock",
 		KeyID:      "bedrock-uuid-1",
-		Value:      *schemas.NewEnvVar("bedrock-val"),
-		Aliases:    schemas.KeyAliases{"model-a": "profile-a"},
+		Value:      *schemas.NewSecretVar("bedrock-val"),
+		Aliases:    schemas.KeyAliases{"model-a": {ModelID: "profile-a"}},
 		BedrockKeyConfig: &schemas.BedrockKeyConfig{
-			AccessKey: *schemas.NewEnvVar("AKIAIOSFODNN7EXAMPLE"),
-			SecretKey: *schemas.NewEnvVar("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
-			Region:    schemas.NewEnvVar("us-west-2"),
-			ARN:       schemas.NewEnvVar("arn:aws:iam::123456789:role/test"),
+			AccessKey: *schemas.NewSecretVar("AKIAIOSFODNN7EXAMPLE"),
+			SecretKey: *schemas.NewSecretVar("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+			Region:    schemas.NewSecretVar("us-west-2"),
+			ARN:       schemas.NewSecretVar("arn:aws:iam::123456789:role/test"),
+			ProjectID: schemas.NewSecretVar("proj_bedrock123"),
 			BatchS3Config: &schemas.BatchS3Config{
 				Buckets: []schemas.S3BucketConfig{
 					{BucketName: "my-batch-bucket", Prefix: "jobs/", IsDefault: true},
@@ -200,6 +422,7 @@ func TestTableKey_BedrockFieldsEncryptDecrypt(t *testing.T) {
 	assert.NotEqual(t, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", raw["bedrock_secret_key"])
 	assert.NotEqual(t, "us-west-2", raw["bedrock_region"])
 	assert.NotEqual(t, "arn:aws:iam::123456789:role/test", raw["bedrock_arn"])
+	assert.NotEqual(t, "proj_bedrock123", raw["bedrock_project_id"])
 	rawAliasesVal := raw["aliases_json"]
 	require.NotNil(t, rawAliasesVal, "aliases_json should be present in raw row")
 	var rawAliasesStr string
@@ -224,7 +447,9 @@ func TestTableKey_BedrockFieldsEncryptDecrypt(t *testing.T) {
 	assert.Equal(t, "us-west-2", found.BedrockKeyConfig.Region.GetValue())
 	require.NotNil(t, found.BedrockKeyConfig.ARN)
 	assert.Equal(t, "arn:aws:iam::123456789:role/test", found.BedrockKeyConfig.ARN.GetValue())
-	assert.Equal(t, "profile-a", found.Aliases["model-a"])
+	require.NotNil(t, found.BedrockKeyConfig.ProjectID)
+	assert.Equal(t, "proj_bedrock123", found.BedrockKeyConfig.ProjectID.GetValue())
+	assert.Equal(t, "profile-a", found.Aliases["model-a"].ModelID)
 	require.NotNil(t, found.BedrockKeyConfig.BatchS3Config)
 	require.Len(t, found.BedrockKeyConfig.BatchS3Config.Buckets, 1)
 	assert.Equal(t, "my-batch-bucket", found.BedrockKeyConfig.BatchS3Config.Buckets[0].BucketName)
@@ -232,7 +457,7 @@ func TestTableKey_BedrockFieldsEncryptDecrypt(t *testing.T) {
 	assert.True(t, found.BedrockKeyConfig.BatchS3Config.Buckets[0].IsDefault)
 }
 
-func TestTableKey_EnvVarNotEncrypted(t *testing.T) {
+func TestTableKey_SecretVarNotEncrypted(t *testing.T) {
 	db := setupTestDB(t)
 
 	// When the value comes from an env var, it should NOT be encrypted
@@ -241,7 +466,7 @@ func TestTableKey_EnvVarNotEncrypted(t *testing.T) {
 		ProviderID: 1,
 		Provider:   "openai",
 		KeyID:      "env-uuid-1",
-		Value:      *schemas.NewEnvVar("env.OPENAI_API_KEY"),
+		Value:      *schemas.NewSecretVar("env.OPENAI_API_KEY"),
 	}
 
 	require.NoError(t, db.Create(key).Error)
@@ -249,7 +474,7 @@ func TestTableKey_EnvVarNotEncrypted(t *testing.T) {
 	var found TableKey
 	require.NoError(t, db.First(&found, key.ID).Error)
 	// The value should be readable (either the env var value or empty if not set)
-	assert.True(t, found.Value.IsFromEnv())
+	assert.True(t, found.Value.IsFromSecret())
 }
 
 // ============================================================================
@@ -260,7 +485,7 @@ func TestTableProvider_ProxyConfigEncryptDecrypt(t *testing.T) {
 	db := setupTestDB(t)
 
 	proxyConfig := &schemas.ProxyConfig{
-		URL: schemas.NewEnvVar("https://proxy.example.com"),
+		URL: schemas.NewSecretVar("https://proxy.example.com"),
 	}
 
 	provider := &TableProvider{
@@ -280,7 +505,7 @@ func TestTableProvider_ProxyConfigEncryptDecrypt(t *testing.T) {
 	var found TableProvider
 	require.NoError(t, db.First(&found, provider.ID).Error)
 	require.NotNil(t, found.ProxyConfig)
-	assert.Equal(t, "https://proxy.example.com", envVarPtrValue(found.ProxyConfig.URL))
+	assert.Equal(t, "https://proxy.example.com", secretVarPtrValue(found.ProxyConfig.URL))
 }
 
 func TestTableProvider_NoProxyConfig_NoEncryption(t *testing.T) {
@@ -304,14 +529,14 @@ func TestTableProvider_NoProxyConfig_NoEncryption(t *testing.T) {
 func TestTableMCPClient_EncryptDecrypt(t *testing.T) {
 	db := setupTestDB(t)
 
-	connStr := schemas.NewEnvVar("https://mcp-server.example.com/sse")
+	connStr := schemas.NewSecretVar("https://mcp-server.example.com/sse")
 	client := &TableMCPClient{
 		ClientID:         "mcp-1",
 		Name:             "test-mcp",
 		ConnectionType:   "sse",
 		ConnectionString: connStr,
-		Headers: map[string]schemas.EnvVar{
-			"Authorization": *schemas.NewEnvVar("Bearer secret-token"),
+		Headers: map[string]schemas.SecretVar{
+			"Authorization": *schemas.NewSecretVar("Bearer secret-token"),
 		},
 	}
 
@@ -335,10 +560,10 @@ func TestTableMCPClient_EncryptDecrypt(t *testing.T) {
 	assert.Equal(t, "Bearer secret-token", found.Headers["Authorization"].Val)
 }
 
-func TestTableMCPClient_EnvVarConnectionString_NotEncrypted(t *testing.T) {
+func TestTableMCPClient_SecretVarConnectionString_NotEncrypted(t *testing.T) {
 	db := setupTestDB(t)
 
-	connStr := schemas.NewEnvVar("env.MCP_SERVER_URL")
+	connStr := schemas.NewSecretVar("env.MCP_SERVER_URL")
 	client := &TableMCPClient{
 		ClientID:         "mcp-env",
 		Name:             "env-mcp",
@@ -350,7 +575,7 @@ func TestTableMCPClient_EnvVarConnectionString_NotEncrypted(t *testing.T) {
 
 	var found TableMCPClient
 	require.NoError(t, db.First(&found, client.ID).Error)
-	assert.True(t, found.ConnectionString.IsFromEnv())
+	assert.True(t, found.ConnectionString.IsFromSecret())
 }
 
 // ============================================================================
@@ -363,7 +588,6 @@ func TestTablePlugin_EncryptDecrypt(t *testing.T) {
 	plugin := &TablePlugin{
 		Name:    "test-plugin",
 		Enabled: true,
-		Version: 1,
 		Config:  map[string]any{"api_key": "secret-plugin-key", "endpoint": "https://plugin.example.com"},
 	}
 
@@ -388,7 +612,6 @@ func TestTablePlugin_EmptyConfig_NoEncryption(t *testing.T) {
 	plugin := &TablePlugin{
 		Name:    "empty-plugin",
 		Enabled: true,
-		Version: 1,
 		// nil Config will serialize to "{}"
 	}
 
@@ -408,7 +631,7 @@ func TestTableVirtualKey_EncryptDecrypt(t *testing.T) {
 	vk := &TableVirtualKey{
 		ID:       "vk-1",
 		Name:     "test-vk",
-		Value:    "vk-secret-value-xyz",
+		Value:    *schemas.NewSecretVar("vk-secret-value-xyz"),
 		IsActive: bifrost.Ptr(true),
 	}
 
@@ -424,7 +647,7 @@ func TestTableVirtualKey_EncryptDecrypt(t *testing.T) {
 
 	var found TableVirtualKey
 	require.NoError(t, db.First(&found, "id = ?", "vk-1").Error)
-	assert.Equal(t, "vk-secret-value-xyz", found.Value)
+	assert.Equal(t, "vk-secret-value-xyz", found.Value.GetValue())
 	assert.Equal(t, expectedHash, found.ValueHash)
 }
 
@@ -434,7 +657,7 @@ func TestTableVirtualKey_HashComputedBeforeEncryption(t *testing.T) {
 	vk := &TableVirtualKey{
 		ID:       "vk-hash",
 		Name:     "hash-test",
-		Value:    "plaintext-value",
+		Value:    *schemas.NewSecretVar("plaintext-value"),
 		IsActive: bifrost.Ptr(true),
 	}
 
@@ -495,12 +718,9 @@ func TestTableOauthConfig_EncryptDecrypt(t *testing.T) {
 
 	config := &TableOauthConfig{
 		ID:           "oauth-cfg-1",
-		ClientID:     schemas.NewEnvVar("client-id-public"),
-		ClientSecret: schemas.NewEnvVar("super-secret-client-secret"),
+		ClientID:     schemas.NewSecretVar("client-id-public"),
+		ClientSecret: schemas.NewSecretVar("super-secret-client-secret"),
 		RedirectURI:  "https://example.com/callback",
-		State:        "csrf-state-token",
-		CodeVerifier: "pkce-code-verifier-secret",
-		ExpiresAt:    time.Now().Add(15 * time.Minute),
 	}
 
 	require.NoError(t, db.Create(config).Error)
@@ -508,12 +728,10 @@ func TestTableOauthConfig_EncryptDecrypt(t *testing.T) {
 	raw := rawRow(t, db, "oauth_configs", "oauth-cfg-1")
 	assert.Equal(t, "encrypted", raw["encryption_status"])
 	assert.NotEqual(t, "super-secret-client-secret", raw["client_secret"])
-	assert.NotEqual(t, "pkce-code-verifier-secret", raw["code_verifier"])
 
 	var found TableOauthConfig
 	require.NoError(t, db.First(&found, "id = ?", "oauth-cfg-1").Error)
 	assert.Equal(t, "super-secret-client-secret", found.ClientSecret.GetValue())
-	assert.Equal(t, "pkce-code-verifier-secret", found.CodeVerifier)
 	// Non-sensitive fields should be unchanged
 	assert.Equal(t, "client-id-public", found.ClientID.GetValue())
 	assert.Equal(t, "https://example.com/callback", found.RedirectURI)
@@ -525,8 +743,6 @@ func TestTableOauthConfig_EmptySecret_NoError(t *testing.T) {
 	config := &TableOauthConfig{
 		ID:          "oauth-cfg-empty",
 		RedirectURI: "https://example.com/callback",
-		State:       "csrf-state-2",
-		ExpiresAt:   time.Now().Add(15 * time.Minute),
 	}
 
 	require.NoError(t, db.Create(config).Error)
@@ -534,6 +750,81 @@ func TestTableOauthConfig_EmptySecret_NoError(t *testing.T) {
 	var found TableOauthConfig
 	require.NoError(t, db.First(&found, "id = ?", "oauth-cfg-empty").Error)
 	assert.Equal(t, "", found.ClientSecret.GetValue())
+}
+
+// TestTableOauthConfig_SecretRef_StampsStatus covers a client_secret held as an
+// env/vault reference. There is nothing to cipher, but the row must still leave
+// plain_text: the startup backfill selects on that column, so a row left behind
+// is re-selected and re-written on every boot.
+func TestTableOauthConfig_SecretRef_StampsStatus(t *testing.T) {
+	for _, ref := range []string{"vault.oauth_configs/cfg/client_secret", "env.OAUTH_CLIENT_SECRET"} {
+		t.Run(ref, func(t *testing.T) {
+			db := setupTestDB(t)
+
+			config := &TableOauthConfig{
+				ID:           "oauth-cfg-ref",
+				ClientSecret: schemas.NewSecretVar(ref),
+				RedirectURI:  "https://example.com/callback",
+			}
+			require.NoError(t, db.Create(config).Error)
+
+			raw := rawRow(t, db, "oauth_configs", "oauth-cfg-ref")
+			assert.Equal(t, "encrypted", raw["encryption_status"])
+			assert.Equal(t, ref, raw["client_secret"], "the reference must be stored verbatim, not ciphered")
+
+			var found TableOauthConfig
+			require.NoError(t, db.First(&found, "id = ?", "oauth-cfg-ref").Error)
+			assert.Equal(t, ref, found.ClientSecret.GetRawRef())
+		})
+	}
+}
+
+// TestTableMCPOauthFlow_EncryptDecrypt covers the CodeVerifier encrypt/decrypt
+// round trip that TestTableOauthConfig_EncryptDecrypt used to exercise before
+// PKCE fields moved off TableOauthConfig onto TableMCPOauthFlow (see that
+// migration).
+func TestTableMCPOauthFlow_EncryptDecrypt(t *testing.T) {
+	db := setupTestDB(t)
+
+	flow := &TableMCPOauthFlow{
+		ID:            "flow-1",
+		MCPClientID:   "mcp-1",
+		OauthConfigID: "oauth-cfg-1",
+		State:         "csrf-state-token",
+		CodeVerifier:  "pkce-code-verifier-secret",
+		FlowMode:      "admin",
+		ExpiresAt:     time.Now().Add(15 * time.Minute),
+	}
+
+	require.NoError(t, db.Create(flow).Error)
+
+	raw := rawRow(t, db, "mcp_oauth_flows", "flow-1")
+	assert.Equal(t, "encrypted", raw["encryption_status"])
+	assert.NotEqual(t, "pkce-code-verifier-secret", raw["code_verifier"])
+
+	var found TableMCPOauthFlow
+	require.NoError(t, db.First(&found, "id = ?", "flow-1").Error)
+	assert.Equal(t, "pkce-code-verifier-secret", found.CodeVerifier)
+	// Non-sensitive fields should be unchanged
+	assert.Equal(t, "csrf-state-token", found.State)
+}
+
+func TestTableMCPOauthFlow_EmptyCodeVerifier_NoError(t *testing.T) {
+	db := setupTestDB(t)
+
+	flow := &TableMCPOauthFlow{
+		ID:            "flow-empty",
+		MCPClientID:   "mcp-1",
+		OauthConfigID: "oauth-cfg-1",
+		State:         "csrf-state-empty",
+		FlowMode:      "admin",
+		ExpiresAt:     time.Now().Add(15 * time.Minute),
+	}
+
+	require.NoError(t, db.Create(flow).Error)
+
+	var found TableMCPOauthFlow
+	require.NoError(t, db.First(&found, "id = ?", "flow-empty").Error)
 	assert.Equal(t, "", found.CodeVerifier)
 }
 
@@ -638,7 +929,7 @@ func TestTableKey_UpdatePreservesDecryption(t *testing.T) {
 		ProviderID: 1,
 		Provider:   "openai",
 		KeyID:      "update-uuid",
-		Value:      *schemas.NewEnvVar("original-key"),
+		Value:      *schemas.NewSecretVar("original-key"),
 	}
 	require.NoError(t, db.Create(key).Error)
 
@@ -648,7 +939,7 @@ func TestTableKey_UpdatePreservesDecryption(t *testing.T) {
 	assert.Equal(t, "original-key", found.Value.GetValue())
 
 	// Update value
-	found.Value = *schemas.NewEnvVar("updated-key")
+	found.Value = *schemas.NewSecretVar("updated-key")
 	require.NoError(t, db.Save(&found).Error)
 
 	// Read again
@@ -719,95 +1010,95 @@ func TestEncryptDecryptString_RoundTrip(t *testing.T) {
 	assert.Equal(t, original, s, "should match after decrypt")
 }
 
-func TestEncryptEnvVar_NilIsNoop(t *testing.T) {
-	require.NoError(t, encryptEnvVar(nil))
+func TestEncryptSecretVar_NilIsNoop(t *testing.T) {
+	require.NoError(t, encryptSecretVar(nil))
 }
 
-func TestEncryptEnvVar_EmptyValueIsNoop(t *testing.T) {
-	ev := schemas.NewEnvVar("")
-	require.NoError(t, encryptEnvVar(ev))
+func TestEncryptSecretVar_EmptyValueIsNoop(t *testing.T) {
+	ev := schemas.NewSecretVar("")
+	require.NoError(t, encryptSecretVar(ev))
 	assert.Equal(t, "", ev.Val)
 }
 
-func TestEncryptEnvVar_EnvRefIsNoop(t *testing.T) {
-	ev := schemas.NewEnvVar("env.MY_VAR")
+func TestEncryptSecretVar_EnvRefIsNoop(t *testing.T) {
+	ev := schemas.NewSecretVar("env.MY_VAR")
 	originalVal := ev.Val
-	require.NoError(t, encryptEnvVar(ev))
+	require.NoError(t, encryptSecretVar(ev))
 	// Value should not change — env var references are never encrypted
 	assert.Equal(t, originalVal, ev.Val)
-	assert.True(t, ev.IsFromEnv())
+	assert.True(t, ev.IsFromSecret())
 }
 
-func TestDecryptEnvVar_NilIsNoop(t *testing.T) {
-	require.NoError(t, decryptEnvVar(nil))
+func TestDecryptSecretVar_NilIsNoop(t *testing.T) {
+	require.NoError(t, decryptSecretVar(nil))
 }
 
-func TestDecryptEnvVar_EmptyValueIsNoop(t *testing.T) {
-	ev := schemas.NewEnvVar("")
-	require.NoError(t, decryptEnvVar(ev))
+func TestDecryptSecretVar_EmptyValueIsNoop(t *testing.T) {
+	ev := schemas.NewSecretVar("")
+	require.NoError(t, decryptSecretVar(ev))
 	assert.Equal(t, "", ev.Val)
 }
 
-func TestDecryptEnvVar_EnvRefIsNoop(t *testing.T) {
-	ev := schemas.NewEnvVar("env.MY_VAR")
+func TestDecryptSecretVar_EnvRefIsNoop(t *testing.T) {
+	ev := schemas.NewSecretVar("env.MY_VAR")
 	originalVal := ev.Val
-	require.NoError(t, decryptEnvVar(ev))
+	require.NoError(t, decryptSecretVar(ev))
 	assert.Equal(t, originalVal, ev.Val)
 }
 
-func TestEncryptDecryptEnvVar_RoundTrip(t *testing.T) {
-	ev := schemas.NewEnvVar("super-secret")
-	require.NoError(t, encryptEnvVar(ev))
+func TestEncryptDecryptSecretVar_RoundTrip(t *testing.T) {
+	ev := schemas.NewSecretVar("super-secret")
+	require.NoError(t, encryptSecretVar(ev))
 	assert.NotEqual(t, "super-secret", ev.Val)
-	require.NoError(t, decryptEnvVar(ev))
+	require.NoError(t, decryptSecretVar(ev))
 	assert.Equal(t, "super-secret", ev.Val)
 }
 
-func TestEncryptEnvVarPtr_NilOuterIsNoop(t *testing.T) {
-	require.NoError(t, encryptEnvVarPtr(nil))
+func TestEncryptSecretVarPtr_NilOuterIsNoop(t *testing.T) {
+	require.NoError(t, encryptSecretVarPtr(nil))
 }
 
-func TestEncryptEnvVarPtr_NilInnerIsNoop(t *testing.T) {
-	var ev *schemas.EnvVar
-	require.NoError(t, encryptEnvVarPtr(&ev))
+func TestEncryptSecretVarPtr_NilInnerIsNoop(t *testing.T) {
+	var ev *schemas.SecretVar
+	require.NoError(t, encryptSecretVarPtr(&ev))
 }
 
-func TestDecryptEnvVarPtr_NilOuterIsNoop(t *testing.T) {
-	require.NoError(t, decryptEnvVarPtr(nil))
+func TestDecryptSecretVarPtr_NilOuterIsNoop(t *testing.T) {
+	require.NoError(t, decryptSecretVarPtr(nil))
 }
 
-func TestDecryptEnvVarPtr_NilInnerIsNoop(t *testing.T) {
-	var ev *schemas.EnvVar
-	require.NoError(t, decryptEnvVarPtr(&ev))
+func TestDecryptSecretVarPtr_NilInnerIsNoop(t *testing.T) {
+	var ev *schemas.SecretVar
+	require.NoError(t, decryptSecretVarPtr(&ev))
 }
 
-func TestEncryptDecryptEnvVarPtr_RoundTrip(t *testing.T) {
-	ev := schemas.NewEnvVar("ptr-secret")
-	require.NoError(t, encryptEnvVarPtr(&ev))
+func TestEncryptDecryptSecretVarPtr_RoundTrip(t *testing.T) {
+	ev := schemas.NewSecretVar("ptr-secret")
+	require.NoError(t, encryptSecretVarPtr(&ev))
 	assert.NotEqual(t, "ptr-secret", ev.Val)
-	require.NoError(t, decryptEnvVarPtr(&ev))
+	require.NoError(t, decryptSecretVarPtr(&ev))
 	assert.Equal(t, "ptr-secret", ev.Val)
 }
 
 // ============================================================================
-// TableKey — BedrockSessionToken (pointer EnvVar field)
+// TableKey — BedrockSessionToken (pointer SecretVar field)
 // ============================================================================
 
 func TestTableKey_BedrockSessionTokenEncryptDecrypt(t *testing.T) {
 	db := setupTestDB(t)
 
-	sessionToken := schemas.NewEnvVar("FwoGZXIvYXdzEBYaDH...")
-	region := schemas.NewEnvVar("us-east-1")
+	sessionToken := schemas.NewSecretVar("FwoGZXIvYXdzEBYaDH...")
+	region := schemas.NewSecretVar("us-east-1")
 
 	key := &TableKey{
 		Name:       "bedrock-session-key",
 		ProviderID: 1,
 		Provider:   "bedrock",
 		KeyID:      "bedrock-st-uuid",
-		Value:      *schemas.NewEnvVar("bedrock-val-2"),
+		Value:      *schemas.NewSecretVar("bedrock-val-2"),
 		BedrockKeyConfig: &schemas.BedrockKeyConfig{
-			AccessKey:    *schemas.NewEnvVar("AKIA-ST-EXAMPLE"),
-			SecretKey:    *schemas.NewEnvVar("wJalr-ST-EXAMPLE"),
+			AccessKey:    *schemas.NewSecretVar("AKIA-ST-EXAMPLE"),
+			SecretKey:    *schemas.NewSecretVar("wJalr-ST-EXAMPLE"),
 			SessionToken: sessionToken,
 			Region:       region,
 		},
@@ -832,6 +1123,195 @@ func TestTableKey_BedrockSessionTokenEncryptDecrypt(t *testing.T) {
 	assert.Equal(t, "us-east-1", found.BedrockKeyConfig.Region.GetValue())
 }
 
+// TestTableKey_BedrockMantleProjectID_RoundTrip verifies the bedrock_mantle_project_id column
+// encrypts, persists, and reconstructs onto BedrockMantleKeyConfig.ProjectID.
+func TestTableKey_BedrockMantleProjectID_RoundTrip(t *testing.T) {
+	db := setupTestDB(t)
+
+	key := &TableKey{
+		Name:       "bedrock-mantle-proj-key",
+		ProviderID: 1,
+		Provider:   "bedrock_mantle",
+		KeyID:      "bedrock-mantle-proj-uuid",
+		Value:      *schemas.NewSecretVar("mantle-val"),
+		BedrockMantleKeyConfig: &schemas.BedrockMantleKeyConfig{
+			AccessKey: *schemas.NewSecretVar("AKIA-MANTLE-PROJ"),
+			SecretKey: *schemas.NewSecretVar("wJalr-MANTLE-PROJ"),
+			Region:    schemas.NewSecretVar("us-east-1"),
+			ProjectID: schemas.NewSecretVar("proj_elvsngya7ixv4dkb26xe"),
+		},
+	}
+
+	require.NoError(t, db.Create(key).Error)
+
+	raw := rawRow(t, db, "config_keys", key.ID)
+	assert.Equal(t, "encrypted", raw["encryption_status"])
+	assert.NotEqual(t, "proj_elvsngya7ixv4dkb26xe", raw["bedrock_mantle_project_id"])
+
+	var found TableKey
+	require.NoError(t, db.First(&found, key.ID).Error)
+	require.NotNil(t, found.BedrockMantleKeyConfig)
+	require.NotNil(t, found.BedrockMantleKeyConfig.ProjectID)
+	assert.Equal(t, "proj_elvsngya7ixv4dkb26xe", found.BedrockMantleKeyConfig.ProjectID.GetValue())
+	assert.Equal(t, "us-east-1", found.BedrockMantleKeyConfig.Region.GetValue())
+}
+
+// TestTableKey_SageMakerKeyConfig_RoundTrip verifies every sagemaker_* column is written under
+// its explicit name (GORM would otherwise derive sage_maker_*), secrets are encrypted at rest, and
+// the config is rebuilt on read. Clearing the config must null the columns.
+func TestTableKey_SageMakerKeyConfig_RoundTrip(t *testing.T) {
+	db := setupTestDB(t)
+
+	const runtimeHost = "vpce-0abc123-x1y2z3.runtime.sagemaker.us-east-1.vpce.amazonaws.com"
+	key := &TableKey{
+		Name:       "sagemaker-key",
+		ProviderID: 1,
+		Provider:   "sagemaker",
+		KeyID:      "sagemaker-uuid",
+		Value:      *schemas.NewSecretVar(""),
+		SageMakerKeyConfig: &schemas.SageMakerKeyConfig{
+			AccessKey:       *schemas.NewSecretVar("AKIA-SAGEMAKER"),
+			SecretKey:       *schemas.NewSecretVar("wJalr-SAGEMAKER"),
+			SessionToken:    schemas.NewSecretVar("session-SAGEMAKER"),
+			Region:          schemas.NewSecretVar("us-east-1"),
+			RoleARN:         schemas.NewSecretVar("arn:aws:iam::123456789012:role/bifrost"),
+			ExternalID:      schemas.NewSecretVar("ext-123"),
+			RoleSessionName: schemas.NewSecretVar("bifrost-session"),
+			Endpoints:       &schemas.SageMakerEndpoints{Runtime: schemas.NewSecretVar(runtimeHost)},
+		},
+	}
+	require.NoError(t, db.Create(key).Error)
+
+	raw := rawRow(t, db, "config_keys", key.ID)
+	assert.Equal(t, "encrypted", raw["encryption_status"])
+	for col, plain := range map[string]string{
+		"sagemaker_access_key":        "AKIA-SAGEMAKER",
+		"sagemaker_secret_key":        "wJalr-SAGEMAKER",
+		"sagemaker_session_token":     "session-SAGEMAKER",
+		"sagemaker_role_arn":          "arn:aws:iam::123456789012:role/bifrost",
+		"sagemaker_external_id":       "ext-123",
+		"sagemaker_role_session_name": "bifrost-session",
+	} {
+		require.Contains(t, raw, col, "column %s must exist under its sagemaker_ name", col)
+		require.NotNil(t, raw[col], col)
+		assert.NotContains(t, raw[col], plain, "%s must be encrypted at rest", col)
+	}
+	assert.NotContains(t, raw["sagemaker_endpoints_json"], runtimeHost)
+
+	var found TableKey
+	require.NoError(t, db.First(&found, key.ID).Error)
+	require.NotNil(t, found.SageMakerKeyConfig)
+	cfg := found.SageMakerKeyConfig
+	assert.Equal(t, "AKIA-SAGEMAKER", cfg.AccessKey.GetValue())
+	assert.Equal(t, "wJalr-SAGEMAKER", cfg.SecretKey.GetValue())
+	assert.Equal(t, "session-SAGEMAKER", cfg.SessionToken.GetValue())
+	assert.Equal(t, "us-east-1", cfg.Region.GetValue())
+	assert.Equal(t, "arn:aws:iam::123456789012:role/bifrost", cfg.RoleARN.GetValue())
+	assert.Equal(t, "ext-123", cfg.ExternalID.GetValue())
+	assert.Equal(t, "bifrost-session", cfg.RoleSessionName.GetValue())
+	require.NotNil(t, cfg.Endpoints)
+	assert.Equal(t, runtimeHost, cfg.Endpoints.Runtime.GetValue())
+
+	found.SageMakerKeyConfig = nil
+	require.NoError(t, db.Save(&found).Error)
+	raw = rawRow(t, db, "config_keys", key.ID)
+	for _, col := range []string{"sagemaker_access_key", "sagemaker_secret_key", "sagemaker_region", "sagemaker_endpoints_json"} {
+		assert.Nil(t, raw[col], "%s must be cleared with the config", col)
+	}
+	var cleared TableKey
+	require.NoError(t, db.First(&cleared, key.ID).Error)
+	assert.Nil(t, cleared.SageMakerKeyConfig)
+}
+
+// TestTableKey_BedrockEndpoints_RoundTrip verifies the VPC endpoint hosts survive a save/find
+// cycle on both Bedrock configs. The columns are the only persistence path: BedrockKeyConfig is
+// a virtual field, so an endpoint without a column is silently dropped on write.
+func TestTableKey_BedrockEndpoints_RoundTrip(t *testing.T) {
+	db := setupTestDB(t)
+
+	const runtimeHost = "vpce-0abc123-x1y2z3.bedrock-runtime.eu-west-2.vpce.amazonaws.com"
+	const mantleHost = "vpce-0abc123-x1y2z3.bedrock-mantle.eu-west-2.vpce.amazonaws.com"
+
+	key := &TableKey{
+		Name:       "bedrock-vpce-key",
+		ProviderID: 1,
+		Provider:   "bedrock",
+		KeyID:      "bedrock-vpce-uuid",
+		Value:      *schemas.NewSecretVar(""),
+		BedrockKeyConfig: &schemas.BedrockKeyConfig{
+			AccessKey: *schemas.NewSecretVar("AKIA-VPCE"),
+			SecretKey: *schemas.NewSecretVar("wJalr-VPCE"),
+			Region:    schemas.NewSecretVar("eu-west-2"),
+			Endpoints: &schemas.BedrockEndpoints{
+				Runtime: schemas.NewSecretVar(runtimeHost),
+			},
+		},
+		BedrockMantleKeyConfig: &schemas.BedrockMantleKeyConfig{
+			AccessKey: *schemas.NewSecretVar("AKIA-VPCE-MANTLE"),
+			SecretKey: *schemas.NewSecretVar("wJalr-VPCE-MANTLE"),
+			Region:    schemas.NewSecretVar("eu-west-2"),
+			Endpoints: &schemas.BedrockEndpoints{
+				Mantle: schemas.NewSecretVar(mantleHost),
+			},
+		},
+	}
+
+	require.NoError(t, db.Create(key).Error)
+
+	raw := rawRow(t, db, "config_keys", key.ID)
+	assert.Equal(t, "encrypted", raw["encryption_status"])
+	assert.NotContains(t, raw["bedrock_endpoints_json"], runtimeHost)
+	assert.NotContains(t, raw["bedrock_mantle_endpoints_json"], mantleHost)
+
+	var found TableKey
+	require.NoError(t, db.First(&found, key.ID).Error)
+
+	require.NotNil(t, found.BedrockKeyConfig)
+	require.NotNil(t, found.BedrockKeyConfig.Endpoints)
+	require.NotNil(t, found.BedrockKeyConfig.Endpoints.Runtime)
+	assert.Equal(t, runtimeHost, found.BedrockKeyConfig.Endpoints.Runtime.GetValue())
+	// Services the user left blank must stay unset so the public regional host is used.
+	assert.Nil(t, found.BedrockKeyConfig.Endpoints.ControlPlane)
+	assert.Nil(t, found.BedrockKeyConfig.Endpoints.S3)
+
+	require.NotNil(t, found.BedrockMantleKeyConfig)
+	require.NotNil(t, found.BedrockMantleKeyConfig.Endpoints)
+	require.NotNil(t, found.BedrockMantleKeyConfig.Endpoints.Mantle)
+	assert.Equal(t, mantleHost, found.BedrockMantleKeyConfig.Endpoints.Mantle.GetValue())
+}
+
+// TestTableKey_BedrockEndpointsCleared_RoundTrip verifies clearing the endpoints on an existing
+// key wipes the column, so a key edited back to the public endpoints stops dialling the VPCE.
+func TestTableKey_BedrockEndpointsCleared_RoundTrip(t *testing.T) {
+	db := setupTestDB(t)
+
+	key := &TableKey{
+		Name:       "bedrock-vpce-cleared-key",
+		ProviderID: 1,
+		Provider:   "bedrock",
+		KeyID:      "bedrock-vpce-cleared-uuid",
+		Value:      *schemas.NewSecretVar(""),
+		BedrockKeyConfig: &schemas.BedrockKeyConfig{
+			AccessKey: *schemas.NewSecretVar("AKIA-VPCE"),
+			SecretKey: *schemas.NewSecretVar("wJalr-VPCE"),
+			Region:    schemas.NewSecretVar("eu-west-2"),
+			Endpoints: &schemas.BedrockEndpoints{
+				Runtime: schemas.NewSecretVar("vpce-0abc123-x1y2z3.bedrock-runtime.eu-west-2.vpce.amazonaws.com"),
+			},
+		},
+	}
+	require.NoError(t, db.Create(key).Error)
+
+	key.BedrockKeyConfig.Endpoints = nil
+	require.NoError(t, db.Save(key).Error)
+
+	var found TableKey
+	require.NoError(t, db.First(&found, key.ID).Error)
+	require.NotNil(t, found.BedrockKeyConfig)
+	assert.Nil(t, found.BedrockKeyConfig.Endpoints)
+	assert.Equal(t, "eu-west-2", found.BedrockKeyConfig.Region.GetValue())
+}
+
 // ============================================================================
 // MCP — edge cases for connection string / headers combinations
 // ============================================================================
@@ -840,7 +1320,7 @@ func TestTableMCPClient_DirectConnStr_EmptyHeaders(t *testing.T) {
 	db := setupTestDB(t)
 
 	// Direct connection string (not env var), no headers
-	connStr := schemas.NewEnvVar("https://mcp-direct.example.com/sse")
+	connStr := schemas.NewSecretVar("https://mcp-direct.example.com/sse")
 	client := &TableMCPClient{
 		ClientID:         "mcp-direct-nohdr",
 		Name:             "direct-no-headers",
@@ -866,8 +1346,8 @@ func TestTableMCPClient_HeadersOnly_NoConnStr(t *testing.T) {
 		ClientID:       "mcp-hdr-only",
 		Name:           "headers-only",
 		ConnectionType: "sse",
-		Headers: map[string]schemas.EnvVar{
-			"X-Api-Key": *schemas.NewEnvVar("secret-api-key"),
+		Headers: map[string]schemas.SecretVar{
+			"X-Api-Key": *schemas.NewSecretVar("secret-api-key"),
 		},
 	}
 
@@ -892,21 +1372,21 @@ func TestTableVirtualKey_UpdatePreservesDecryption(t *testing.T) {
 	vk := &TableVirtualKey{
 		ID:       "vk-update",
 		Name:     "update-vk",
-		Value:    "original-vk-value",
+		Value:    *schemas.NewSecretVar("original-vk-value"),
 		IsActive: bifrost.Ptr(true),
 	}
 	require.NoError(t, db.Create(vk).Error)
 
 	var found TableVirtualKey
 	require.NoError(t, db.First(&found, "id = ?", "vk-update").Error)
-	assert.Equal(t, "original-vk-value", found.Value)
+	assert.Equal(t, "original-vk-value", found.Value.GetValue())
 
-	found.Value = "updated-vk-value"
+	found.Value = *schemas.NewSecretVar("updated-vk-value")
 	require.NoError(t, db.Save(&found).Error)
 
 	var found2 TableVirtualKey
 	require.NoError(t, db.First(&found2, "id = ?", "vk-update").Error)
-	assert.Equal(t, "updated-vk-value", found2.Value)
+	assert.Equal(t, "updated-vk-value", found2.Value.GetValue())
 
 	raw := rawRow(t, db, "governance_virtual_keys", "vk-update")
 	assert.Equal(t, "encrypted", raw["encryption_status"])
@@ -918,10 +1398,8 @@ func TestTableOauthConfig_UpdatePreservesDecryption(t *testing.T) {
 
 	config := &TableOauthConfig{
 		ID:           "oauth-cfg-update",
-		ClientSecret: schemas.NewEnvVar("original-secret"),
+		ClientSecret: schemas.NewSecretVar("original-secret"),
 		RedirectURI:  "https://example.com/callback",
-		State:        "csrf-update",
-		ExpiresAt:    time.Now().Add(15 * time.Minute),
 	}
 	require.NoError(t, db.Create(config).Error)
 
@@ -929,7 +1407,7 @@ func TestTableOauthConfig_UpdatePreservesDecryption(t *testing.T) {
 	require.NoError(t, db.First(&found, "id = ?", "oauth-cfg-update").Error)
 	assert.Equal(t, "original-secret", found.ClientSecret.GetValue())
 
-	found.ClientSecret = schemas.NewEnvVar("rotated-secret")
+	found.ClientSecret = schemas.NewSecretVar("rotated-secret")
 	require.NoError(t, db.Save(&found).Error)
 
 	var found2 TableOauthConfig
@@ -966,22 +1444,22 @@ func TestTableProvider_UpdatePreservesDecryption(t *testing.T) {
 
 	provider := &TableProvider{
 		Name:        "update-provider",
-		ProxyConfig: &schemas.ProxyConfig{URL: schemas.NewEnvVar("https://proxy-v1.example.com")},
+		ProxyConfig: &schemas.ProxyConfig{URL: schemas.NewSecretVar("https://proxy-v1.example.com")},
 	}
 	require.NoError(t, db.Create(provider).Error)
 
 	var found TableProvider
 	require.NoError(t, db.First(&found, provider.ID).Error)
 	require.NotNil(t, found.ProxyConfig)
-	assert.Equal(t, "https://proxy-v1.example.com", envVarPtrValue(found.ProxyConfig.URL))
+	assert.Equal(t, "https://proxy-v1.example.com", secretVarPtrValue(found.ProxyConfig.URL))
 
-	found.ProxyConfig = &schemas.ProxyConfig{URL: schemas.NewEnvVar("https://proxy-v2.example.com")}
+	found.ProxyConfig = &schemas.ProxyConfig{URL: schemas.NewSecretVar("https://proxy-v2.example.com")}
 	require.NoError(t, db.Save(&found).Error)
 
 	var found2 TableProvider
 	require.NoError(t, db.First(&found2, provider.ID).Error)
 	require.NotNil(t, found2.ProxyConfig)
-	assert.Equal(t, "https://proxy-v2.example.com", envVarPtrValue(found2.ProxyConfig.URL))
+	assert.Equal(t, "https://proxy-v2.example.com", secretVarPtrValue(found2.ProxyConfig.URL))
 }
 
 func TestTablePlugin_UpdatePreservesDecryption(t *testing.T) {
@@ -990,7 +1468,6 @@ func TestTablePlugin_UpdatePreservesDecryption(t *testing.T) {
 	plugin := &TablePlugin{
 		Name:    "update-plugin",
 		Enabled: true,
-		Version: 1,
 		Config:  map[string]any{"key": "original-secret"},
 	}
 	require.NoError(t, db.Create(plugin).Error)
@@ -1036,14 +1513,14 @@ func TestTableVectorStoreConfig_UpdatePreservesDecryption(t *testing.T) {
 func TestTableMCPClient_UpdatePreservesDecryption(t *testing.T) {
 	db := setupTestDB(t)
 
-	connStr := schemas.NewEnvVar("https://mcp-v1.example.com/sse")
+	connStr := schemas.NewSecretVar("https://mcp-v1.example.com/sse")
 	client := &TableMCPClient{
 		ClientID:         "mcp-update",
 		Name:             "update-mcp",
 		ConnectionType:   "sse",
 		ConnectionString: connStr,
-		Headers: map[string]schemas.EnvVar{
-			"Authorization": *schemas.NewEnvVar("Bearer token-v1"),
+		Headers: map[string]schemas.SecretVar{
+			"Authorization": *schemas.NewSecretVar("Bearer token-v1"),
 		},
 	}
 	require.NoError(t, db.Create(client).Error)
@@ -1052,9 +1529,9 @@ func TestTableMCPClient_UpdatePreservesDecryption(t *testing.T) {
 	require.NoError(t, db.First(&found, client.ID).Error)
 	assert.Equal(t, "https://mcp-v1.example.com/sse", found.ConnectionString.GetValue())
 
-	found.ConnectionString = schemas.NewEnvVar("https://mcp-v2.example.com/sse")
-	found.Headers = map[string]schemas.EnvVar{
-		"Authorization": *schemas.NewEnvVar("Bearer token-v2"),
+	found.ConnectionString = schemas.NewSecretVar("https://mcp-v2.example.com/sse")
+	found.Headers = map[string]schemas.SecretVar{
+		"Authorization": *schemas.NewSecretVar("Bearer token-v2"),
 	}
 	require.NoError(t, db.Save(&found).Error)
 
@@ -1077,7 +1554,7 @@ func TestTableKey_FindMultipleDecryptsAll(t *testing.T) {
 			ProviderID: 1,
 			Provider:   "openai",
 			KeyID:      val + "-uuid",
-			Value:      *schemas.NewEnvVar("secret-" + val),
+			Value:      *schemas.NewSecretVar("secret-" + val),
 			Models:     []string{"gpt-4"},
 		}
 		_ = i
@@ -1149,32 +1626,38 @@ func TestTableOauthToken_FindMultipleDecryptsAll(t *testing.T) {
 func TestTableKey_AllProviderConfigs_EncryptDecrypt(t *testing.T) {
 	db := setupTestDB(t)
 
-	sessionToken := schemas.NewEnvVar("aws-session-token")
+	sessionToken := schemas.NewSecretVar("aws-session-token")
 	key := &TableKey{
 		Name:       "multi-provider-key",
 		ProviderID: 1,
 		Provider:   "custom",
 		KeyID:      "multi-uuid",
-		Value:      *schemas.NewEnvVar("multi-api-key"),
-		Aliases:    schemas.KeyAliases{"claude-3": "profile-claude"},
+		Value:      *schemas.NewSecretVar("multi-api-key"),
+		Aliases:    schemas.KeyAliases{"claude-3": {ModelID: "profile-claude"}},
 		AzureKeyConfig: &schemas.AzureKeyConfig{
-			Endpoint:     *schemas.NewEnvVar("https://azure.endpoint.com"),
-			ClientID:     schemas.NewEnvVar("multi-azure-cid"),
-			ClientSecret: schemas.NewEnvVar("azure-cs"),
-			TenantID:     schemas.NewEnvVar("multi-azure-tid"),
+			Endpoint:     *schemas.NewSecretVar("https://azure.endpoint.com"),
+			ClientID:     schemas.NewSecretVar("multi-azure-cid"),
+			ClientSecret: schemas.NewSecretVar("azure-cs"),
+			TenantID:     schemas.NewSecretVar("multi-azure-tid"),
 		},
 		VertexKeyConfig: &schemas.VertexKeyConfig{
-			AuthCredentials: *schemas.NewEnvVar(`{"type":"sa"}`),
-			ProjectID:       *schemas.NewEnvVar("proj-123"),
-			ProjectNumber:   *schemas.NewEnvVar("987654321"),
-			Region:          *schemas.NewEnvVar("us-central1"),
+			AuthCredentials: *schemas.NewSecretVar(`{"type":"sa"}`),
+			ProjectID:       *schemas.NewSecretVar("proj-123"),
+			ProjectNumber:   *schemas.NewSecretVar("987654321"),
+			Region:          *schemas.NewSecretVar("us-central1"),
 		},
 		BedrockKeyConfig: &schemas.BedrockKeyConfig{
-			AccessKey:    *schemas.NewEnvVar("AKIA-MULTI"),
-			SecretKey:    *schemas.NewEnvVar("wJalr-MULTI"),
+			AccessKey:    *schemas.NewSecretVar("AKIA-MULTI"),
+			SecretKey:    *schemas.NewSecretVar("wJalr-MULTI"),
 			SessionToken: sessionToken,
-			Region:       schemas.NewEnvVar("eu-west-1"),
-			ARN:          schemas.NewEnvVar("arn:aws:bedrock:eu-west-1:123:role"),
+			Region:       schemas.NewSecretVar("eu-west-1"),
+			ARN:          schemas.NewSecretVar("arn:aws:bedrock:eu-west-1:123:role"),
+		},
+		BedrockMantleKeyConfig: &schemas.BedrockMantleKeyConfig{
+			AccessKey: *schemas.NewSecretVar("AKIA-MANTLE"),
+			SecretKey: *schemas.NewSecretVar("wJalr-MANTLE"),
+			Region:    schemas.NewSecretVar("us-east-1"),
+			ProjectID: schemas.NewSecretVar("proj_mantle456"),
 		},
 	}
 
@@ -1190,6 +1673,7 @@ func TestTableKey_AllProviderConfigs_EncryptDecrypt(t *testing.T) {
 	assert.NotEqual(t, "us-central1", raw["vertex_region"])
 	assert.NotEqual(t, "eu-west-1", raw["bedrock_region"])
 	assert.NotEqual(t, "arn:aws:bedrock:eu-west-1:123:role", raw["bedrock_arn"])
+	assert.NotEqual(t, "proj_mantle456", raw["bedrock_mantle_project_id"])
 	rawAliasesVal2 := raw["aliases_json"]
 	require.NotNil(t, rawAliasesVal2, "aliases_json should be present in raw row")
 	var rawAliasesStr2 string
@@ -1230,7 +1714,14 @@ func TestTableKey_AllProviderConfigs_EncryptDecrypt(t *testing.T) {
 	assert.Equal(t, "eu-west-1", found.BedrockKeyConfig.Region.GetValue())
 	require.NotNil(t, found.BedrockKeyConfig.ARN)
 	assert.Equal(t, "arn:aws:bedrock:eu-west-1:123:role", found.BedrockKeyConfig.ARN.GetValue())
-	assert.Equal(t, "profile-claude", found.Aliases["claude-3"])
+
+	require.NotNil(t, found.BedrockMantleKeyConfig)
+	assert.Equal(t, "AKIA-MANTLE", found.BedrockMantleKeyConfig.AccessKey.GetValue())
+	assert.Equal(t, "wJalr-MANTLE", found.BedrockMantleKeyConfig.SecretKey.GetValue())
+	require.NotNil(t, found.BedrockMantleKeyConfig.ProjectID)
+	assert.Equal(t, "proj_mantle456", found.BedrockMantleKeyConfig.ProjectID.GetValue())
+
+	assert.Equal(t, "profile-claude", found.Aliases["claude-3"].ModelID)
 }
 
 // ============================================================================
@@ -1251,13 +1742,13 @@ func TestTableKey_EncryptionDisabled_StoresPlaintext(t *testing.T) {
 	disableEncryption(t)
 	db := setupTestDB(t)
 
-	endpoint := schemas.NewEnvVar("https://azure.example.com")
+	endpoint := schemas.NewSecretVar("https://azure.example.com")
 	key := &TableKey{
 		Name:       "disabled-key",
 		ProviderID: 1,
 		Provider:   "azure",
 		KeyID:      "dis-1",
-		Value:      *schemas.NewEnvVar("sk-plaintext-stays"),
+		Value:      *schemas.NewSecretVar("sk-plaintext-stays"),
 		AzureKeyConfig: &schemas.AzureKeyConfig{
 			Endpoint: *endpoint,
 		},
@@ -1287,9 +1778,9 @@ func TestTableMCPClient_EncryptionDisabled_StoresPlaintext(t *testing.T) {
 		ClientID:         "mcp-dis-1",
 		Name:             "disabled-mcp",
 		ConnectionType:   "sse",
-		ConnectionString: schemas.NewEnvVar("https://mcp.example.com"),
-		Headers: map[string]schemas.EnvVar{
-			"Authorization": *schemas.NewEnvVar("Bearer secret-token"),
+		ConnectionString: schemas.NewSecretVar("https://mcp.example.com"),
+		Headers: map[string]schemas.SecretVar{
+			"Authorization": *schemas.NewSecretVar("Bearer secret-token"),
 		},
 	}
 
@@ -1315,7 +1806,7 @@ func TestTableVirtualKey_EncryptionDisabled_StoresPlaintext(t *testing.T) {
 	vk := &TableVirtualKey{
 		ID:       "vk-dis-1",
 		Name:     "disabled-vk",
-		Value:    "vk-plaintext-value",
+		Value:    *schemas.NewSecretVar("vk-plaintext-value"),
 		IsActive: bifrost.Ptr(true),
 	}
 
@@ -1331,7 +1822,7 @@ func TestTableVirtualKey_EncryptionDisabled_StoresPlaintext(t *testing.T) {
 	// GORM read should return same plaintext
 	var found TableVirtualKey
 	require.NoError(t, db.Where("id = ?", "vk-dis-1").First(&found).Error)
-	assert.Equal(t, "vk-plaintext-value", found.Value)
+	assert.Equal(t, "vk-plaintext-value", found.Value.GetValue())
 }
 
 func TestSessionsTable_EncryptionDisabled_StoresPlaintext(t *testing.T) {
@@ -1363,12 +1854,9 @@ func TestTableOauthConfig_EncryptionDisabled_StoresPlaintext(t *testing.T) {
 
 	cfg := &TableOauthConfig{
 		ID:           "cfg-dis-1",
-		ClientSecret: schemas.NewEnvVar("client-secret-plain"),
-		CodeVerifier: "verifier-plain",
+		ClientSecret: schemas.NewSecretVar("client-secret-plain"),
 		RedirectURI:  "https://example.com/cb",
-		State:        "csrf-state",
 		Status:       "pending",
-		ExpiresAt:    time.Now().Add(time.Hour),
 	}
 
 	require.NoError(t, db.Create(cfg).Error)
@@ -1378,12 +1866,39 @@ func TestTableOauthConfig_EncryptionDisabled_StoresPlaintext(t *testing.T) {
 	db.Table("oauth_configs").Where("id = ?", "cfg-dis-1").Take(&raw)
 	assert.Equal(t, "plain_text", raw["encryption_status"])
 	assert.Equal(t, "client-secret-plain", raw["client_secret"])
-	assert.Equal(t, "verifier-plain", raw["code_verifier"])
 
 	// GORM read should return same plaintext
 	var found TableOauthConfig
 	require.NoError(t, db.Where("id = ?", "cfg-dis-1").First(&found).Error)
 	assert.Equal(t, "client-secret-plain", found.ClientSecret.GetValue())
+}
+
+func TestTableMCPOauthFlow_EncryptionDisabled_StoresPlaintext(t *testing.T) {
+	disableEncryption(t)
+	db := setupTestDB(t)
+
+	flow := &TableMCPOauthFlow{
+		ID:            "flow-dis-1",
+		MCPClientID:   "mcp-1",
+		OauthConfigID: "oauth-cfg-1",
+		State:         "csrf-state",
+		CodeVerifier:  "verifier-plain",
+		FlowMode:      "admin",
+		Status:        "pending",
+		ExpiresAt:     time.Now().Add(time.Hour),
+	}
+
+	require.NoError(t, db.Create(flow).Error)
+
+	// Raw DB should have plaintext
+	var raw map[string]any
+	db.Table("mcp_oauth_flows").Where("id = ?", "flow-dis-1").Take(&raw)
+	assert.Equal(t, "plain_text", raw["encryption_status"])
+	assert.Equal(t, "verifier-plain", raw["code_verifier"])
+
+	// GORM read should return same plaintext
+	var found TableMCPOauthFlow
+	require.NoError(t, db.Where("id = ?", "flow-dis-1").First(&found).Error)
 	assert.Equal(t, "verifier-plain", found.CodeVerifier)
 }
 
@@ -1422,8 +1937,8 @@ func TestTableProvider_EncryptionDisabled_StoresPlaintext(t *testing.T) {
 	provider := &TableProvider{
 		Name: "disabled-provider",
 		ProxyConfig: &schemas.ProxyConfig{
-			URL:      schemas.NewEnvVar("https://proxy.example.com"),
-			Password: schemas.NewEnvVar("proxy-secret"),
+			URL:      schemas.NewSecretVar("https://proxy.example.com"),
+			Password: schemas.NewSecretVar("proxy-secret"),
 		},
 	}
 
@@ -1438,7 +1953,7 @@ func TestTableProvider_EncryptionDisabled_StoresPlaintext(t *testing.T) {
 	var found TableProvider
 	require.NoError(t, db.First(&found, provider.ID).Error)
 	require.NotNil(t, found.ProxyConfig)
-	assert.Equal(t, "proxy-secret", envVarPtrValue(found.ProxyConfig.Password))
+	assert.Equal(t, "proxy-secret", secretVarPtrValue(found.ProxyConfig.Password))
 }
 
 func TestTablePlugin_EncryptionDisabled_StoresPlaintext(t *testing.T) {
@@ -1448,7 +1963,6 @@ func TestTablePlugin_EncryptionDisabled_StoresPlaintext(t *testing.T) {
 	plugin := &TablePlugin{
 		Name:    "disabled-plugin",
 		Enabled: true,
-		Version: 1,
 		Config:  map[string]any{"api_key": "plugin-secret"},
 	}
 
@@ -1494,9 +2008,15 @@ func TestTableVectorStoreConfig_EncryptionDisabled_StoresPlaintext(t *testing.T)
 // Multi-backend helpers — run the same tests on SQLite and Postgres
 // ============================================================================
 
+// pgTestSchema is this package's dedicated Postgres schema. Test packages
+// (configstore, configstore/tables, logstore) run in parallel against the same
+// database, so each one works in its own schema to avoid clobbering the
+// others' tables and rows.
+const pgTestSchema = "configstore_tables_test"
+
 // postgresDSN matches the postgres service in tests/docker-compose.yml and
 // framework/docker-compose.yml.
-const postgresDSN = "host=localhost user=bifrost password=bifrost_password dbname=bifrost port=5432 sslmode=disable"
+const postgresDSN = "host=localhost user=bifrost password=bifrost_password dbname=bifrost port=5432 sslmode=disable search_path=" + pgTestSchema
 
 // namedDB pairs a backend name with its GORM connection for use in subtests.
 type namedDB struct {
@@ -1532,6 +2052,12 @@ func trySetupPostgresDB(t *testing.T) *gorm.DB {
 		return nil
 	}
 	if err := sqlDB.Ping(); err != nil {
+		return nil
+	}
+
+	// All objects live in this package's dedicated schema (via search_path in
+	// the DSN), isolated from other test packages sharing the same database.
+	if err := db.Exec("CREATE SCHEMA IF NOT EXISTS " + pgTestSchema).Error; err != nil {
 		return nil
 	}
 
@@ -1600,10 +2126,6 @@ func forEachDB(t *testing.T) []namedDB {
 // text type which has no length limit.
 // ============================================================================
 
-func TestEncryptedColumns_AzureAPIVersion_FitsAfterWidening(t *testing.T) {
-	t.Skip("azure_api_version column has been removed from AzureKeyConfig")
-}
-
 func TestEncryptedColumns_VertexRegion_FitsAfterWidening(t *testing.T) {
 	// "northamerica-northeast1" is 23 chars — encrypts to ~68 chars.
 	// Longer regions would have overflowed the old varchar(100).
@@ -1616,10 +2138,10 @@ func TestEncryptedColumns_VertexRegion_FitsAfterWidening(t *testing.T) {
 				ProviderID: providerID,
 				Provider:   "vertex",
 				KeyID:      "vx-region-width-" + ndb.name,
-				Value:      *schemas.NewEnvVar("vertex-api-key"),
+				Value:      *schemas.NewSecretVar("vertex-api-key"),
 				VertexKeyConfig: &schemas.VertexKeyConfig{
-					ProjectID: *schemas.NewEnvVar("my-project"),
-					Region:    *schemas.NewEnvVar("northamerica-northeast1"),
+					ProjectID: *schemas.NewSecretVar("my-project"),
+					Region:    *schemas.NewSecretVar("northamerica-northeast1"),
 				},
 			}
 
@@ -1637,7 +2159,7 @@ func TestEncryptedColumns_VertexRegion_FitsAfterWidening(t *testing.T) {
 func TestEncryptedColumns_BedrockRegion_FitsAfterWidening(t *testing.T) {
 	// "ap-southeast-2" is 14 chars — encrypts to ~58 chars.
 	// Previously borderline against varchar(100).
-	region := schemas.NewEnvVar("ap-southeast-2")
+	region := schemas.NewSecretVar("ap-southeast-2")
 
 	for _, ndb := range forEachDB(t) {
 		ndb := ndb
@@ -1648,10 +2170,10 @@ func TestEncryptedColumns_BedrockRegion_FitsAfterWidening(t *testing.T) {
 				ProviderID: providerID,
 				Provider:   "bedrock",
 				KeyID:      "bk-region-width-" + ndb.name,
-				Value:      *schemas.NewEnvVar("bedrock-val"),
+				Value:      *schemas.NewSecretVar("bedrock-val"),
 				BedrockKeyConfig: &schemas.BedrockKeyConfig{
-					AccessKey: *schemas.NewEnvVar("AKIAIOSFODNN7EXAMPLE"),
-					SecretKey: *schemas.NewEnvVar("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+					AccessKey: *schemas.NewSecretVar("AKIAIOSFODNN7EXAMPLE"),
+					SecretKey: *schemas.NewSecretVar("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
 					Region:    region,
 				},
 			}
@@ -1706,14 +2228,14 @@ func TestPostgres_EncryptedColumns_AreText(t *testing.T) {
 // dropped from the DB. On the next reload the entire provider-specific config block
 // could vanish.
 //
-// IsSet() (which checks both Val and EnvVar) is the correct check, and AfterFind
+// IsSet() (which checks both Val and SecretVar) is the correct check, and AfterFind
 // reconstruction must consider all fields in the config, not just one.
 // ============================================================================
 
-// TestTableKey_VertexUnresolvedEnvVar_RoundTrip verifies that a Vertex key configured
+// TestTableKey_VertexUnresolvedSecretVar_RoundTrip verifies that a Vertex key configured
 // with an env var reference for ProjectID survives the BeforeSave/AfterFind round-trip
 // even when the env var is NOT set on the server (so the resolved Val is empty).
-func TestTableKey_VertexUnresolvedEnvVar_RoundTrip(t *testing.T) {
+func TestTableKey_VertexUnresolvedSecretVar_RoundTrip(t *testing.T) {
 	// Make sure the env var is NOT set so the resolved Val is empty.
 	require.NoError(t, os.Unsetenv("FAKE_VERTEX_PROJECT_ID_FOR_TEST"))
 
@@ -1724,14 +2246,10 @@ func TestTableKey_VertexUnresolvedEnvVar_RoundTrip(t *testing.T) {
 		ProviderID: 1,
 		Provider:   "vertex",
 		KeyID:      "vertex-env-uuid-1",
-		Value:      *schemas.NewEnvVar(""),
+		Value:      *schemas.NewSecretVar(""),
 		VertexKeyConfig: &schemas.VertexKeyConfig{
-			ProjectID: schemas.EnvVar{
-				Val:     "",
-				EnvVar:  "env.FAKE_VERTEX_PROJECT_ID_FOR_TEST",
-				FromEnv: true,
-			},
-			Region: *schemas.NewEnvVar("us-central1"),
+			ProjectID: *schemas.NewSecretVar("env.FAKE_VERTEX_PROJECT_ID_FOR_TEST"),
+			Region:    *schemas.NewSecretVar("us-central1"),
 		},
 	}
 
@@ -1743,18 +2261,18 @@ func TestTableKey_VertexUnresolvedEnvVar_RoundTrip(t *testing.T) {
 
 	// VertexKeyConfig must NOT be wiped — this was the original bug.
 	require.NotNil(t, found.VertexKeyConfig, "VertexKeyConfig was wiped on reload")
-	assert.Equal(t, "env.FAKE_VERTEX_PROJECT_ID_FOR_TEST", found.VertexKeyConfig.ProjectID.EnvVar,
+	assert.Equal(t, "env.FAKE_VERTEX_PROJECT_ID_FOR_TEST", found.VertexKeyConfig.ProjectID.GetRawRef(),
 		"env var reference for ProjectID lost on round-trip")
-	assert.True(t, found.VertexKeyConfig.ProjectID.FromEnv,
+	assert.True(t, found.VertexKeyConfig.ProjectID.IsFromSecret(),
 		"FromEnv flag for ProjectID lost on round-trip")
 	assert.Equal(t, "us-central1", found.VertexKeyConfig.Region.GetValue(),
 		"Plain Region value should survive round-trip unchanged")
 }
 
-// TestTableKey_AzureUnresolvedEnvVar_RoundTrip verifies the same property for Azure.
+// TestTableKey_AzureUnresolvedSecretVar_RoundTrip verifies the same property for Azure.
 // This also exercises the broadened AfterFind reconstruction condition: when only the
 // endpoint is set (and unresolved), the entire AzureKeyConfig must still be reconstructed.
-func TestTableKey_AzureUnresolvedEnvVar_RoundTrip(t *testing.T) {
+func TestTableKey_AzureUnresolvedSecretVar_RoundTrip(t *testing.T) {
 	require.NoError(t, os.Unsetenv("FAKE_AZURE_ENDPOINT_FOR_TEST"))
 
 	db := setupTestDB(t)
@@ -1764,13 +2282,9 @@ func TestTableKey_AzureUnresolvedEnvVar_RoundTrip(t *testing.T) {
 		ProviderID: 1,
 		Provider:   "azure",
 		KeyID:      "azure-env-uuid-1",
-		Value:      *schemas.NewEnvVar(""),
+		Value:      *schemas.NewSecretVar(""),
 		AzureKeyConfig: &schemas.AzureKeyConfig{
-			Endpoint: schemas.EnvVar{
-				Val:     "",
-				EnvVar:  "env.FAKE_AZURE_ENDPOINT_FOR_TEST",
-				FromEnv: true,
-			},
+			Endpoint: *schemas.NewSecretVar("env.FAKE_AZURE_ENDPOINT_FOR_TEST"),
 		},
 	}
 
@@ -1780,15 +2294,15 @@ func TestTableKey_AzureUnresolvedEnvVar_RoundTrip(t *testing.T) {
 	require.NoError(t, db.First(&found, key.ID).Error)
 
 	require.NotNil(t, found.AzureKeyConfig, "AzureKeyConfig was wiped on reload")
-	assert.Equal(t, "env.FAKE_AZURE_ENDPOINT_FOR_TEST", found.AzureKeyConfig.Endpoint.EnvVar,
+	assert.Equal(t, "env.FAKE_AZURE_ENDPOINT_FOR_TEST", found.AzureKeyConfig.Endpoint.GetRawRef(),
 		"env var reference for Endpoint lost on round-trip")
-	assert.True(t, found.AzureKeyConfig.Endpoint.FromEnv,
+	assert.True(t, found.AzureKeyConfig.Endpoint.IsFromSecret(),
 		"FromEnv flag for Endpoint lost on round-trip")
 }
 
-// TestTableKey_BedrockUnresolvedEnvVar_RoundTrip verifies the same property for
+// TestTableKey_BedrockUnresolvedSecretVar_RoundTrip verifies the same property for
 // Bedrock explicit credentials.
-func TestTableKey_BedrockUnresolvedEnvVar_RoundTrip(t *testing.T) {
+func TestTableKey_BedrockUnresolvedSecretVar_RoundTrip(t *testing.T) {
 	require.NoError(t, os.Unsetenv("FAKE_AWS_ACCESS_KEY_FOR_TEST"))
 	require.NoError(t, os.Unsetenv("FAKE_AWS_SECRET_KEY_FOR_TEST"))
 
@@ -1799,19 +2313,11 @@ func TestTableKey_BedrockUnresolvedEnvVar_RoundTrip(t *testing.T) {
 		ProviderID: 1,
 		Provider:   "bedrock",
 		KeyID:      "bedrock-env-uuid-1",
-		Value:      *schemas.NewEnvVar(""),
+		Value:      *schemas.NewSecretVar(""),
 		BedrockKeyConfig: &schemas.BedrockKeyConfig{
-			AccessKey: schemas.EnvVar{
-				Val:     "",
-				EnvVar:  "env.FAKE_AWS_ACCESS_KEY_FOR_TEST",
-				FromEnv: true,
-			},
-			SecretKey: schemas.EnvVar{
-				Val:     "",
-				EnvVar:  "env.FAKE_AWS_SECRET_KEY_FOR_TEST",
-				FromEnv: true,
-			},
-			Region: schemas.NewEnvVar("us-west-2"),
+			AccessKey: *schemas.NewSecretVar("env.FAKE_AWS_ACCESS_KEY_FOR_TEST"),
+			SecretKey: *schemas.NewSecretVar("env.FAKE_AWS_SECRET_KEY_FOR_TEST"),
+			Region:    schemas.NewSecretVar("us-west-2"),
 		},
 	}
 
@@ -1821,17 +2327,17 @@ func TestTableKey_BedrockUnresolvedEnvVar_RoundTrip(t *testing.T) {
 	require.NoError(t, db.First(&found, key.ID).Error)
 
 	require.NotNil(t, found.BedrockKeyConfig, "BedrockKeyConfig was wiped on reload")
-	assert.Equal(t, "env.FAKE_AWS_ACCESS_KEY_FOR_TEST", found.BedrockKeyConfig.AccessKey.EnvVar,
+	assert.Equal(t, "env.FAKE_AWS_ACCESS_KEY_FOR_TEST", found.BedrockKeyConfig.AccessKey.GetRawRef(),
 		"env var reference for AccessKey lost on round-trip")
-	assert.Equal(t, "env.FAKE_AWS_SECRET_KEY_FOR_TEST", found.BedrockKeyConfig.SecretKey.EnvVar,
+	assert.Equal(t, "env.FAKE_AWS_SECRET_KEY_FOR_TEST", found.BedrockKeyConfig.SecretKey.GetRawRef(),
 		"env var reference for SecretKey lost on round-trip")
 	require.NotNil(t, found.BedrockKeyConfig.Region)
 	assert.Equal(t, "us-west-2", found.BedrockKeyConfig.Region.GetValue())
 }
 
-// TestTableKey_OllamaUnresolvedEnvVar_RoundTrip and TestTableKey_SGLUnresolvedEnvVar_RoundTrip
+// TestTableKey_OllamaUnresolvedSecretVar_RoundTrip and TestTableKey_SGLUnresolvedSecretVar_RoundTrip
 // verify the same property for the recently-added providers, which also use env-aware persistence.
-func TestTableKey_OllamaUnresolvedEnvVar_RoundTrip(t *testing.T) {
+func TestTableKey_OllamaUnresolvedSecretVar_RoundTrip(t *testing.T) {
 	require.NoError(t, os.Unsetenv("FAKE_OLLAMA_URL_FOR_TEST"))
 
 	db := setupTestDB(t)
@@ -1841,13 +2347,9 @@ func TestTableKey_OllamaUnresolvedEnvVar_RoundTrip(t *testing.T) {
 		ProviderID: 1,
 		Provider:   "ollama",
 		KeyID:      "ollama-env-uuid-1",
-		Value:      *schemas.NewEnvVar(""),
+		Value:      *schemas.NewSecretVar(""),
 		OllamaKeyConfig: &schemas.OllamaKeyConfig{
-			URL: schemas.EnvVar{
-				Val:     "",
-				EnvVar:  "env.FAKE_OLLAMA_URL_FOR_TEST",
-				FromEnv: true,
-			},
+			URL: *schemas.NewSecretVar("env.FAKE_OLLAMA_URL_FOR_TEST"),
 		},
 	}
 
@@ -1857,11 +2359,11 @@ func TestTableKey_OllamaUnresolvedEnvVar_RoundTrip(t *testing.T) {
 	require.NoError(t, db.First(&found, key.ID).Error)
 
 	require.NotNil(t, found.OllamaKeyConfig, "OllamaKeyConfig was wiped on reload")
-	assert.Equal(t, "env.FAKE_OLLAMA_URL_FOR_TEST", found.OllamaKeyConfig.URL.EnvVar)
-	assert.True(t, found.OllamaKeyConfig.URL.FromEnv)
+	assert.Equal(t, "env.FAKE_OLLAMA_URL_FOR_TEST", found.OllamaKeyConfig.URL.GetRawRef())
+	assert.True(t, found.OllamaKeyConfig.URL.IsFromSecret())
 }
 
-func TestTableKey_SGLUnresolvedEnvVar_RoundTrip(t *testing.T) {
+func TestTableKey_SGLUnresolvedSecretVar_RoundTrip(t *testing.T) {
 	require.NoError(t, os.Unsetenv("FAKE_SGL_URL_FOR_TEST"))
 
 	db := setupTestDB(t)
@@ -1871,13 +2373,9 @@ func TestTableKey_SGLUnresolvedEnvVar_RoundTrip(t *testing.T) {
 		ProviderID: 1,
 		Provider:   "sgl",
 		KeyID:      "sgl-env-uuid-1",
-		Value:      *schemas.NewEnvVar(""),
+		Value:      *schemas.NewSecretVar(""),
 		SGLKeyConfig: &schemas.SGLKeyConfig{
-			URL: schemas.EnvVar{
-				Val:     "",
-				EnvVar:  "env.FAKE_SGL_URL_FOR_TEST",
-				FromEnv: true,
-			},
+			URL: *schemas.NewSecretVar("env.FAKE_SGL_URL_FOR_TEST"),
 		},
 	}
 
@@ -1887,8 +2385,34 @@ func TestTableKey_SGLUnresolvedEnvVar_RoundTrip(t *testing.T) {
 	require.NoError(t, db.First(&found, key.ID).Error)
 
 	require.NotNil(t, found.SGLKeyConfig, "SGLKeyConfig was wiped on reload")
-	assert.Equal(t, "env.FAKE_SGL_URL_FOR_TEST", found.SGLKeyConfig.URL.EnvVar)
-	assert.True(t, found.SGLKeyConfig.URL.FromEnv)
+	assert.Equal(t, "env.FAKE_SGL_URL_FOR_TEST", found.SGLKeyConfig.URL.GetRawRef())
+	assert.True(t, found.SGLKeyConfig.URL.IsFromSecret())
+}
+
+func TestTableKey_CloudflareUnresolvedSecretVar_RoundTrip(t *testing.T) {
+	require.NoError(t, os.Unsetenv("FAKE_CLOUDFLARE_ACCOUNT_ID_FOR_TEST"))
+
+	db := setupTestDB(t)
+
+	key := &TableKey{
+		Name:       "cloudflare-unresolved-env",
+		ProviderID: 1,
+		Provider:   "cloudflare",
+		KeyID:      "cloudflare-env-uuid-1",
+		Value:      *schemas.NewSecretVar("cf-token"),
+		CloudflareKeyConfig: &schemas.CloudflareKeyConfig{
+			AccountID: *schemas.NewSecretVar("env.FAKE_CLOUDFLARE_ACCOUNT_ID_FOR_TEST"),
+		},
+	}
+
+	require.NoError(t, db.Create(key).Error)
+
+	var found TableKey
+	require.NoError(t, db.First(&found, key.ID).Error)
+
+	require.NotNil(t, found.CloudflareKeyConfig, "CloudflareKeyConfig was wiped on reload")
+	assert.Equal(t, "env.FAKE_CLOUDFLARE_ACCOUNT_ID_FOR_TEST", found.CloudflareKeyConfig.AccountID.GetRawRef())
+	assert.True(t, found.CloudflareKeyConfig.AccountID.IsFromSecret())
 }
 
 // TestTableKey_VertexPlainValue_RoundTrip is a sanity check ensuring that plain
@@ -1902,10 +2426,10 @@ func TestTableKey_VertexPlainValue_RoundTrip(t *testing.T) {
 		ProviderID: 1,
 		Provider:   "vertex",
 		KeyID:      "vertex-plain-uuid-1",
-		Value:      *schemas.NewEnvVar(""),
+		Value:      *schemas.NewSecretVar(""),
 		VertexKeyConfig: &schemas.VertexKeyConfig{
-			ProjectID: *schemas.NewEnvVar("my-gcp-project"),
-			Region:    *schemas.NewEnvVar("us-central1"),
+			ProjectID: *schemas.NewSecretVar("my-gcp-project"),
+			Region:    *schemas.NewSecretVar("us-central1"),
 		},
 	}
 
@@ -1916,6 +2440,142 @@ func TestTableKey_VertexPlainValue_RoundTrip(t *testing.T) {
 
 	require.NotNil(t, found.VertexKeyConfig)
 	assert.Equal(t, "my-gcp-project", found.VertexKeyConfig.ProjectID.GetValue())
-	assert.False(t, found.VertexKeyConfig.ProjectID.FromEnv)
+	assert.False(t, found.VertexKeyConfig.ProjectID.IsFromSecret())
 	assert.Equal(t, "us-central1", found.VertexKeyConfig.Region.GetValue())
+}
+
+// TestTableKey_AliasesJSON_LegacyWireShape verifies that a KeyAliases value
+// containing only ModelID (the unenriched shape) is persisted to the DB as the
+// legacy {"k":"v"} string-valued JSON, preserving byte-for-byte wire compat
+// with pre-refactor consumers and keeping config_hash stable.
+func TestTableKey_AliasesJSON_LegacyWireShape(t *testing.T) {
+	db := setupTestDB(t)
+
+	key := &TableKey{
+		Name:       "openai-key",
+		ProviderID: 1,
+		Provider:   "openai",
+		KeyID:      "openai-uuid-aliases-legacy",
+		Value:      *schemas.NewSecretVar("sk-test"),
+		Aliases: schemas.KeyAliases{
+			"best-model": {ModelID: "gpt-4o-deployment"},
+			"backup":     {ModelID: "gpt-3.5-turbo"},
+		},
+	}
+	require.NoError(t, db.Create(key).Error)
+
+	raw := rawRow(t, db, "config_keys", key.ID)
+	rawAliasesVal := raw["aliases_json"]
+	var rawAliasesStr string
+	switch v := rawAliasesVal.(type) {
+	case string:
+		rawAliasesStr = v
+	case []byte:
+		rawAliasesStr = string(v)
+	}
+	require.NotEmpty(t, rawAliasesStr)
+
+	plaintext, err := encrypt.Decrypt(rawAliasesStr)
+	require.NoError(t, err, "aliases_json should be decryptable")
+
+	// Both expected shapes are valid JSON encodings (map iteration order is not stable).
+	candidates := []string{
+		`{"best-model":"gpt-4o-deployment","backup":"gpt-3.5-turbo"}`,
+		`{"backup":"gpt-3.5-turbo","best-model":"gpt-4o-deployment"}`,
+	}
+	assert.Contains(t, candidates, plaintext, "legacy ModelID-only aliases should marshal to the string-valued legacy wire shape")
+}
+
+// TestTableKey_AliasesJSON_RichRoundTrip verifies that an enriched AliasConfig
+// (with ModelName/ModelFamily/sub-config populated) survives the full DB
+// encrypt → save → load → decrypt round-trip with no loss of information.
+func TestTableKey_AliasesJSON_RichRoundTrip(t *testing.T) {
+	db := setupTestDB(t)
+
+	apiVersion := "2024-08-01-preview"
+	canonical := "claude-3-5-sonnet"
+	family := schemas.ModelFamilyAnthropic
+
+	key := &TableKey{
+		Name:       "azure-rich",
+		ProviderID: 1,
+		Provider:   "azure",
+		KeyID:      "azure-uuid-aliases-rich",
+		Value:      *schemas.NewSecretVar("sk-test"),
+		Aliases: schemas.KeyAliases{
+			"best-model": {
+				ModelID:     "azure-deployment-xyz",
+				ModelName:   &canonical,
+				ModelFamily: &family,
+				Description: "prod summarizer",
+				AzureAliasCfg: &schemas.AzureAliasCfg{
+					APIVersion: &apiVersion,
+				},
+			},
+			"plain": {ModelID: "gpt-4o-fallback"},
+		},
+		AzureKeyConfig: &schemas.AzureKeyConfig{
+			Endpoint: *schemas.NewSecretVar("https://example.openai.azure.com"),
+		},
+	}
+	require.NoError(t, db.Create(key).Error)
+
+	var found TableKey
+	require.NoError(t, db.First(&found, key.ID).Error)
+	require.NotNil(t, found.Aliases)
+	require.Len(t, found.Aliases, 2)
+
+	rich := found.Aliases["best-model"]
+	assert.Equal(t, "azure-deployment-xyz", rich.ModelID)
+	require.NotNil(t, rich.ModelName)
+	assert.Equal(t, canonical, *rich.ModelName)
+	require.NotNil(t, rich.ModelFamily)
+	assert.Equal(t, schemas.ModelFamilyAnthropic, *rich.ModelFamily)
+	assert.Equal(t, "prod summarizer", rich.Description)
+	require.NotNil(t, rich.AzureAliasCfg)
+	require.NotNil(t, rich.AzureAliasCfg.APIVersion)
+	assert.Equal(t, apiVersion, *rich.AzureAliasCfg.APIVersion)
+
+	// The unenriched sibling stays a legacy-shape entry — proves marshaling
+	// only escalates to the rich object form for entries that need it.
+	plain := found.Aliases["plain"]
+	assert.Equal(t, "gpt-4o-fallback", plain.ModelID)
+	assert.Nil(t, plain.ModelName)
+	assert.Nil(t, plain.ModelFamily)
+	assert.Nil(t, plain.AzureAliasCfg)
+}
+
+// TestTableKey_AliasesJSON_LegacyInputRoundTrip simulates a row written before
+// the refactor — raw legacy {"k":"v"} JSON in the aliases_json column — and
+// verifies AfterFind promotes it to AliasConfig{ModelID: v} transparently.
+func TestTableKey_AliasesJSON_LegacyInputRoundTrip(t *testing.T) {
+	db := setupTestDB(t)
+
+	// First create a key without aliases so the row exists.
+	key := &TableKey{
+		Name:       "openai-key",
+		ProviderID: 1,
+		Provider:   "openai",
+		KeyID:      "openai-uuid-aliases-legacy-input",
+		Value:      *schemas.NewSecretVar("sk-test"),
+	}
+	require.NoError(t, db.Create(key).Error)
+
+	// Then write the legacy-shaped JSON directly into the aliases_json column,
+	// bypassing BeforeSave — this is what a pre-refactor row looks like.
+	legacy := `{"best-model":"gpt-4o-deployment"}`
+	encrypted, err := encrypt.Encrypt(legacy)
+	require.NoError(t, err)
+	require.NoError(t, db.Exec("UPDATE config_keys SET aliases_json = ? WHERE id = ?", encrypted, key.ID).Error)
+
+	// Read back through GORM — AfterFind should decrypt + UnmarshalJSON should
+	// promote the legacy string value into AliasConfig{ModelID: ...}.
+	var found TableKey
+	require.NoError(t, db.First(&found, key.ID).Error)
+	require.NotNil(t, found.Aliases)
+	require.Len(t, found.Aliases, 1)
+	got := found.Aliases["best-model"]
+	assert.Equal(t, "gpt-4o-deployment", got.ModelID)
+	assert.Nil(t, got.ModelName)
+	assert.Nil(t, got.ModelFamily)
 }

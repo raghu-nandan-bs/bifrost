@@ -27,7 +27,7 @@ func AsLLMPlugin(plugin schemas.BasePlugin) schemas.LLMPlugin {
 	// Check if it's a DynamicPlugin first
 	if dp, ok := plugin.(*DynamicPlugin); ok {
 		// Only return as LLMPlugin if it actually has LLM hooks
-		if dp.preLLMHook != nil || dp.postLLMHook != nil {
+		if dp.preRequestHook != nil || dp.preLLMHook != nil || dp.postLLMHook != nil {
 			return dp
 		}
 		return nil
@@ -65,7 +65,11 @@ func AsHTTPTransportPlugin(plugin schemas.BasePlugin) schemas.HTTPTransportPlugi
 	// Check if it's a DynamicPlugin first
 	if dp, ok := plugin.(*DynamicPlugin); ok {
 		// Only return as HTTPTransportPlugin if it actually has HTTP transport hooks
-		if dp.httpTransportPreHook != nil || dp.httpTransportPostHook != nil {
+		if dp.httpTransportPreAuthHook != nil ||
+			dp.httpTransportPreHook != nil ||
+			dp.httpTransportPostHook != nil ||
+			dp.httpTransportResponseHeadersHook != nil ||
+			dp.httpTransportStreamChunkHook != nil {
 			return dp
 		}
 		return nil

@@ -86,6 +86,13 @@ PYEOF
     fi
   fi
 
+  # The authenticated newman pass needs a first admin account, whose creation
+  # requires a bootstrap token the server resolves at boot from BIFROST_SETUP_TOKEN.
+  # Export it so the server process and the runner (BIFROST_E2E_SETUP_TOKEN) share it;
+  # without it set-auth-config skips the auth pass and the MCP/vMCP tests run nowhere.
+  export BIFROST_SETUP_TOKEN="${BIFROST_SETUP_TOKEN:-bifrost-e2e-setup-token}"
+  export BIFROST_E2E_SETUP_TOKEN="$BIFROST_SETUP_TOKEN"
+
   echo "🚀 Starting Bifrost on port $PORT..."
   "$BIFROST_BINARY" --app-dir "$TEMP_DIR" --port "$PORT" --log-level debug > "$SERVER_LOG" 2>&1 &
   BIFROST_PID=$!
@@ -176,5 +183,24 @@ if ! ./runners/run-newman-inference-features-tests.sh $REPORT_ARGS; then
   exit 1
 fi
 
+# The governance suites (vk quota, rate limit / budget, vk rotation cooldown)
+# are not listed separately here: run-newman-api-tests.sh above runs them as
+# part of the /api suite. Set BIFROST_E2E_SKIP_GOVERNANCE=1 to skip them.
+
+# The auth matrix boots its own servers (one per config combination), so it only
+# runs when we were given a binary to boot. When tests run against an externally
+# managed server we cannot vary its boot config, so the suite is skipped.
+if [ -n "${BIFROST_BINARY:-}" ]; then
+  echo "=========================================="
+  echo "Running auth matrix test suite..."
+  echo "=========================================="
+  if ! ./runners/individual/run-newman-auth-matrix-tests.sh --binary "$BIFROST_BINARY" --port "$((PORT + 7))" $REPORT_ARGS; then
+    echo "❌ auth matrix test suite failed"
+    exit 1
+  fi
+else
+  echo "ℹ️  Skipping auth matrix suite (no binary provided; it boots its own servers per config)"
+fi
+
 echo ""
-echo "✅ All E2E API tests passed (/v1, /integrations, /api, inference features)"
+echo "✅ All E2E API tests passed (/v1, /integrations, /api incl. governance suites, inference features, auth matrix)"

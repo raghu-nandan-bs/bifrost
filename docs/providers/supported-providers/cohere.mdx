@@ -72,25 +72,7 @@ Configure Cohere as a provider.
 
 </Tab>
 <Tab title="API">
-
-```bash
-curl --location 'http://localhost:8080/api/providers' \
---header 'Content-Type: application/json' \
---data '{
-  "provider": "cohere",
-  "keys": [
-    {
-      "name": "cohere-key-1",
-      "value": "env.COHERE_API_KEY",
-      "models": [
-        "*"
-      ],
-      "weight": 1.0
-    }
-  ]
-}'
-```
-
+Refer to the API documentation for [Provider Keys Management](https://docs.getbifrost.ai/api-reference/providers/create-a-key-for-a-provider).
 </Tab>
 <Tab title="Go SDK">
 
@@ -98,7 +80,7 @@ curl --location 'http://localhost:8080/api/providers' \
 case schemas.Cohere:
     return []schemas.Key{{
         Name:   "cohere-key-1",
-        Value:  *schemas.NewEnvVar("env.COHERE_API_KEY"),
+        Value:  *schemas.NewSecretVar("env.COHERE_API_KEY"),
         Models: []string{"*"},
         Weight: 1.0,
     }}, nil
@@ -410,8 +392,8 @@ curl -X POST http://localhost:8080/v1/embeddings \
 resp, err := client.EmbeddingRequest(schemas.NewBifrostContext(ctx, schemas.NoDeadline), &schemas.BifrostEmbeddingRequest{
     Provider: schemas.Cohere,
     Model:    "cohere/embed-english-v3.0",
-    Input: &schemas.EmbeddingInput{
-        Texts: []string{"text to embed"},
+    Input: []schemas.EmbeddingContent{
+        {{Type: schemas.EmbeddingContentPartTypeText, Text: schemas.Ptr("text to embed")}},
     },
     Params: &schemas.EmbeddingParameters{
         Dimensions: schemas.Ptr(1024),

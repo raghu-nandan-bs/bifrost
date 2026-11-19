@@ -1,5 +1,5 @@
-import { describe, test, expect } from "vitest";
-import { cleanNumericInput } from "./strings";
+import { describe, expect, it, test } from "vitest";
+import { cleanNumericInput, isSentinelValue, secondsToHumanReadable, titleCaseFromSnakeCase, trimFields } from "./strings";
 
 // Simulate what onChange does: clean → Number()
 function simulateOnChange(raw: string): { display: string; value: number | undefined } {
@@ -200,5 +200,66 @@ describe("simulateOnBlur (normalize display)", () => {
 	});
 	test("1000 → 1000", () => {
 		expect(simulateOnBlur("1000")).toEqual({ display: "1000", value: 1000 });
+	});
+});
+describe("titleCaseFromSnakeCase", () => {
+	test("single word", () => expect(titleCaseFromSnakeCase("connected")).toBe("Connected"));
+	test("two words", () => expect(titleCaseFromSnakeCase("pending_verification")).toBe("Pending Verification"));
+	test("needs_reauth", () => expect(titleCaseFromSnakeCase("needs_reauth")).toBe("Needs Reauth"));
+	test("already uppercase", () => expect(titleCaseFromSnakeCase("HEALTHY")).toBe("Healthy"));
+	test("mixed case", () => expect(titleCaseFromSnakeCase("Needs_Reauth")).toBe("Needs Reauth"));
+	test("empty string", () => expect(titleCaseFromSnakeCase("")).toBe(""));
+	test("leading/trailing underscores", () => expect(titleCaseFromSnakeCase("_disabled_")).toBe("Disabled"));
+});
+
+describe("trimFields", () => {
+	test("trims string fields in place", () => {
+		const obj = { topic: " my-topic ", project: "\tproj\n" };
+		trimFields(obj, "topic", "project");
+		expect(obj).toEqual({ topic: "my-topic", project: "proj" });
+	});
+	test("trims string array fields", () => {
+		const obj = { brokers: [" a:9092", "b:9092 ", " c:9092 "] };
+		trimFields(obj, "brokers");
+		expect(obj.brokers).toEqual(["a:9092", "b:9092", "c:9092"]);
+	});
+	test("leaves undefined fields untouched", () => {
+		const obj: { name: string; ml_app?: string } = { name: " x " };
+		trimFields(obj, "name", "ml_app");
+		expect(obj).toEqual({ name: "x" });
+		expect("ml_app" in obj).toBe(false);
+	});
+	test("only touches the named fields", () => {
+		const obj = { a: " x ", b: " y " };
+		trimFields(obj, "a");
+		expect(obj).toEqual({ a: "x", b: " y " });
+	});
+	test("returns the same object", () => {
+		const obj = { a: " x " };
+		expect(trimFields(obj, "a")).toBe(obj);
+	});
+});
+describe("isSentinelValue", () => {
+	test("matches double-underscore placeholders", () => {
+		expect(isSentinelValue("__none__")).toBe(true);
+		expect(isSentinelValue("__all__")).toBe(true);
+	});
+
+	test("leaves real values alone", () => {
+		expect(isSentinelValue("openai")).toBe(false);
+		expect(isSentinelValue("all")).toBe(false);
+		expect(isSentinelValue("____")).toBe(false);
+		expect(isSentinelValue("__none")).toBe(false);
+	});
+});
+
+describe("secondsToHumanReadable", () => {
+	it("words a duration, dropping zero parts", () => {
+		expect(secondsToHumanReadable(0)).toBe("0 seconds");
+		expect(secondsToHumanReadable(1)).toBe("1 second");
+		expect(secondsToHumanReadable(120)).toBe("2 minutes");
+		expect(secondsToHumanReadable(125)).toBe("2 minutes 5 seconds");
+		expect(secondsToHumanReadable(3600)).toBe("1 hour");
+		expect(secondsToHumanReadable(90061)).toBe("1 day 1 hour 1 minute 1 second");
 	});
 });

@@ -116,9 +116,12 @@ func DefaultMatchFns() []MatchFn {
 	}
 }
 
-// matches reports whether a and b are considered equal by any of the provided fns.
-// Returns true on the first fn that returns true.
+// matches reports whether list entry b matches model a: a regex: entry is a full RE2
+// match, any other entry is equal by the first of the provided fns that returns true.
 func matches(a, b string, fns []MatchFn) bool {
+	if schemas.IsRegexEntry(b) {
+		return schemas.MatchEntry(b, a)
+	}
 	for _, fn := range fns {
 		if fn(a, b) {
 			return true
@@ -168,9 +171,9 @@ type FilterResult struct {
 type ListModelsPipeline struct {
 	AllowedModels     schemas.WhiteList
 	BlacklistedModels schemas.BlackList
-	// Aliases maps user-facing alias keys to provider-specific model IDs.
-	// e.g. {"my-gpt4": "gpt-4-turbo-2024-04-09"}
-	Aliases     map[string]string
+	// Aliases maps user-facing alias keys to their AliasConfig. The pipeline
+	// reads AliasConfig.ModelID for matching and Alias surfacing.
+	Aliases     schemas.KeyAliases
 	Unfiltered  bool
 	ProviderKey schemas.ModelProvider
 	// MatchFns is the ordered list of equivalence functions used for every
@@ -224,9 +227,13 @@ type aliasMatch struct {
 //	  → [{key:"gpt-3.5-turbo", value:""}]
 func (p *ListModelsPipeline) resolveModelID(modelID string) []aliasMatch {
 	var candidates []aliasMatch
-	for aliasKey, providerID := range p.Aliases {
-		if matches(modelID, providerID, p.MatchFns) {
-			candidates = append(candidates, aliasMatch{key: aliasKey, value: providerID})
+	for aliasKey, alias := range p.Aliases {
+		// A pattern alias names no single model, so it never relabels a listed one.
+		if schemas.IsRegexEntry(aliasKey) {
+			continue
+		}
+		if matches(modelID, alias.ModelID, p.MatchFns) {
+			candidates = append(candidates, aliasMatch{key: aliasKey, value: alias.ModelID})
 		}
 	}
 	if len(candidates) == 0 {
@@ -350,7 +357,7 @@ func (p *ListModelsPipeline) BackfillModels(included map[string]bool) []schemas.
 	if !p.Unfiltered && p.AllowedModels.IsRestricted() {
 		// Case A: backfill explicit allowlist entries not yet matched.
 		for _, entry := range p.AllowedModels {
-			if included[strings.ToLower(entry)] {
+			if schemas.IsRegexEntry(entry) || included[strings.ToLower(entry)] {
 				continue
 			}
 			// Blacklist check.
@@ -369,21 +376,25 @@ func (p *ListModelsPipeline) BackfillModels(included map[string]bool) []schemas.
 				Name: schemas.Ptr(ToDisplayName(entry)),
 			}
 			// If this allowlist entry has an alias, surface the provider-specific ID.
-			for aliasKey, providerID := range p.Aliases {
-				if matches(entry, aliasKey, p.MatchFns) {
-					m.Alias = schemas.Ptr(providerID)
+			for aliasKey, alias := range p.Aliases {
+				if !schemas.IsRegexEntry(aliasKey) && matches(entry, aliasKey, p.MatchFns) {
+					m.Alias = schemas.Ptr(alias.ModelID)
 					break
+				}
+			}
+			if m.Alias == nil {
+				for _, pattern := range p.Aliases.PatternKeys() {
+					if alias, ok := schemas.ExpandPatternAlias(pattern, p.Aliases[pattern], entry); ok {
+						m.Alias = schemas.Ptr(alias.ModelID)
+						break
+					}
 				}
 			}
 			result = append(result, m)
 		}
-		return result
-	}
-
-	// Case B: wildcard allowlist — backfill only explicitly configured aliases.
-	if !p.Unfiltered && len(p.Aliases) > 0 {
-		for aliasKey, providerID := range p.Aliases {
-			if included[strings.ToLower(aliasKey)] {
+		// An alias allowed only by a regex: entry has no exact entry above, so backfill it here.
+		for aliasKey, alias := range p.Aliases {
+			if schemas.IsRegexEntry(aliasKey) || included[strings.ToLower(aliasKey)] || !p.allowedOnlyByRegex(aliasKey) {
 				continue
 			}
 			// Blacklist check.
@@ -400,10 +411,51 @@ func (p *ListModelsPipeline) BackfillModels(included map[string]bool) []schemas.
 			result = append(result, schemas.Model{
 				ID:    string(p.ProviderKey) + "/" + aliasKey,
 				Name:  schemas.Ptr(ToDisplayName(aliasKey)),
-				Alias: schemas.Ptr(providerID),
+				Alias: schemas.Ptr(alias.ModelID),
+			})
+		}
+		return result
+	}
+
+	// Case B: wildcard allowlist — backfill only explicitly configured aliases.
+	if !p.Unfiltered && len(p.Aliases) > 0 {
+		for aliasKey, alias := range p.Aliases {
+			if schemas.IsRegexEntry(aliasKey) || included[strings.ToLower(aliasKey)] {
+				continue
+			}
+			// Blacklist check.
+			blacklisted := false
+			for _, bl := range p.BlacklistedModels {
+				if matches(aliasKey, bl, p.MatchFns) {
+					blacklisted = true
+					break
+				}
+			}
+			if blacklisted {
+				continue
+			}
+			result = append(result, schemas.Model{
+				ID:    string(p.ProviderKey) + "/" + aliasKey,
+				Name:  schemas.Ptr(ToDisplayName(aliasKey)),
+				Alias: schemas.Ptr(alias.ModelID),
 			})
 		}
 	}
 
 	return result
+}
+
+// allowedOnlyByRegex reports whether name matches a regex: allowlist entry and no exact one.
+func (p *ListModelsPipeline) allowedOnlyByRegex(name string) bool {
+	byRegex := false
+	for _, entry := range p.AllowedModels {
+		if !matches(name, entry, p.MatchFns) {
+			continue
+		}
+		if !schemas.IsRegexEntry(entry) {
+			return false
+		}
+		byRegex = true
+	}
+	return byRegex
 }

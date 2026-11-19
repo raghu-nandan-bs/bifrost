@@ -151,9 +151,38 @@ func HTTPTransportPostHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest
 	return nil
 }
 
+// HTTPTransportResponseHeadersHook adds headers at the pre-commit boundary, so
+// they are present on both streaming and non-streaming responses.
+func HTTPTransportResponseHeadersHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, resp *schemas.HTTPResponseMetadata) error {
+	if !pluginConfig.EnableHTTPHooks {
+		return nil
+	}
+
+	var interfaces []string
+	if pluginConfig.EnableHTTPHooks {
+		interfaces = append(interfaces, "http")
+	}
+	if pluginConfig.EnableLLMHooks {
+		interfaces = append(interfaces, "llm")
+	}
+	if pluginConfig.EnableMCPHooks {
+		interfaces = append(interfaces, "mcp")
+	}
+	if pluginConfig.EnableObservability {
+		interfaces = append(interfaces, "observability")
+	}
+	resp.SetHeader(fmt.Sprintf("%s-Interfaces", pluginConfig.CustomHeaderPrefix), fmt.Sprintf("%v", interfaces))
+	return nil
+}
+
 // ============================================================================
 // LLMPlugin Interface
 // ============================================================================
+
+// PreRequestHook is the per-request routing phase. This example plugin doesn't route.
+func PreRequestHook(_ *schemas.BifrostContext, _ *schemas.BifrostRequest) error {
+	return nil
+}
 
 // PreLLMHook is called before the LLM provider is invoked
 func PreLLMHook(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) (*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error) {

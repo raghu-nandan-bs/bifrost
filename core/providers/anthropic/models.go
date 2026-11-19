@@ -8,7 +8,7 @@ import (
 	"github.com/maximhq/bifrost/core/schemas"
 )
 
-func (response *AnthropicListModelsResponse) ToBifrostListModelsResponse(providerKey schemas.ModelProvider, allowedModels schemas.WhiteList, blacklistedModels schemas.BlackList, aliases map[string]string, unfiltered bool) *schemas.BifrostListModelsResponse {
+func (response *AnthropicListModelsResponse) ToBifrostListModelsResponse(providerKey schemas.ModelProvider, allowedModels schemas.WhiteList, blacklistedModels schemas.BlackList, aliases schemas.KeyAliases, unfiltered bool) *schemas.BifrostListModelsResponse {
 	if response == nil {
 		return nil
 	}
@@ -105,4 +105,22 @@ func ToAnthropicListModelsResponse(response *schemas.BifrostListModelsResponse) 
 	}
 
 	return anthropicResponse
+}
+
+// ToBifrostModelRetrieveResponse converts an Anthropic model object to a Bifrost model retrieve response
+func (model *AnthropicModel) ToBifrostModelRetrieveResponse(providerKey schemas.ModelProvider) *schemas.BifrostModelRetrieveResponse {
+	if model == nil {
+		return nil
+	}
+
+	return &schemas.BifrostModelRetrieveResponse{
+		Model: schemas.Model{
+			ID:              string(providerKey) + "/" + model.ID,
+			Name:            schemas.Ptr(model.DisplayName),
+			Created:         schemas.Ptr(model.CreatedAt.Unix()),
+			MaxInputTokens:  model.MaxInputTokens,
+			MaxOutputTokens: model.MaxTokens,
+			ProviderExtra:   model.Capabilities,
+		},
+	}
 }

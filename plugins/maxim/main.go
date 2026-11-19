@@ -4,6 +4,7 @@ package maxim
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,8 +30,9 @@ const (
 //   - APIKey: API key for Maxim SDK authentication
 //   - LogRepoID: Optional default ID for the Maxim logger instance
 type Config struct {
-	LogRepoID string `json:"log_repo_id,omitempty"` // Optional - can be empty
-	APIKey    string `json:"api_key"`
+	LogRepoID      string   `json:"log_repo_id,omitempty"` // Optional - can be empty
+	APIKey         string   `json:"api_key"`
+	RequestHeaders []string `json:"request_headers,omitempty"` // Optional request-header name patterns (exact or wildcard) to attach as trace tags
 }
 
 // Plugin implements the schemas.LLMPlugin interface for Maxim's logger.
@@ -48,6 +50,7 @@ type Plugin struct {
 	loggers          map[string]*logging.Logger
 	loggerMutex      *sync.RWMutex
 	logger           schemas.Logger
+	requestHeaders   []string
 }
 
 // Init initializes and returns a Plugin instance for Maxim's logger.
@@ -75,6 +78,7 @@ func Init(config *Config, logger schemas.Logger) (schemas.LLMPlugin, error) {
 		loggers:          make(map[string]*logging.Logger),
 		loggerMutex:      &sync.RWMutex{},
 		logger:           logger,
+		requestHeaders:   config.RequestHeaders,
 	}
 
 	// Initialize default logger if LogRepoId is provided
@@ -161,6 +165,12 @@ func (plugin *Plugin) GetName() string {
 	return PluginName
 }
 
+// HTTPTransportPreAuthHook is a no-op: this plugin does no credential work, so it has
+// nothing to do before the transport authenticates the request (HTTPTransportPlugin interface).
+func (*Plugin) HTTPTransportPreAuthHook(_ *schemas.BifrostContext, _ *schemas.HTTPRequest) (*schemas.HTTPResponse, error) {
+	return nil, nil
+}
+
 // HTTPTransportPreHook is not used for this plugin
 func (plugin *Plugin) HTTPTransportPreHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest) (*schemas.HTTPResponse, error) {
 	return nil, nil
@@ -168,6 +178,11 @@ func (plugin *Plugin) HTTPTransportPreHook(ctx *schemas.BifrostContext, req *sch
 
 // HTTPTransportPostHook is not used for this plugin
 func (plugin *Plugin) HTTPTransportPostHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, resp *schemas.HTTPResponse) error {
+	return nil
+}
+
+// HTTPTransportResponseHeadersHook leaves response headers unchanged.
+func (plugin *Plugin) HTTPTransportResponseHeadersHook(_ *schemas.BifrostContext, _ *schemas.HTTPRequest, _ *schemas.HTTPResponseMetadata) error {
 	return nil
 }
 
@@ -224,6 +239,11 @@ func (plugin *Plugin) getOrCreateLogger(logRepoID string) (*logging.Logger, erro
 
 	plugin.loggers[logRepoID] = logger
 	return logger, nil
+}
+
+// PreRequestHook implements schemas.LLMPlugin (no-op — required for plugin indexing).
+func (plugin *Plugin) PreRequestHook(_ *schemas.BifrostContext, _ *schemas.BifrostRequest) error {
+	return nil
 }
 
 // PreLLMHook is called before a request is processed by Bifrost.
@@ -507,6 +527,27 @@ func (plugin *Plugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.Bifro
 	return req, nil, nil
 }
 
+// addLatencyTags forwards Bifrost's upstream/overhead latency split onto the Maxim
+// generation and trace as tags. Maxim has no native field for the breakdown, so
+// tags are the channel, matching how model and dimensions are forwarded. A nil
+// value is left unreported so absent stays distinct from zero.
+func addLatencyTags(logger *logging.Logger, generationID, traceID string, upstreamMs, overheadMs *int64) {
+	add := func(key string, v *int64) {
+		if v == nil {
+			return
+		}
+		val := strconv.FormatInt(*v, 10)
+		if generationID != "" {
+			logger.AddTagToGeneration(generationID, key, val)
+		}
+		if traceID != "" {
+			logger.AddTagToTrace(traceID, key, val)
+		}
+	}
+	add("upstream_latency_ms", upstreamMs)
+	add("overhead_latency_ms", overheadMs)
+}
+
 // PostLLMHook is called after a request has been processed by Bifrost.
 // It completes the request trace by:
 // - Adding response data to the generation if a generation ID exists
@@ -554,6 +595,32 @@ func (plugin *Plugin) PostLLMHook(ctx *schemas.BifrostContext, result *schemas.B
 	tags, hasTags := ctx.Value(TagsKey).(map[string]string)
 	// Also capture x-bf-dim-* dimensions to forward as tags
 	dims, hasDims := ctx.Value(schemas.BifrostContextKeyDimensions).(map[string]string)
+	// Capture configured request headers (exact or wildcard patterns) to forward as tags.
+	var reqHeaders map[string]string
+	if len(plugin.requestHeaders) > 0 {
+		allHeaders, _ := ctx.Value(schemas.BifrostContextKeyRequestHeaders).(map[string]string)
+		// Maxim captures from ctx directly (not trace.RequestHeaders), so redact
+		// credential-bearing headers here before forwarding them as tags.
+		reqHeaders = schemas.RedactSensitiveHeaders(schemas.FilterHeaders(allHeaders, plugin.requestHeaders))
+	}
+	hasReqHeaders := len(reqHeaders) > 0
+
+	// Bifrost's latency breakdown (time on provider sockets vs Bifrost's own cost),
+	// stamped onto ExtraFields before post-hooks run. Copied out here so the
+	// goroutine can forward them as tags without racing a reused context or result.
+	var upstreamLatencyMs, overheadLatencyMs *int64
+	if result != nil {
+		if ef := result.GetExtraFields(); ef != nil {
+			if v := ef.UpstreamLatency; v != nil {
+				u := *v
+				upstreamLatencyMs = &u
+			}
+			if v := ef.OverheadLatency; v != nil {
+				o := *v
+				overheadLatencyMs = &o
+			}
+		}
+	}
 
 	isFinalChunk := bifrost.IsFinalChunk(ctx)
 
@@ -686,6 +753,20 @@ func (plugin *Plugin) PostLLMHook(ctx *schemas.BifrostContext, result *schemas.B
 		}
 		if hasTraceID && traceID != "" && modelTag != "" {
 			logger.AddTagToTrace(traceID, "model", string(modelTag))
+		}
+		// Forward Bifrost's upstream/overhead latency split, matching the logs UI.
+		addLatencyTags(logger, generationID, traceID, upstreamLatencyMs, overheadLatencyMs)
+		// add configured request headers as tags (prefixed to avoid colliding with other tags)
+		if hasReqHeaders {
+			for key, value := range reqHeaders {
+				tagKey := "header." + key
+				if generationID != "" {
+					logger.AddTagToGeneration(generationID, tagKey, value)
+				}
+				if traceID != "" {
+					logger.AddTagToTrace(traceID, tagKey, value)
+				}
+			}
 		}
 		// Flush only the effective logger that was used for this request
 		logger.Flush()

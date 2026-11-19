@@ -89,9 +89,9 @@ type BedrockBatchJobSummary struct {
 
 // BedrockBatchResultRecord represents a single result record in Bedrock batch output JSONL.
 type BedrockBatchResultRecord struct {
-	RecordID    string                 `json:"recordId"`
-	ModelOutput json.RawMessage        `json:"modelOutput,omitempty"`
-	Error       *BedrockBatchError     `json:"error,omitempty"`
+	RecordID    string             `json:"recordId"`
+	ModelOutput json.RawMessage    `json:"modelOutput,omitempty"`
+	Error       *BedrockBatchError `json:"error,omitempty"`
 }
 
 // BedrockBatchError represents an error in batch processing.
@@ -281,6 +281,11 @@ func ToBedrockBatchJobRetrieveResponse(resp *schemas.BifrostBatchRetrieveRespons
 		if jobName, ok := resp.Metadata["job_name"]; ok {
 			result.JobName = jobName
 		}
+	}
+
+	// Map the failure reason back to Bedrock's native message field.
+	if resp.Errors != nil && len(resp.Errors.Data) > 0 {
+		result.Message = resp.Errors.Data[0].Message
 	}
 
 	if resp.CreatedAt > 0 {

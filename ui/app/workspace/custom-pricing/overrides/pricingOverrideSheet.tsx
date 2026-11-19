@@ -1,3 +1,5 @@
+import { VirtualKeySelector } from "@/components/entitySelectors/virtualKeySelector";
+import { RbacOperation, RbacResource, useRbac } from "@enterprise/lib/contexts/rbacContext";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { CodeEditor } from "@/components/ui/codeEditor";
@@ -6,313 +8,65 @@ import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { ProviderSelector } from "@/components/ui/providerSelector";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
-import { ProviderIconType, RenderProviderIcon } from "@/lib/constants/icons";
-import { getProviderLabel, RequestTypeLabels } from "@/lib/constants/logs";
-import {
-	getErrorMessage,
-	useCreatePricingOverrideMutation,
-	useGetProvidersQuery,
-	useGetVirtualKeysQuery,
-	useUpdatePricingOverrideMutation,
-} from "@/lib/store";
+import { getProviderLabel, getRequestTypeLabel } from "@/lib/constants/logs";
+import { getErrorMessage, useCreatePricingOverrideMutation, useGetProvidersQuery, useUpdatePricingOverrideMutation } from "@/lib/store";
 import { useGetAllKeysQuery } from "@/lib/store/apis/providersApi";
+import { getUserPicker } from "@/lib/registries/userPicker";
 import { ModelProvider, RequestType } from "@/lib/types/config";
-import {
-	CreatePricingOverrideRequest,
-	PricingOverride,
-	PricingOverrideMatchType,
-	PricingOverridePatch,
-	PricingOverrideScopeKind,
-} from "@/lib/types/governance";
+import { CreatePricingOverrideRequest, PricingOverride, PricingOverrideMatchType, PricingOverrideScopeKind } from "@/lib/types/governance";
 import { cn } from "@/lib/utils";
 import { ChevronDown, Save, X } from "lucide-react";
 import { Dispatch, SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ParseKeys } from "i18next";
 import { useForm } from "react-hook-form";
+import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
+import i18n from "@/lib/i18n";
 import { PricingFieldSelector } from "./pricingFieldSelector";
+// Side-effect import: registers the enterprise user picker (no-op in OSS builds).
+import "@enterprise/lib/registrations/userPicker";
 
-export const REQUEST_TYPE_GROUPS = [
-	{
-		label: "Chat / Text / Responses",
-		types: ["chat_completion", "text_completion", "responses"],
-	},
-	{
-		label: "Embedding",
-		types: ["embedding"],
-	},
-	{
-		label: "Rerank",
-		types: ["rerank"],
-	},
-	{
-		label: "Audio",
-		types: ["speech", "transcription"],
-	},
-	{
-		label: "Image",
-		types: ["image_generation", "image_variation", "image_edit"],
-	},
-	{
-		label: "Video",
-		types: ["video_generation", "video_remix"],
-	},
-	{
-		label: "OCR",
-		types: ["ocr"],
-	},
-] as const;
-
-export const REQUEST_TYPE_OPTIONS = REQUEST_TYPE_GROUPS.flatMap((g) => g.types);
-
-export function getRequestTypeGroup(rt: string): string | undefined {
-	return REQUEST_TYPE_GROUPS.find((g) => (g.types as readonly string[]).includes(rt))?.label;
-}
-
-export const PRICING_FIELDS = [
-	// Chat / Text / Responses fields
-	{
-		key: "input_cost_per_token",
-		label: "Input / token",
-		group: "chat",
-		requestTypeGroups: ["chat", "embedding", "rerank", "audio", "image", "video"],
-	},
-	{
-		key: "output_cost_per_token",
-		label: "Output / token",
-		group: "chat",
-		requestTypeGroups: ["chat", "rerank", "audio", "image", "video"],
-	},
-	{ key: "input_cost_per_token_batches", label: "Input / token (batch)", group: "chat", requestTypeGroups: ["chat"] },
-	{ key: "output_cost_per_token_batches", label: "Output / token (batch)", group: "chat", requestTypeGroups: ["chat"] },
-	{ key: "input_cost_per_token_priority", label: "Input / token (priority)", group: "chat", requestTypeGroups: ["chat"] },
-	{ key: "output_cost_per_token_priority", label: "Output / token (priority)", group: "chat", requestTypeGroups: ["chat"] },
-	{ key: "input_cost_per_token_flex", label: "Input / token (flex)", group: "chat", requestTypeGroups: ["chat"] },
-	{ key: "output_cost_per_token_flex", label: "Output / token (flex)", group: "chat", requestTypeGroups: ["chat"] },
-	{
-		key: "input_cost_per_token_above_128k_tokens",
-		label: "Input / token (>128k)",
-		group: "chat",
-		requestTypeGroups: ["chat", "embedding", "rerank"],
-	},
-	{
-		key: "output_cost_per_token_above_128k_tokens",
-		label: "Output / token (>128k)",
-		group: "chat",
-		requestTypeGroups: ["chat", "rerank", "audio"],
-	},
-	{
-		key: "input_cost_per_token_above_200k_tokens",
-		label: "Input / token (>200k)",
-		group: "chat",
-		requestTypeGroups: ["chat", "embedding", "rerank"],
-	},
-	{
-		key: "input_cost_per_token_above_200k_tokens_priority",
-		label: "Input / token (>200k, priority)",
-		group: "chat",
-		requestTypeGroups: ["chat"],
-	},
-	{
-		key: "output_cost_per_token_above_200k_tokens",
-		label: "Output / token (>200k)",
-		group: "chat",
-		requestTypeGroups: ["chat", "rerank", "audio"],
-	},
-	{
-		key: "output_cost_per_token_above_200k_tokens_priority",
-		label: "Output / token (>200k, priority)",
-		group: "chat",
-		requestTypeGroups: ["chat"],
-	},
-	{
-		key: "input_cost_per_token_above_272k_tokens",
-		label: "Input / token (>272k)",
-		group: "chat",
-		requestTypeGroups: ["chat"],
-	},
-	{
-		key: "input_cost_per_token_above_272k_tokens_priority",
-		label: "Input / token (>272k, priority)",
-		group: "chat",
-		requestTypeGroups: ["chat"],
-	},
-	{
-		key: "output_cost_per_token_above_272k_tokens",
-		label: "Output / token (>272k)",
-		group: "chat",
-		requestTypeGroups: ["chat"],
-	},
-	{
-		key: "output_cost_per_token_above_272k_tokens_priority",
-		label: "Output / token (>272k, priority)",
-		group: "chat",
-		requestTypeGroups: ["chat"],
-	},
-	{ key: "cache_creation_input_token_cost", label: "Cache creation / token", group: "chat", requestTypeGroups: ["chat"] },
-	{ key: "cache_read_input_token_cost", label: "Cache read / token", group: "chat", requestTypeGroups: ["chat"] },
-	{
-		key: "cache_creation_input_token_cost_above_200k_tokens",
-		label: "Cache creation / token (>200k)",
-		group: "chat",
-		requestTypeGroups: ["chat"],
-	},
-	{ key: "cache_read_input_token_cost_above_200k_tokens", label: "Cache read / token (>200k)", group: "chat", requestTypeGroups: ["chat"] },
-	{ key: "cache_creation_input_token_cost_above_1hr", label: "Cache creation / token (>1hr)", group: "chat", requestTypeGroups: ["chat"] },
-	{
-		key: "cache_creation_input_token_cost_above_1hr_above_200k_tokens",
-		label: "Cache creation / token (>1hr, >200k)",
-		group: "chat",
-		requestTypeGroups: ["chat"],
-	},
-	{ key: "cache_read_input_token_cost_priority", label: "Cache read / token (priority)", group: "chat", requestTypeGroups: ["chat"] },
-	{ key: "cache_read_input_token_cost_flex", label: "Cache read / token (flex)", group: "chat", requestTypeGroups: ["chat"] },
-	{
-		key: "cache_read_input_token_cost_above_200k_tokens_priority",
-		label: "Cache read / token (>200k, priority)",
-		group: "chat",
-		requestTypeGroups: ["chat"],
-	},
-	{ key: "cache_read_input_token_cost_above_272k_tokens", label: "Cache read / token (>272k)", group: "chat", requestTypeGroups: ["chat"] },
-	{
-		key: "cache_read_input_token_cost_above_272k_tokens_priority",
-		label: "Cache read / token (>272k, priority)",
-		group: "chat",
-		requestTypeGroups: ["chat"],
-	},
-	{ key: "search_context_cost_per_query", label: "Search context / query", group: "chat", requestTypeGroups: ["chat", "rerank"] },
-	{ key: "code_interpreter_cost_per_session", label: "Code interpreter / session", group: "chat", requestTypeGroups: ["chat"] },
-	// Audio fields
-	{ key: "input_cost_per_character", label: "Input / character", group: "audio", requestTypeGroups: ["audio"] },
-	{ key: "input_cost_per_audio_token", label: "Input / audio token", group: "audio", requestTypeGroups: ["audio"] },
-	{ key: "input_cost_per_audio_per_second", label: "Input / audio second", group: "audio", requestTypeGroups: ["audio"] },
-	{
-		key: "input_cost_per_audio_per_second_above_128k_tokens",
-		label: "Input / audio second (>128k)",
-		group: "audio",
-		requestTypeGroups: ["audio"],
-	},
-	{ key: "input_cost_per_second", label: "Input / second", group: "audio", requestTypeGroups: ["audio", "video"] },
-	{ key: "output_cost_per_audio_token", label: "Output / audio token", group: "audio", requestTypeGroups: ["audio"] },
-	{ key: "output_cost_per_second", label: "Output / second", group: "audio", requestTypeGroups: ["audio", "video"] },
-	{ key: "cache_creation_input_audio_token_cost", label: "Cache creation / audio token", group: "audio", requestTypeGroups: ["audio"] },
-	// Image fields
-	{ key: "input_cost_per_image_token", label: "Input / image token", group: "image", requestTypeGroups: ["image"] },
-	{ key: "input_cost_per_image", label: "Input / image", group: "image", requestTypeGroups: ["image"] },
-	{ key: "input_cost_per_image_above_128k_tokens", label: "Input / image (>128k)", group: "image", requestTypeGroups: ["image"] },
-	{ key: "input_cost_per_pixel", label: "Input / pixel", group: "image", requestTypeGroups: ["image"] },
-	{ key: "output_cost_per_image_token", label: "Output / image token", group: "image", requestTypeGroups: ["image"] },
-	{ key: "output_cost_per_image", label: "Output / image", group: "image", requestTypeGroups: ["image"] },
-	{ key: "output_cost_per_pixel", label: "Output / pixel", group: "image", requestTypeGroups: ["image"] },
-	{ key: "output_cost_per_image_premium_image", label: "Output / image (premium)", group: "image", requestTypeGroups: ["image"] },
-	{ key: "output_cost_per_image_above_512_and_512_pixels", label: "Output / image (>512px)", group: "image", requestTypeGroups: ["image"] },
-	{
-		key: "output_cost_per_image_above_512_and_512_pixels_and_premium_image",
-		label: "Output / image (>512px, premium)",
-		group: "image",
-		requestTypeGroups: ["image"],
-	},
-	{
-		key: "output_cost_per_image_above_1024_and_1024_pixels",
-		label: "Output / image (>1024px)",
-		group: "image",
-		requestTypeGroups: ["image"],
-	},
-	{
-		key: "output_cost_per_image_above_1024_and_1024_pixels_and_premium_image",
-		label: "Output / image (>1024px, premium)",
-		group: "image",
-		requestTypeGroups: ["image"],
-	},
-	{ key: "output_cost_per_image_low_quality", label: "Output / image (low quality)", group: "image", requestTypeGroups: ["image"] },
-	{ key: "output_cost_per_image_medium_quality", label: "Output / image (medium quality)", group: "image", requestTypeGroups: ["image"] },
-	{ key: "output_cost_per_image_high_quality", label: "Output / image (high quality)", group: "image", requestTypeGroups: ["image"] },
-	{ key: "output_cost_per_image_auto_quality", label: "Output / image (auto quality)", group: "image", requestTypeGroups: ["image"] },
-	{ key: "cache_read_input_image_token_cost", label: "Cache read / image token", group: "image", requestTypeGroups: ["image"] },
-	// Video fields
-	{ key: "input_cost_per_video_per_second", label: "Input / video second", group: "video", requestTypeGroups: ["video"] },
-	{
-		key: "input_cost_per_video_per_second_above_128k_tokens",
-		label: "Input / video second (>128k)",
-		group: "video",
-		requestTypeGroups: ["video"],
-	},
-	{ key: "output_cost_per_video_per_second", label: "Output / video second", group: "video", requestTypeGroups: ["video"] },
-	// OCR fields
-	{ key: "ocr_cost_per_page", label: "OCR / page", group: "ocr", requestTypeGroups: ["ocr"] },
-	{ key: "annotation_cost_per_page", label: "Annotation / page", group: "ocr", requestTypeGroups: ["ocr"] },
-] as const;
-
-export type PricingFieldKey = (typeof PRICING_FIELDS)[number]["key"];
-export type FieldErrors = Partial<Record<PricingFieldKey | "name" | "scope" | "pattern" | "patch", string>>;
-
-type ScopeRoot = "global" | "virtual_key";
-
-export interface FormState {
-	name: string;
-	scopeRoot: ScopeRoot;
-	virtualKeyID: string;
-	providerID: string;
-	providerKeyID: string;
-	matchType: PricingOverrideMatchType;
-	pattern: string;
-	requestTypes: RequestType[];
-	pricingValues: Partial<Record<PricingFieldKey, string>>;
-}
-
-export const defaultFormState: FormState = {
-	name: "",
-	scopeRoot: "global",
-	virtualKeyID: "",
-	providerID: "",
-	providerKeyID: "",
-	matchType: "exact",
-	pattern: "",
-	requestTypes: [],
-	pricingValues: {},
-};
-
-export const fieldLabelByKey = Object.fromEntries(PRICING_FIELDS.map((field) => [field.key, field.label])) as Record<
-	PricingFieldKey,
-	string
->;
-export const patchKeys = PRICING_FIELDS.map((field) => field.key) as PricingFieldKey[];
+// Field metadata lives in ./pricingFields; re-exported here so existing
+// importers of this module keep working unchanged.
+export {
+	fieldLabelKeyByKey,
+	getRequestTypeGroup,
+	patchKeys,
+	PRICING_FIELDS,
+	REQUEST_TYPE_GROUPS,
+	REQUEST_TYPE_OPTIONS,
+} from "./pricingFields";
+export { buildPatchFromForm, defaultFormState } from "./pricingFields";
+export type { FieldErrors, FormState, PricingFieldKey, ScopeRoot } from "./pricingFields";
+import {
+	buildPatchFromForm,
+	defaultFormState,
+	fieldLabelKeyByKey,
+	isUnsafePatchKey,
+	patchKeys,
+	PRESERVED_PATCH_KEYS,
+	PRICING_FIELDS,
+	REQUEST_TYPE_GROUPS,
+	REQUEST_TYPE_OPTIONS,
+	pricingFieldError,
+} from "./pricingFields";
+import type { FieldErrors, FormState, PricingFieldKey, ScopeRoot } from "./pricingFields";
 
 export function patternError(matchType: PricingOverrideMatchType, pattern: string): string | undefined {
 	const trimmed = pattern.trim();
-	if (!trimmed) return "Pattern is required";
+	if (!trimmed) return i18n.t("customPricing.patternRequired", { ns: "models" });
 	if (matchType === "exact") {
-		if (trimmed.includes("*")) return "Exact pattern cannot contain *";
+		if (trimmed.includes("*")) return i18n.t("customPricing.exactNoStar", { ns: "models" });
 	} else if (matchType === "wildcard") {
 		const starCount = (trimmed.match(/\*/g) || []).length;
-		if (starCount === 0) return "Wildcard pattern must end with * (example: gpt-5*)";
-		if (starCount > 1) return "Wildcard pattern can include only one *";
-		if (!trimmed.endsWith("*")) return "Wildcard supports prefix-only trailing *";
+		if (starCount === 0) return i18n.t("customPricing.wildcardMustEndStar", { ns: "models" });
+		if (starCount > 1) return i18n.t("customPricing.wildcardOneStar", { ns: "models" });
+		if (!trimmed.endsWith("*")) return i18n.t("customPricing.wildcardPrefixOnly", { ns: "models" });
 	}
 	return undefined;
-}
-
-export function buildPatchFromForm(form: FormState): { patch: PricingOverridePatch; errors: FieldErrors } {
-	const errors: FieldErrors = {};
-	const patch: PricingOverridePatch = {};
-
-	for (const key of patchKeys) {
-		const raw = form.pricingValues[key];
-		if (raw == null || raw.trim() === "") continue;
-		const parsed = Number(raw);
-		if (!Number.isFinite(parsed)) {
-			errors[key] = "Must be a number";
-			continue;
-		}
-		if (parsed < 0) {
-			errors[key] = "Must be >= 0";
-			continue;
-		}
-		(patch as Record<string, number>)[key] = parsed;
-	}
-
-	return { patch, errors };
 }
 
 function toFormState(override: PricingOverride): FormState {
@@ -323,20 +77,32 @@ function toFormState(override: PricingOverride): FormState {
 	} catch {
 		// malformed patch — leave values empty
 	}
-	for (const key of patchKeys) {
-		const val = parsedPatch[key];
-		if (typeof val === "number") values[key] = String(val);
+	// Existing overrides are read leniently: an unrecognized key the API stored
+	// is carried through rather than dropped on save. Unsafe keys are the one
+	// exception, since assigning them here would mutate the prototype instead
+	// of storing anything.
+	const preservedPatch: Record<string, unknown> = {};
+	for (const [key, val] of Object.entries(parsedPatch)) {
+		if (isUnsafePatchKey(key)) continue;
+		if (patchKeys.includes(key as PricingFieldKey) && typeof val === "number") {
+			values[key as PricingFieldKey] = String(val);
+		} else {
+			preservedPatch[key] = val;
+		}
 	}
 	const scopeKind = resolveScopeKind(override);
 
 	const scopeRoot: ScopeRoot =
 		scopeKind === "virtual_key" || scopeKind === "virtual_key_provider" || scopeKind === "virtual_key_provider_key"
 			? "virtual_key"
-			: "global";
+			: scopeKind === "user" || scopeKind === "user_provider" || scopeKind === "user_provider_key"
+				? "user"
+				: "global";
 
 	return {
 		name: override.name ?? "",
 		scopeRoot,
+		userID: override.user_id ?? "",
 		virtualKeyID: override.virtual_key_id ?? "",
 		providerID: override.provider_id ?? "",
 		providerKeyID: override.provider_key_id ?? "",
@@ -344,6 +110,7 @@ function toFormState(override: PricingOverride): FormState {
 		pattern: override.pattern,
 		requestTypes: override.request_types ?? [],
 		pricingValues: values,
+		preservedPatch,
 	};
 }
 
@@ -354,7 +121,10 @@ function resolveScopeKind(override: PricingOverride): PricingOverrideScopeKind {
 		override.scope_kind === "provider_key" ||
 		override.scope_kind === "virtual_key" ||
 		override.scope_kind === "virtual_key_provider" ||
-		override.scope_kind === "virtual_key_provider_key"
+		override.scope_kind === "virtual_key_provider_key" ||
+		override.scope_kind === "user" ||
+		override.scope_kind === "user_provider" ||
+		override.scope_kind === "user_provider_key"
 	) {
 		return override.scope_kind;
 	}
@@ -362,6 +132,11 @@ function resolveScopeKind(override: PricingOverride): PricingOverrideScopeKind {
 		if (override.provider_key_id) return "virtual_key_provider_key";
 		if (override.provider_id) return "virtual_key_provider";
 		return "virtual_key";
+	}
+	if (override.user_id) {
+		if (override.provider_key_id) return "user_provider_key";
+		if (override.provider_id) return "user_provider";
+		return "user";
 	}
 	if (override.provider_key_id) return "provider_key";
 	if (override.provider_id) return "provider";
@@ -373,6 +148,11 @@ function deriveScopeKind(form: FormState): PricingOverrideScopeKind {
 		if (form.providerKeyID) return "virtual_key_provider_key";
 		if (form.providerID) return "virtual_key_provider";
 		return "virtual_key";
+	}
+	if (form.scopeRoot === "user") {
+		if (form.providerKeyID) return "user_provider_key";
+		if (form.providerID) return "user_provider";
+		return "user";
 	}
 	if (form.providerKeyID) return "provider_key";
 	if (form.providerID) return "provider";
@@ -388,13 +168,13 @@ export function patchSummary(override: PricingOverride): string {
 	}
 	const keys = Object.keys(parsed) as PricingFieldKey[];
 	if (keys.length === 0) return "None";
-	const labels = keys.map((key) => fieldLabelByKey[key] || key);
+	const labels = keys.map((key) => (fieldLabelKeyByKey[key] ? i18n.t(fieldLabelKeyByKey[key], { ns: "models" }) : key));
 	if (labels.length <= 2) return labels.join(", ");
 	return `${labels.slice(0, 2).join(", ")} +${labels.length - 2} more`;
 }
 
 export function renderFields(
-	fields: ReadonlyArray<{ key: PricingFieldKey; label: string }>,
+	fields: ReadonlyArray<{ key: PricingFieldKey; labelKey: ParseKeys<"models"> }>,
 	form: FormState,
 	setForm: Dispatch<SetStateAction<FormState>>,
 	errors: FieldErrors,
@@ -404,7 +184,7 @@ export function renderFields(
 		<div className="grid grid-cols-1 gap-4 md:grid-cols-2">
 			{fields.map((field) => (
 				<div key={field.key} className="space-y-2 pb-1">
-					<Label>{field.label}</Label>
+					<Label>{i18n.t(field.labelKey, { ns: "models" })}</Label>
 					<Input
 						data-testid={`pricing-override-field-input-${field.key}`}
 						type="text"
@@ -426,12 +206,17 @@ export function renderFields(
 	);
 }
 
+// An override with no provider applies across all of them; the form spells that absence as
+// a sentinel so the control has something to show. Module level for a stable identity.
+const ALL_PROVIDERS_VALUE = "__none__";
+
 interface PricingOverrideDrawerProps {
 	open: boolean;
 	onOpenChange: (open: boolean) => void;
 	editingOverride?: PricingOverride | null;
 	scopeLock?: {
 		scopeKind: PricingOverrideScopeKind;
+		userID?: string;
 		virtualKeyID?: string;
 		providerID?: string;
 		providerKeyID?: string;
@@ -455,17 +240,29 @@ function isCompleteScopeLock(scopeLock?: PricingOverrideDrawerProps["scopeLock"]
 			return Boolean(scopeLock.virtualKeyID && scopeLock.providerID);
 		case "virtual_key_provider_key":
 			return Boolean(scopeLock.virtualKeyID && scopeLock.providerID && scopeLock.providerKeyID);
+		case "user":
+			return Boolean(scopeLock.userID);
+		case "user_provider":
+			return Boolean(scopeLock.userID && scopeLock.providerID);
+		case "user_provider_key":
+			return Boolean(scopeLock.userID && scopeLock.providerID && scopeLock.providerKeyID);
 		default:
 			return false;
 	}
 }
 
 export default function PricingOverrideSheet({ open, onOpenChange, editingOverride, scopeLock, onSaved }: PricingOverrideDrawerProps) {
+	const { t } = useTranslation("models");
+	const { t: tc } = useTranslation("common");
+	const { t: tObs } = useTranslation("observability");
+	const allProvidersOption = useMemo(() => ({ value: ALL_PROVIDERS_VALUE, label: t("customPricing.allProvidersLower") }), [t]);
 	const { data: providersData, isLoading: isProvidersLoading, error: providersError } = useGetProvidersQuery();
-	const { data: virtualKeysData, isLoading: isVirtualKeysLoading, error: virtualKeysError } = useGetVirtualKeysQuery();
 	const { data: allKeysData = [] } = useGetAllKeysQuery();
 	const [createOverride, { isLoading: isCreating }] = useCreatePricingOverrideMutation();
 	const [updateOverride, { isLoading: isPatching }] = useUpdatePricingOverrideMutation();
+	// Reached by a deep link or a stale page too, so the save checks the permission
+	// it needs rather than trusting whoever opened the sheet.
+	const canSave = useRbac(RbacResource.Settings, editingOverride ? RbacOperation.Update : RbacOperation.Create);
 
 	const methods = useForm<FormState>({ defaultValues: defaultFormState });
 	const { control, handleSubmit, setValue, watch, reset, getValues, setError, clearErrors } = methods;
@@ -477,18 +274,22 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 	const [requestTypePopoverOpen, setRequestTypePopoverOpen] = useState(false);
 
 	const isSaving = isCreating || isPatching;
-	const providers = useMemo<ModelProvider[]>(() => (providersError ? [] : (providersData ?? [])), [providersData, providersError]);
-	const virtualKeys = useMemo(() => (virtualKeysError ? [] : (virtualKeysData?.virtual_keys ?? [])), [virtualKeysData, virtualKeysError]);
 
 	const scopeRoot = watch("scopeRoot");
 	const providerID = watch("providerID");
 	const providerKeyID = watch("providerKeyID");
 	const virtualKeyID = watch("virtualKeyID");
+	const userID = watch("userID");
 	const matchType = watch("matchType");
 	const requestTypes = watch("requestTypes");
 	const pricingValues = watch("pricingValues");
+	const preservedPatch = watch("preservedPatch");
 
 	const shouldLockScope = useMemo(() => !editingOverride && isCompleteScopeLock(scopeLock), [editingOverride, scopeLock]);
+
+	// Registered by the downstream build at module load; undefined in builds
+	// without a user directory, which hides the "User" scope root.
+	const UserPicker = getUserPicker();
 
 	const providerKeyOptions = useMemo(
 		() =>
@@ -528,6 +329,7 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 		if (shouldLockScope && scopeLock) {
 			reset({
 				...defaultFormState,
+				userID: scopeLock.userID ?? "",
 				virtualKeyID: scopeLock.virtualKeyID ?? "",
 				providerID: scopeLock.providerID ?? "",
 				providerKeyID: scopeLock.providerKeyID ?? "",
@@ -536,7 +338,9 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 					scopeLock.scopeKind === "virtual_key_provider" ||
 					scopeLock.scopeKind === "virtual_key_provider_key"
 						? "virtual_key"
-						: "global",
+						: scopeLock.scopeKind === "user" || scopeLock.scopeKind === "user_provider" || scopeLock.scopeKind === "user_provider_key"
+							? "user"
+							: "global",
 			});
 			return;
 		}
@@ -565,6 +369,11 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 		return scopeRoot === "virtual_key" ? virtualKeyID || undefined : undefined;
 	}, [scopeLock, shouldLockScope, scopeRoot, virtualKeyID]);
 
+	const resolvedUserID = useMemo(() => {
+		if (shouldLockScope) return scopeLock?.userID;
+		return scopeRoot === "user" ? userID.trim() || undefined : undefined;
+	}, [scopeLock, shouldLockScope, scopeRoot, userID]);
+
 	const resolvedProviderID = useMemo(() => {
 		if (shouldLockScope) return scopeLock?.providerID;
 		return providerID || undefined;
@@ -578,11 +387,8 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 	const pricingFieldErrors = useMemo<FieldErrors>(() => {
 		const errs: FieldErrors = {};
 		for (const key of patchKeys) {
-			const raw = pricingValues[key];
-			if (!raw || raw.trim() === "") continue;
-			const parsed = Number(raw);
-			if (!Number.isFinite(parsed)) errs[key] = "Must be a number";
-			else if (parsed < 0) errs[key] = "Must be >= 0";
+			const err = pricingFieldError(key, pricingValues[key]);
+			if (err) errs[key] = err;
 		}
 		return errs;
 	}, [pricingValues]);
@@ -594,7 +400,7 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 			setJSONPatch(json);
 			setJSONError(undefined);
 		}
-	}, [pricingValues, getValues]);
+	}, [pricingValues, preservedPatch, getValues]);
 
 	const handleJSONChange = useCallback(
 		(value: string) => {
@@ -603,34 +409,56 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 			const trimmed = value.trim();
 			if (!trimmed) {
 				setJSONError(undefined);
+				setValue("preservedPatch", {});
 				setValue("pricingValues", {});
 				return;
 			}
 			try {
 				const parsed = JSON.parse(trimmed);
 				if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
-					setJSONError("Patch must be a JSON object");
+					setJSONError(t("customPricing.patchMustBeObject"));
 					return;
 				}
 				const newPricingValues: Partial<Record<PricingFieldKey, string>> = {};
+				const newPreserved: Record<string, unknown> = {};
 				for (const [key, val] of Object.entries(parsed)) {
-					if (!patchKeys.includes(key as PricingFieldKey)) {
-						setJSONError(`Unknown field: ${key}`);
+					if (isUnsafePatchKey(key)) {
+						setJSONError(t("customPricing.unsupportedField", { key }));
 						return;
 					}
-					if (typeof val !== "number" || Number.isNaN(val) || val < 0) {
-						setJSONError(`${key} must be a non-negative number`);
+					// Keys the form cannot render as a number (today only the
+					// peak_hours schedule object) ride through untouched so an
+					// override authored via the API stays editable here. Anything
+					// else unrecognized is a typo and is rejected: the pricing
+					// engine ignores unknown keys, so accepting one would save a
+					// setting that silently never takes effect.
+					if (!patchKeys.includes(key as PricingFieldKey)) {
+						if (!PRESERVED_PATCH_KEYS.includes(key)) {
+							setJSONError(t("customPricing.unknownField", { key }));
+							return;
+						}
+						newPreserved[key] = val;
+						continue;
+					}
+					if (typeof val !== "number" || Number.isNaN(val)) {
+						setJSONError(t("customPricing.fieldMustBeNumber", { key }));
+						return;
+					}
+					const err = pricingFieldError(key as PricingFieldKey, String(val));
+					if (err) {
+						setJSONError(t("customPricing.fieldError", { key, error: err }));
 						return;
 					}
 					newPricingValues[key as PricingFieldKey] = String(val);
 				}
 				setJSONError(undefined);
+				setValue("preservedPatch", newPreserved);
 				setValue("pricingValues", newPricingValues);
 			} catch {
-				setJSONError("Invalid JSON");
+				setJSONError(t("customPricing.invalidJson"));
 			}
 		},
-		[setValue],
+		[setValue, t],
 	);
 
 	const handleFieldChange = useCallback(() => {
@@ -652,7 +480,16 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 				resolvedScopeKind === "virtual_key_provider_key") &&
 			!resolvedVirtualKeyID
 		) {
-			setError("virtualKeyID", { message: "Virtual key is required" });
+			setError("virtualKeyID", { message: t("customPricing.virtualKeyRequired") });
+			hasErrors = true;
+		}
+
+		if (
+			!shouldLockScope &&
+			(resolvedScopeKind === "user" || resolvedScopeKind === "user_provider" || resolvedScopeKind === "user_provider_key") &&
+			!resolvedUserID
+		) {
+			setError("userID", { message: t("customPricing.userIdRequired") });
 			hasErrors = true;
 		}
 
@@ -663,17 +500,17 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 		}
 
 		if (data.requestTypes.length === 0) {
-			setError("requestTypes", { message: "At least one request type must be selected" });
+			setError("requestTypes", { message: t("customPricing.requestTypesRequired") });
 			hasErrors = true;
 		}
 
 		if (Object.keys(pricingFieldErrors).length > 0) {
-			setError("pricingValues", { message: "Fix the pricing field errors above" });
+			setError("pricingValues", { message: t("customPricing.fixPricingErrors") });
 			hasErrors = true;
 		} else {
 			const { patch } = buildPatchFromForm(data);
 			if (Object.keys(patch).length === 0) {
-				setError("pricingValues", { message: "At least one pricing field must be overridden" });
+				setError("pricingValues", { message: t("customPricing.atLeastOneField") });
 				hasErrors = true;
 			}
 		}
@@ -681,6 +518,7 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 		if (hasErrors || jsonError) return;
 
 		const { patch } = buildPatchFromForm(data);
+		let scopedUserID: string | undefined;
 		let scopedVirtualKeyID: string | undefined;
 		let scopedProviderID: string | undefined;
 		let scopedProviderKeyID: string | undefined;
@@ -706,11 +544,24 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 				scopedProviderID = resolvedProviderID;
 				scopedProviderKeyID = resolvedProviderKeyID;
 				break;
+			case "user":
+				scopedUserID = resolvedUserID;
+				break;
+			case "user_provider":
+				scopedUserID = resolvedUserID;
+				scopedProviderID = resolvedProviderID;
+				break;
+			case "user_provider_key":
+				scopedUserID = resolvedUserID;
+				scopedProviderID = resolvedProviderID;
+				scopedProviderKeyID = resolvedProviderKeyID;
+				break;
 		}
 
 		const requestPayload: CreatePricingOverrideRequest = {
 			name: data.name.trim(),
 			scope_kind: resolvedScopeKind,
+			user_id: scopedUserID,
 			virtual_key_id: scopedVirtualKeyID,
 			provider_id: scopedProviderID,
 			provider_key_id: scopedProviderKeyID,
@@ -723,40 +574,40 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 		try {
 			if (editingOverride) {
 				await updateOverride({ id: editingOverride.id, data: requestPayload }).unwrap();
-				toast.success("Pricing override updated");
+				toast.success(t("customPricing.updatedSuccess"));
 			} else {
 				await createOverride(requestPayload).unwrap();
-				toast.success("Pricing override created");
+				toast.success(t("customPricing.createdSuccess"));
 			}
 			handleCloseDrawer();
 			onSaved?.();
 		} catch (error) {
-			toast.error("Failed to save pricing override", { description: getErrorMessage(error) });
+			toast.error(t("customPricing.failedSave"), { description: getErrorMessage(error) });
 		}
 	};
 
 	return (
 		<Sheet open={open} onOpenChange={(o) => (o ? onOpenChange(true) : handleCloseDrawer())}>
 			<SheetContent side="right" className="dark:bg-card flex w-full flex-col overflow-x-hidden bg-white p-0 pt-4 sm:max-w-2xl">
-				<SheetHeader className="flex flex-col items-start px-8 py-4" headerClassName="mb-0 sticky -top-4 bg-card z-10">
-					<SheetTitle className="">{editingOverride ? "Edit Pricing Override" : "Create Pricing Override"}</SheetTitle>
+				<SheetHeader className="flex flex-col items-start py-4" headerClassName="mb-0 sticky -top-4 bg-card z-10 px-4 md:px-8">
+					<SheetTitle className="">{editingOverride ? t("customPricing.editTitle") : t("customPricing.createTitle")}</SheetTitle>
 				</SheetHeader>
 
 				<Form {...methods}>
 					<form onSubmit={handleSubmit(onSubmit)} className="flex min-h-0 flex-1 flex-col">
-						<div className="flex-1 space-y-6 px-8 pb-4">
+						<div className="flex-1 space-y-6 px-4 pb-4 md:px-8">
 							<div className="space-y-4">
 								<FormField
 									control={control}
 									name="name"
-									rules={{ required: "Name is required" }}
+									rules={{ required: t("customPricing.nameRequired") }}
 									render={({ field }) => (
 										<FormItem>
 											<FormLabel>
-												Name <span className="text-red-500">*</span>
+												{t("customPricing.nameStar")} <span className="text-red-500">*</span>
 											</FormLabel>
 											<FormControl>
-												<Input data-testid="pricing-override-name-input" placeholder="e.g., GPT-4 Negotiated Rate" {...field} />
+												<Input data-testid="pricing-override-name-input" placeholder={t("customPricing.namePlaceholder")} {...field} />
 											</FormControl>
 											<FormMessage />
 										</FormItem>
@@ -765,7 +616,7 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 
 								{shouldLockScope && scopeLock ? (
 									<div className="space-y-2">
-										<Label htmlFor="pricing-override-scope-lock-input">Scope</Label>
+										<Label htmlFor="pricing-override-scope-lock-input">{t("customPricing.scope")}</Label>
 										<Input
 											id="pricing-override-scope-lock-input"
 											data-testid="pricing-override-scope-lock-input"
@@ -780,13 +631,15 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 											name="scopeRoot"
 											render={({ field }) => (
 												<FormItem>
-													<FormLabel>Scope root</FormLabel>
+													<FormLabel>{t("customPricing.scopeRoot")}</FormLabel>
 													<Select
 														value={field.value}
 														onValueChange={(value: ScopeRoot) => {
 															field.onChange(value);
 															setValue("virtualKeyID", "");
+															setValue("userID", "");
 															clearErrors("virtualKeyID");
+															clearErrors("userID");
 														}}
 													>
 														<FormControl>
@@ -795,13 +648,55 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 															</SelectTrigger>
 														</FormControl>
 														<SelectContent>
-															<SelectItem value="global">Global</SelectItem>
-															<SelectItem value="virtual_key">Virtual key</SelectItem>
+															<SelectItem value="global">{t("customPricing.global")}</SelectItem>
+															<SelectItem value="virtual_key">{t("customPricing.virtualKeyLower")}</SelectItem>
+															{(UserPicker || scopeRoot === "user") && <SelectItem value="user">{t("customPricing.user")}</SelectItem>}
 														</SelectContent>
 													</Select>
 												</FormItem>
 											)}
 										/>
+
+										{scopeRoot === "user" && (
+											<FormField
+												control={control}
+												name="userID"
+												render={({ field }) => (
+													<FormItem>
+														<FormLabel>
+															{t("customPricing.user")} <span className="text-red-500">*</span>
+														</FormLabel>
+														<FormControl>
+															{UserPicker ? (
+																<UserPicker
+																	value={field.value}
+																	onChange={(value) => {
+																		field.onChange(value);
+																		clearErrors("userID");
+																	}}
+																	fallbackOption={
+																		editingOverride?.user_id ? { value: editingOverride.user_id, label: editingOverride.user_id } : null
+																	}
+																/>
+															) : (
+																// No user directory in this build: keep a plain input so
+																// existing user-scoped overrides remain editable.
+																<Input
+																	data-testid="pricing-override-user-id-input"
+																	placeholder={t("customPricing.governanceUserId")}
+																	{...field}
+																	onChange={(e) => {
+																		field.onChange(e);
+																		clearErrors("userID");
+																	}}
+																/>
+															)}
+														</FormControl>
+														<FormMessage />
+													</FormItem>
+												)}
+											/>
+										)}
 
 										{scopeRoot === "virtual_key" && (
 											<FormField
@@ -810,91 +705,54 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 												render={({ field }) => (
 													<FormItem>
 														<FormLabel>
-															Virtual key <span className="text-red-500">*</span>
+															{t("customPricing.virtualKeyLower")} <span className="text-red-500">*</span>
 														</FormLabel>
 														<FormControl>
-															<ComboboxSelect
-																data-testid="pricing-override-virtual-key-select"
-																options={virtualKeys.map((vk) => ({ label: vk.name, value: vk.id }))}
-																value={field.value || null}
-																onValueChange={(value) => {
-																	field.onChange(value ?? "");
+															<VirtualKeySelector
+																value={field.value}
+																onChange={(value) => {
+																	field.onChange(value);
 																	setValue("providerID", "");
 																	setValue("providerKeyID", "");
 																	clearErrors("virtualKeyID");
 																}}
-																placeholder={isVirtualKeysLoading ? "Loading..." : "Select virtual key"}
-																disabled={isVirtualKeysLoading || !!virtualKeysError}
-																noPortal
-																className="h-9"
+																fallbackOption={
+																	editingOverride?.virtual_key_id
+																		? { value: editingOverride.virtual_key_id, label: editingOverride.virtual_key_id }
+																		: null
+																}
+																placeholder={t("customPricing.selectVirtualKey")}
 															/>
 														</FormControl>
-														{virtualKeysError ? (
-															<p className="text-destructive mt-1 text-xs">
-																Failed to load virtual keys: {getErrorMessage(virtualKeysError)}
-															</p>
-														) : (
-															<FormMessage />
-														)}
+														<FormMessage />
 													</FormItem>
 												)}
 											/>
 										)}
 
-										<div className="grid grid-cols-2 gap-2">
+										<div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
 											<FormField
 												control={control}
 												name="providerID"
 												render={({ field }) => (
 													<FormItem>
-														<FormLabel>Provider</FormLabel>
-														<Select
-															value={field.value || "__none__"}
-															onValueChange={(value) => {
-																field.onChange(value === "__none__" ? "" : value);
-																setValue("providerKeyID", "");
-															}}
-														>
-															<FormControl>
-																<SelectTrigger
-																	data-testid="pricing-override-provider-select"
-																	className="w-full"
-																	disabled={isProvidersLoading || !!providersError}
-																>
-																	{isProvidersLoading ? (
-																		<span className="text-muted-foreground">Loading...</span>
-																	) : field.value ? (
-																		<div className="flex items-center gap-1.5">
-																			<RenderProviderIcon
-																				provider={field.value as ProviderIconType}
-																				size="sm"
-																				className="h-4 w-4 shrink-0"
-																			/>
-																			<span>{getProviderLabel(field.value)}</span>
-																		</div>
-																	) : (
-																		<span className="text-muted-foreground">All providers</span>
-																	)}
-																</SelectTrigger>
-															</FormControl>
-															<SelectContent>
-																<SelectItem value="__none__">All providers</SelectItem>
-																{providers.map((provider) => (
-																	<SelectItem key={provider.name} value={provider.name}>
-																		<div className="flex items-center gap-1.5">
-																			<RenderProviderIcon
-																				provider={provider.name as ProviderIconType}
-																				size="sm"
-																				className="h-4 w-4 shrink-0"
-																			/>
-																			<span>{getProviderLabel(provider.name)}</span>
-																		</div>
-																	</SelectItem>
-																))}
-															</SelectContent>
-														</Select>
+														<FormLabel>{t("customPricing.provider")}</FormLabel>
+														<FormControl>
+															<ProviderSelector
+																data-testid="pricing-override-provider-select"
+																allOption={allProvidersOption}
+																value={field.value || ALL_PROVIDERS_VALUE}
+																onChange={(value: string) => {
+																	field.onChange(value === ALL_PROVIDERS_VALUE ? "" : value);
+																	setValue("providerKeyID", "");
+																}}
+																disabled={isProvidersLoading || !!providersError}
+															/>
+														</FormControl>
 														{providersError ? (
-															<p className="text-destructive mt-1 text-xs">Failed to load providers: {getErrorMessage(providersError)}</p>
+															<p className="text-destructive mt-1 text-xs">
+																{t("customPricing.failedLoadProviders", { message: getErrorMessage(providersError) })}
+															</p>
 														) : null}
 													</FormItem>
 												)}
@@ -906,14 +764,14 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 													name="providerKeyID"
 													render={({ field }) => (
 														<FormItem>
-															<FormLabel>Provider key</FormLabel>
+															<FormLabel>{t("customPricing.providerKey")}</FormLabel>
 															<FormControl>
 																<ComboboxSelect
 																	data-testid="pricing-override-provider-key-select"
 																	options={providerScopedKeyOptions.map((option) => ({ label: option.label, value: option.id }))}
 																	value={field.value || null}
 																	onValueChange={(value) => field.onChange(value ?? "")}
-																	placeholder="All provider keys"
+																	placeholder={t("customPricing.allProviderKeys")}
 																	noPortal
 																	className="h-9"
 																/>
@@ -936,7 +794,7 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 										name="matchType"
 										render={({ field }) => (
 											<FormItem>
-												<FormLabel>Match type</FormLabel>
+												<FormLabel>{t("customPricing.matchType")}</FormLabel>
 												<Select
 													value={field.value}
 													onValueChange={(value: PricingOverrideMatchType) => {
@@ -946,12 +804,12 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 												>
 													<FormControl>
 														<SelectTrigger data-testid="pricing-override-match-type-select" className="w-full">
-															<SelectValue placeholder="Select match type" />
+															<SelectValue placeholder={t("customPricing.selectMatchType")} />
 														</SelectTrigger>
 													</FormControl>
 													<SelectContent>
-														<SelectItem value="exact">Exact</SelectItem>
-														<SelectItem value="wildcard">Wildcard</SelectItem>
+														<SelectItem value="exact">{t("modelCatalog.exact")}</SelectItem>
+														<SelectItem value="wildcard">{t("customPricing.wildcard")}</SelectItem>
 													</SelectContent>
 												</Select>
 											</FormItem>
@@ -963,12 +821,16 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 										render={({ field }) => (
 											<FormItem>
 												<FormLabel>
-													Pattern <span className="text-red-500">*</span>
+													{t("customPricing.pattern")} <span className="text-red-500">*</span>
 												</FormLabel>
 												<FormControl>
 													<Input
 														data-testid="pricing-override-pattern-input"
-														placeholder={matchType === "exact" ? "e.g., gpt-4o" : "e.g., gpt-4*"}
+														placeholder={
+															matchType === "exact"
+																? t("customPricing.patternExactPlaceholder")
+																: t("customPricing.patternWildcardPlaceholder")
+														}
 														{...field}
 														onChange={(e) => {
 															field.onChange(e);
@@ -989,7 +851,7 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 								render={({ field }) => (
 									<FormItem>
 										<FormLabel>
-											Request types <span className="text-red-500">*</span>
+											{t("customPricing.requestTypes")} <span className="text-red-500">*</span>
 										</FormLabel>
 										<Popover open={requestTypePopoverOpen} onOpenChange={setRequestTypePopoverOpen} modal={false}>
 											<PopoverTrigger asChild>
@@ -1002,9 +864,9 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 													>
 														<span className="truncate text-left">
 															{field.value.length > 0 ? (
-																field.value.map((rt) => RequestTypeLabels[rt as keyof typeof RequestTypeLabels] ?? rt).join(", ")
+																field.value.map((rt) => getRequestTypeLabel(rt, tObs)).join(", ")
 															) : (
-																<span className="text-muted-foreground">Select request types...</span>
+																<span className="text-muted-foreground">{t("customPricing.selectRequestTypes")}</span>
 															)}
 														</span>
 														<ChevronDown className="h-4 w-4 shrink-0" />
@@ -1014,8 +876,8 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 											<PopoverContent align="start" className="w-[320px] p-2">
 												<div className="max-h-72 space-y-1 overflow-y-auto" onWheel={(e) => e.stopPropagation()}>
 													{REQUEST_TYPE_GROUPS.map((group) => (
-														<div key={group.label}>
-															<div className="text-muted-foreground px-2 py-1 text-xs font-medium">{group.label}</div>
+														<div key={group.labelKey}>
+															<div className="text-muted-foreground px-2 py-1 text-xs font-medium">{t(group.labelKey)}</div>
 															{group.types.map((requestType) => {
 																const checked = field.value.includes(requestType as RequestType);
 																return (
@@ -1035,7 +897,7 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 																				if (next.length > 0) clearErrors("requestTypes");
 																			}}
 																		/>
-																		<span>{RequestTypeLabels[requestType as keyof typeof RequestTypeLabels] ?? requestType}</span>
+																		<span>{getRequestTypeLabel(requestType, tObs)}</span>
 																	</label>
 																);
 															})}
@@ -1050,7 +912,7 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 														variant="ghost"
 														onClick={() => field.onChange([])}
 													>
-														Clear
+														{t("customPricing.clear")}
 													</Button>
 												</div>
 											</PopoverContent>
@@ -1066,8 +928,8 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 								render={({ field }) => (
 									<FormItem>
 										<FormLabel>
-											Pricing fields <span className="text-red-500">*</span>{" "}
-											<span className="text-muted-foreground text-xs font-normal">(USD per unit)</span>
+											{t("customPricing.pricingFields")} <span className="text-red-500">*</span>{" "}
+											<span className="text-muted-foreground text-xs font-normal">{t("customPricing.usdPerUnit")}</span>
 										</FormLabel>
 										<PricingFieldSelector
 											key={open ? (editingOverride?.id ?? "new") : "closed"}
@@ -1104,7 +966,7 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 							</div>
 						</div>
 
-						<div className="bg-card sticky bottom-0 flex justify-end gap-3 border-t px-7 py-4">
+						<div className="bg-card sticky bottom-0 flex justify-end gap-3 border-t px-4 py-4 md:px-7">
 							<Button
 								data-testid="pricing-override-cancel-btn"
 								type="button"
@@ -1113,11 +975,16 @@ export default function PricingOverrideSheet({ open, onOpenChange, editingOverri
 								disabled={isSaving}
 							>
 								<X className="h-4 w-4" />
-								Cancel
+								{tc("cancel")}
 							</Button>
-							<Button data-testid="pricing-override-save-btn" type="submit" disabled={isSaving}>
+							<Button
+								data-testid="pricing-override-save-btn"
+								type="submit"
+								disabled={isSaving || !canSave}
+								title={canSave ? undefined : t("customPricing.noChangePermission")}
+							>
 								<Save className="h-4 w-4" />
-								{editingOverride ? "Update Override" : "Save Override"}
+								{editingOverride ? t("customPricing.updateOverride") : t("customPricing.saveOverride")}
 							</Button>
 						</div>
 					</form>

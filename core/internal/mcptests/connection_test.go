@@ -2,9 +2,12 @@ package mcptests
 
 import (
 	"encoding/json"
+	"net"
+	"net/url"
 	"testing"
 	"time"
 
+	"github.com/maximhq/bifrost/core/network"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -36,7 +39,7 @@ func TestHTTPConnection(t *testing.T) {
 	clients := manager.GetClients()
 	require.Len(t, clients, 1, "should have one client")
 	assert.Equal(t, schemas.MCPConnectionTypeHTTP, clients[0].ConnectionInfo.Type)
-	assert.Equal(t, schemas.MCPConnectionStateConnected, clients[0].State)
+	assert.Equal(t, schemas.MCPConnectionStateHealthy, clients[0].State)
 }
 
 func TestHTTPConnectionInvalidURL(t *testing.T) {
@@ -55,7 +58,7 @@ func TestHTTPConnectionInvalidURL(t *testing.T) {
 		time.Sleep(2 * time.Second)
 		clients = manager.GetClients()
 		if len(clients) > 0 {
-			assert.Equal(t, schemas.MCPConnectionStateDisconnected, clients[0].State)
+			assert.Equal(t, schemas.MCPConnectionStateUnstable, clients[0].State)
 		}
 	}
 }
@@ -86,7 +89,7 @@ func TestSSEConnection(t *testing.T) {
 	clients := manager.GetClients()
 	require.Len(t, clients, 1, "should have one client")
 	assert.Equal(t, schemas.MCPConnectionTypeSSE, clients[0].ConnectionInfo.Type)
-	assert.Equal(t, schemas.MCPConnectionStateConnected, clients[0].State)
+	assert.Equal(t, schemas.MCPConnectionStateHealthy, clients[0].State)
 }
 
 func TestSSEConnectionReconnect(t *testing.T) {
@@ -115,7 +118,7 @@ func TestSSEConnectionReconnect(t *testing.T) {
 
 	// Verify still connected
 	clients = manager.GetClients()
-	AssertClientState(t, clients, clientID, schemas.MCPConnectionStateConnected)
+	AssertClientState(t, clients, clientID, schemas.MCPConnectionStateHealthy)
 }
 
 // =============================================================================
@@ -169,7 +172,7 @@ func TestSTDIOConnectionTimeout(t *testing.T) {
 	clients := manager.GetClients()
 	if len(clients) > 0 {
 		// Client should be in disconnected or error state
-		assert.NotEqual(t, schemas.MCPConnectionStateConnected, clients[0].State)
+		assert.NotEqual(t, schemas.MCPConnectionStateHealthy, clients[0].State)
 	}
 }
 
@@ -357,16 +360,16 @@ func TestConnectionWithHeaders(t *testing.T) {
 
 	// Create client config with custom headers
 	clientConfig := GetSampleHTTPClientConfig(config.HTTPServerURL)
-	clientConfig.Headers = map[string]schemas.EnvVar{
-		"Authorization":   *schemas.NewEnvVar("Bearer test-token"),
-		"X-Custom-Header": *schemas.NewEnvVar("test-value"),
+	clientConfig.Headers = map[string]schemas.SecretVar{
+		"Authorization":   *schemas.NewSecretVar("Bearer test-token"),
+		"X-Custom-Header": *schemas.NewSecretVar("test-value"),
 	}
 
 	manager := setupMCPManager(t, clientConfig)
 	clients := manager.GetClients()
 
 	require.Len(t, clients, 1, "should have one client")
-	assert.Equal(t, schemas.MCPConnectionStateConnected, clients[0].State)
+	assert.Equal(t, schemas.MCPConnectionStateHealthy, clients[0].State)
 }
 
 func TestConnectionWithEnvironmentVariables(t *testing.T) {
@@ -399,7 +402,7 @@ func TestInvalidConnectionType(t *testing.T) {
 	// Verify client was not added or is in error state
 	clients := manager.GetClients()
 	if len(clients) > 0 {
-		assert.NotEqual(t, schemas.MCPConnectionStateConnected, clients[0].State)
+		assert.NotEqual(t, schemas.MCPConnectionStateHealthy, clients[0].State)
 	}
 }
 
@@ -419,6 +422,121 @@ func TestConnectionWithMissingRequiredFields(t *testing.T) {
 
 	// Client should not be connected
 	if len(clients) > 0 {
-		assert.NotEqual(t, schemas.MCPConnectionStateConnected, clients[0].State)
+		assert.NotEqual(t, schemas.MCPConnectionStateHealthy, clients[0].State)
+	}
+}
+
+// =============================================================================
+// REQUIRE-PUBLIC-TARGET CONNECTION TESTS
+// =============================================================================
+
+// RequirePublicTarget is server-set when a client is registered over the management
+// API with no admin credential check, and is never cleared. The dial policy it selects
+// is unit-tested in core/mcp; what these pin is the effect a caller can observe — a
+// flagged client pointed at a private address serves nothing.
+//
+// The pair matters more than either half: the refusal alone would also pass with the
+// fixture server down, so the second test connects the same URL unflagged.
+
+func TestRequirePublicTargetRefusesPrivateUpstream(t *testing.T) {
+	t.Parallel()
+
+	config := GetTestConfig(t)
+	if config.HTTPServerURL == "" {
+		t.Skip("MCP_HTTP_URL not set")
+	}
+	// The default fixture is loopback, but MCP_USE_REMOTE=1 lets an operator point
+	// MCP_HTTP_URL at any host. Against a public one the policy correctly ALLOWS the
+	// connection, which would fail the assertions below and read as a broken guard.
+	requirePrivateUpstream(t, config.HTTPServerURL)
+
+	flagged := GetSampleHTTPClientConfig(config.HTTPServerURL)
+	flagged.ID = "require-public-target-client"
+	flagged.Name = "unauthenticatedRegistration"
+	flagged.RequirePublicTarget = true
+
+	manager := setupMCPManager(t, flagged)
+
+	ctx := createTestContext()
+	assert.Empty(t, manager.GetToolPerClient(ctx)[flagged.Name],
+		"a RequirePublicTarget client must expose no tools from a private upstream")
+
+	for _, client := range manager.GetClients() {
+		if client.ExecutionConfig.Name == flagged.Name {
+			assert.NotEqual(t, schemas.MCPConnectionStateHealthy, client.State,
+				"a RequirePublicTarget client must not reach healthy against a private upstream")
+		}
+	}
+}
+
+// requirePrivateUpstream skips unless rawURL resolves to a private address, using the
+// same classifier the production dial policy uses rather than a second definition of
+// "private" that could drift from it.
+func requirePrivateUpstream(t *testing.T, rawURL string) {
+	t.Helper()
+
+	parsed, err := url.Parse(rawURL)
+	require.NoError(t, err, "MCP_HTTP_URL must be a valid URL")
+
+	// Resolver rather than net.LookupIP: the lookup unblocks when the test's context is
+	// cancelled, instead of outliving the test on a hung resolver.
+	addrs, err := net.DefaultResolver.LookupIPAddr(t.Context(), parsed.Hostname())
+	if err != nil || len(addrs) == 0 {
+		t.Skipf("cannot resolve %q to decide whether it is private: %v", parsed.Hostname(), err)
+	}
+	for _, addr := range addrs {
+		if network.IsPublicIP(addr.IP) {
+			t.Skipf("MCP_HTTP_URL resolves to the public address %s; RequirePublicTarget permits it by design", addr.IP)
+		}
+	}
+}
+
+func TestRequirePublicTargetUnflaggedClientReachesSameUpstream(t *testing.T) {
+	t.Parallel()
+
+	config := GetTestConfig(t)
+	if config.HTTPServerURL == "" {
+		t.Skip("MCP_HTTP_URL not set")
+	}
+
+	unflagged := GetSampleHTTPClientConfig(config.HTTPServerURL)
+	unflagged.ID = "admin-registration-client"
+	unflagged.Name = "adminRegistration"
+
+	manager := setupMCPManager(t, unflagged)
+
+	ctx := createTestContext()
+	require.NotEmpty(t, manager.GetToolPerClient(ctx)[unflagged.Name],
+		"the same upstream must be reachable without RequirePublicTarget")
+}
+
+// TestConnectionRefusesCloudMetadataEndpoint pins the pre-proxy destination guard that
+// keeps MCP from being used as an SSRF primitive against the cloud metadata service.
+// 169.254.169.254 is the canonical target; the guard blocks link-local and unspecified
+// destinations regardless of whether a proxy is configured.
+func TestConnectionRefusesCloudMetadataEndpoint(t *testing.T) {
+	t.Parallel()
+
+	for _, target := range []string{
+		"http://169.254.169.254/mcp",
+		"http://[fe80::1]/mcp",
+		"http://0.0.0.0/mcp",
+	} {
+		clientConfig := GetSampleHTTPClientConfig(target)
+		clientConfig.ID = "metadata-probe"
+		clientConfig.Name = "MetadataProbe"
+
+		manager := setupMCPManager(t, clientConfig)
+
+		ctx := createTestContext()
+		assert.Empty(t, manager.GetToolPerClient(ctx)[clientConfig.Name],
+			"%s must expose no tools", target)
+
+		for _, client := range manager.GetClients() {
+			if client.ExecutionConfig.Name == clientConfig.Name {
+				assert.NotEqual(t, schemas.MCPConnectionStateHealthy, client.State,
+					"%s must not reach healthy", target)
+			}
+		}
 	}
 }

@@ -1,5 +1,10 @@
 package schemas
 
+import (
+	"bytes"
+	"fmt"
+)
+
 type ImageEventType string
 
 const (
@@ -40,6 +45,7 @@ type ImageGenerationParameters struct {
 	OutputCompression *int                   `json:"output_compression,omitempty"`  // compression level (0-100%)
 	OutputFormat      *string                `json:"output_format,omitempty"`       // "png", "webp", "jpeg"
 	Style             *string                `json:"style,omitempty"`               // "natural", "vivid"
+	Type              *string                `json:"type,omitempty"`                // operation selector, e.g. "vectorize"
 	ResponseFormat    *string                `json:"response_format,omitempty"`     // "url", "b64_json"
 	Seed              *int                   `json:"seed,omitempty"`                // seed for image generation
 	NegativePrompt    *string                `json:"negative_prompt,omitempty"`     // negative prompt for image generation
@@ -60,7 +66,7 @@ type BifrostImageGenerationResponse struct {
 	*ImageGenerationResponseParameters
 
 	Usage       *ImageUsage                `json:"usage,omitempty"`
-	ExtraFields BifrostResponseExtraFields `json:"extra_fields,omitempty"`
+	ExtraFields BifrostResponseExtraFields `json:"extra_fields"`
 }
 
 // BackfillParams populates response fields from the original request that are needed
@@ -68,11 +74,12 @@ type BifrostImageGenerationResponse struct {
 // - NumInputImages on ImageUsage (count of input images from the request)
 // - Size on ImageGenerationResponseParameters (from request params if not in response)
 // - Quality (low, medium, high, auto) only
+// - AspectRatio on ImageGenerationResponseParameters (from request params if not in response)
 func (r *BifrostImageGenerationResponse) BackfillParams(req *BifrostRequest) {
 	if r == nil || req == nil {
 		return
 	}
-	numInputImages, size, quality := getNumInputImagesSizeAndQualityFromRequest(req)
+	numInputImages, size, quality, aspectRatio := getNumInputImagesSizeQualityAndAspectRatioFromRequest(req)
 
 	// Backfill Model from whichever inner request carries it. Some provider APIs
 	// (notably OpenAI /v1/images/*) omit model in the response body.
@@ -110,29 +117,21 @@ func (r *BifrostImageGenerationResponse) BackfillParams(req *BifrostRequest) {
 		}
 		r.ImageGenerationResponseParameters.Quality = quality
 	}
+
+	// Backfill AspectRatio if not already present from provider response
+	if aspectRatio != "" && (r.ImageGenerationResponseParameters == nil || r.ImageGenerationResponseParameters.AspectRatio == "") {
+		if r.ImageGenerationResponseParameters == nil {
+			r.ImageGenerationResponseParameters = &ImageGenerationResponseParameters{}
+		}
+		r.ImageGenerationResponseParameters.AspectRatio = aspectRatio
+	}
 }
 
-// getModelFromRequest extracts the model from any image-related request.
-func getModelFromRequest(req *BifrostRequest) string {
+// getNumInputImagesSizeQualityAndAspectRatioFromRequest extracts request params for cost
+// calculation and logging. Quality is only returned when it is one of low, medium, high, auto.
+func getNumInputImagesSizeQualityAndAspectRatioFromRequest(req *BifrostRequest) (numInputImages int, size string, quality string, aspectRatio string) {
 	if req == nil {
-		return ""
-	}
-	switch {
-	case req.ImageGenerationRequest != nil:
-		return req.ImageGenerationRequest.Model
-	case req.ImageEditRequest != nil:
-		return req.ImageEditRequest.Model
-	case req.ImageVariationRequest != nil:
-		return req.ImageVariationRequest.Model
-	}
-	return ""
-}
-
-// getNumInputImagesSizeAndQualityFromRequest extracts request params for cost calculation.
-// Quality is only returned when it is one of low, medium, high, auto.
-func getNumInputImagesSizeAndQualityFromRequest(req *BifrostRequest) (numInputImages int, size string, quality string) {
-	if req == nil {
-		return 0, "", ""
+		return 0, "", "", ""
 	}
 
 	switch {
@@ -145,6 +144,9 @@ func getNumInputImagesSizeAndQualityFromRequest(req *BifrostRequest) (numInputIm
 			}
 			if p.Quality != nil {
 				quality = normalizeImageQuality(*p.Quality)
+			}
+			if p.AspectRatio != nil {
+				aspectRatio = *p.AspectRatio
 			}
 		}
 	case req.ImageEditRequest != nil:
@@ -159,6 +161,9 @@ func getNumInputImagesSizeAndQualityFromRequest(req *BifrostRequest) (numInputIm
 			if p.Quality != nil {
 				quality = normalizeImageQuality(*p.Quality)
 			}
+			if p.AspectRatio != nil {
+				aspectRatio = *p.AspectRatio
+			}
 		}
 	case req.ImageVariationRequest != nil:
 		if req.ImageVariationRequest.Input != nil {
@@ -168,7 +173,7 @@ func getNumInputImagesSizeAndQualityFromRequest(req *BifrostRequest) (numInputIm
 			size = *req.ImageVariationRequest.Params.Size
 		}
 	}
-	return numInputImages, size, quality
+	return numInputImages, size, quality, aspectRatio
 }
 
 // normalizeImageQuality returns the quality string only if it is supported by gpt-image-1.5 (low, medium, high, auto).
@@ -187,15 +192,27 @@ type ImageGenerationResponseParameters struct {
 	OutputFormat  string    `json:"output_format,omitempty"`
 	Quality       string    `json:"quality,omitempty"`
 	Size          string    `json:"size,omitempty"`
+	AspectRatio   string    `json:"aspect_ratio,omitempty"`
 	FinishReasons []*string `json:"finish_reasons,omitempty"`
 	Seeds         []int     `json:"seeds,omitempty"`
 }
 
 type ImageData struct {
-	URL           string `json:"url,omitempty"`
-	B64JSON       string `json:"b64_json,omitempty"`
-	RevisedPrompt string `json:"revised_prompt,omitempty"`
-	Index         int    `json:"index"`
+	ID            string           `json:"id,omitempty"` // provider-side asset identifier, when one is assigned
+	URL           string           `json:"url,omitempty"`
+	B64JSON       string           `json:"b64_json,omitempty"`
+	RevisedPrompt string           `json:"revised_prompt,omitempty"`
+	Index         int              `json:"index"`
+	Detections    []ImageDetection `json:"detections,omitempty"`
+}
+
+// ImageDetection is a region located by a masking or segmentation model. Coordinates are absolute
+// pixels in the input image's own coordinate space, not normalized.
+type ImageDetection struct {
+	XMin int `json:"x_min"`
+	YMin int `json:"y_min"`
+	XMax int `json:"x_max"`
+	YMax int `json:"y_max"`
 }
 
 type ImageUsage struct {
@@ -204,13 +221,51 @@ type ImageUsage struct {
 	TotalTokens         int                `json:"total_tokens,omitempty"`
 	OutputTokens        int                `json:"output_tokens,omitempty"` // Always image tokens unless OutputTokensDetails is not nil
 	OutputTokensDetails *ImageTokenDetails `json:"output_tokens_details,omitempty"`
-	NumInputImages      int                `json:"num_input_images,omitempty"` // Number of input images from the request (populated by Bifrost)
+	NumInputImages      int                `json:"-"`              // Number of input images from the request (populated by Bifrost)
+	Cost                *BifrostCost       `json:"cost,omitempty"` // Only for the providers which support cost calculation
+	// xAI-specific usage field, normalized into Cost by NormalizeProviderCost.
+	CostInUsdTicks *int64 `json:"cost_in_usd_ticks,omitempty"`
+}
+
+// NormalizeProviderCost mirrors BifrostLLMUsage.NormalizeProviderCost for the image path.
+func (u *ImageUsage) NormalizeProviderCost() {
+	if u == nil || u.Cost != nil {
+		return
+	}
+	u.Cost = costFromUSDTicks(u.CostInUsdTicks)
 }
 
 type ImageTokenDetails struct {
 	NImages     int `json:"-"` // Number of images generated (used internally for bifrost)
 	ImageTokens int `json:"image_tokens,omitempty"`
 	TextTokens  int `json:"text_tokens,omitempty"`
+	// Thinking tokens, counted in the parent OutputTokens; output side only
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+}
+
+// DeepCopy returns an independent copy of u with no shared pointer fields,
+// safe for callers (e.g. cost calculation) that need to derive values
+// without mutating the original response. Returns nil for a nil receiver.
+func (u *ImageUsage) DeepCopy() *ImageUsage {
+	if u == nil {
+		return nil
+	}
+	out := *u
+	if u.InputTokensDetails != nil {
+		details := *u.InputTokensDetails
+		out.InputTokensDetails = &details
+	}
+	if u.OutputTokensDetails != nil {
+		details := *u.OutputTokensDetails
+		out.OutputTokensDetails = &details
+	}
+	if u.CostInUsdTicks != nil {
+		out.CostInUsdTicks = new(*u.CostInUsdTicks)
+	}
+	if u.Cost != nil {
+		out.Cost = new(*u.Cost)
+	}
+	return &out
 }
 
 // Streaming Response
@@ -225,6 +280,7 @@ type BifrostImageGenerationStreamResponse struct {
 	URL               string                     `json:"url,omitempty"`
 	CreatedAt         int64                      `json:"created_at,omitempty"`
 	Size              string                     `json:"size,omitempty"`
+	AspectRatio       string                     `json:"aspect_ratio,omitempty"`
 	Quality           string                     `json:"quality,omitempty"`
 	Background        string                     `json:"background,omitempty"`
 	OutputFormat      string                     `json:"output_format,omitempty"`
@@ -233,7 +289,7 @@ type BifrostImageGenerationStreamResponse struct {
 	Error             *BifrostError              `json:"error,omitempty"`
 	RawRequest        string                     `json:"-"`
 	RawResponse       string                     `json:"-"`
-	ExtraFields       BifrostResponseExtraFields `json:"extra_fields,omitempty"`
+	ExtraFields       BifrostResponseExtraFields `json:"extra_fields"`
 }
 
 // BackfillParams populates response fields from the original request that are needed
@@ -241,8 +297,9 @@ type BifrostImageGenerationStreamResponse struct {
 // - NumInputImages on ImageUsage (count of input images from the request)
 // - Size on ImageGenerationResponseParameters (from request params if not in response)
 // - Quality (low, medium, high, auto) only
+// - AspectRatio on ImageGenerationResponseParameters (from request params if not in response)
 func (r *BifrostImageGenerationStreamResponse) BackfillParams(req *BifrostRequest) {
-	numInputImages, size, quality := getNumInputImagesSizeAndQualityFromRequest(req)
+	numInputImages, size, quality, aspectRatio := getNumInputImagesSizeQualityAndAspectRatioFromRequest(req)
 
 	// Backfill NumInputImages
 	if numInputImages > 0 {
@@ -260,6 +317,11 @@ func (r *BifrostImageGenerationStreamResponse) BackfillParams(req *BifrostReques
 	// Backfill Quality if not already present (only low, medium, high, auto)
 	if quality != "" && r.Quality == "" {
 		r.Quality = quality
+	}
+
+	// Backfill AspectRatio if not already present from provider response
+	if aspectRatio != "" && r.AspectRatio == "" {
+		r.AspectRatio = aspectRatio
 	}
 }
 
@@ -285,10 +347,37 @@ type ImageEditInput struct {
 
 type ImageInput struct {
 	Image []byte `json:"image"`
+	URL   string `json:"url,omitempty"` // alternative to Image; providers that require bytes reject it
+}
+
+// UnmarshalJSON accepts either the object form or a bare string, so images: ["https://..."] reads
+// the way input_images does on /v1/images/generations. A string lands in URL, the same field the
+// multipart image_url path fills. Marshalling always emits the object form.
+func (i *ImageInput) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		i.Image = nil
+		i.URL = ""
+		return nil
+	}
+
+	var s string
+	if err := Unmarshal(data, &s); err == nil {
+		i.Image = nil
+		i.URL = s
+		return nil
+	}
+	type imageInput ImageInput
+	var obj imageInput
+	if err := Unmarshal(data, &obj); err != nil {
+		return fmt.Errorf("image input is neither a string nor an object")
+	}
+	*i = ImageInput(obj)
+	return nil
 }
 
 type ImageEditParameters struct {
-	Type              *string                `json:"type,omitempty"`           // "inpainting", "outpainting", "background_removal", "remove_background", "erase_object", "recolor", "search_replace", "control_sketch", "control_structure", "style_guide", "style_transfer", "upscale_fast", "upscale_creative", "upscale_conservative"
+	Type              *string                `json:"type,omitempty"`           // "inpainting", "outpainting", "background_removal", "remove_background", "erase_object", "recolor", "search_replace", "control_sketch", "control_structure", "style_guide", "style_transfer", "upscale", "upscale_fast", "upscale_creative", "upscale_conservative", "mask", "segmentation", "vectorize", "controlnet_preprocess"
 	Background        *string                `json:"background,omitempty"`     // "transparent", "opaque", "auto"
 	InputFidelity     *string                `json:"input_fidelity,omitempty"` // "low", "high"
 	Mask              []byte                 `json:"mask,omitempty"`
@@ -303,6 +392,9 @@ type ImageEditParameters struct {
 	NegativePrompt    *string                `json:"negative_prompt,omitempty"`     // negative prompt for image editing
 	Seed              *int                   `json:"seed,omitempty"`                // seed for image editing
 	NumInferenceSteps *int                   `json:"num_inference_steps,omitempty"` // number of inference steps
+	UpscaleFactor     *int                   `json:"upscale_factor,omitempty"`      // type "upscale": multiply each dimension by N
+	TargetMegapixels  *int                   `json:"target_megapixels,omitempty"`   // type "upscale": target output size; mutually exclusive with upscale_factor
+	AspectRatio       *string                `json:"aspect_ratio,omitempty"`        // aspect ratio of the edited image
 	ExtraParams       map[string]interface{} `json:"-"`
 }
 

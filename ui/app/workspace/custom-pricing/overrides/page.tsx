@@ -2,7 +2,7 @@ import ScopedPricingOverridesView from "@/app/workspace/custom-pricing/overrides
 
 export default function ScopedPricingOverridesPage() {
 	return (
-		<div className="mx-auto w-full max-w-7xl">
+		<div className="no-padding-parent mx-auto flex h-[calc(var(--app-content-viewport)_-_var(--app-bottom-padding))] min-h-0 w-full flex-col overflow-hidden p-4">
 			<ScopedPricingOverridesView />
 		</div>
 	);

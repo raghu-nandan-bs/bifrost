@@ -1,6 +1,7 @@
 package streaming
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -93,7 +94,40 @@ func deepCopyChatStreamDelta(original *schemas.ChatStreamResponseChoiceDelta) *s
 				copyName := *tc.Function.Name
 				copyTc.Function.Name = &copyName
 			}
+			if tc.Custom != nil {
+				copyCustom := *tc.Custom
+				if tc.Custom.Name != nil {
+					copyName := *tc.Custom.Name
+					copyCustom.Name = &copyName
+				}
+				copyTc.Custom = &copyCustom
+			}
+			// Deep copy ExtraContent (json.RawMessage is a []byte)
+			if len(tc.ExtraContent) > 0 {
+				copyTc.ExtraContent = append(json.RawMessage(nil), tc.ExtraContent...)
+			}
 			copy.ToolCalls[i] = copyTc
+		}
+	}
+
+	// Deep copy Annotations slice
+	if original.Annotations != nil {
+		copy.Annotations = make([]schemas.ChatAssistantMessageAnnotation, len(original.Annotations))
+		for i, annotation := range original.Annotations {
+			copyAnnotation := annotation
+			if annotation.URLCitation.URL != nil {
+				copyURL := *annotation.URLCitation.URL
+				copyAnnotation.URLCitation.URL = &copyURL
+			}
+			if annotation.URLCitation.Text != nil {
+				copyText := *annotation.URLCitation.Text
+				copyAnnotation.URLCitation.Text = &copyText
+			}
+			if annotation.URLCitation.Type != nil {
+				copyType := *annotation.URLCitation.Type
+				copyAnnotation.URLCitation.Type = &copyType
+			}
+			copy.Annotations[i] = copyAnnotation
 		}
 	}
 
@@ -107,12 +141,37 @@ func deepCopyChatStreamDelta(original *schemas.ChatStreamResponseChoiceDelta) *s
 		}
 	}
 
+	// Deep copy Images slice
+	if original.Images != nil {
+		copy.Images = make([]schemas.ChatAssistantMessageImage, len(original.Images))
+		for i, image := range original.Images {
+			copyImage := image
+			if image.ImageURL.FileID != nil {
+				copyFileID := *image.ImageURL.FileID
+				copyImage.ImageURL.FileID = &copyFileID
+			}
+			if image.ImageURL.Detail != nil {
+				copyDetail := *image.ImageURL.Detail
+				copyImage.ImageURL.Detail = &copyDetail
+			}
+			copy.Images[i] = copyImage
+		}
+	}
+
 	return copy
 }
 
-// buildCompleteMessageFromChunks builds a complete message from accumulated chunks.
-// Uses strings.Builder for O(n) accumulation instead of O(n²) string concatenation.
+// buildCompleteMessageFromChatStreamChunks builds a complete message from accumulated chunks.
 func (a *Accumulator) buildCompleteMessageFromChatStreamChunks(chunks []*ChatStreamChunk) *schemas.ChatMessage {
+	return BuildChatMessageFromChunks(chunks)
+}
+
+// BuildChatMessageFromChunks assembles the complete assistant message from a stream's chat chunks
+// (content, refusal, reasoning, reasoning details, audio, images, annotations and tool calls). It sorts
+// chunks in place by ChunkIndex and holds no state, so callers that rebuild a stream outside the
+// Accumulator (e.g. from a recorded passthrough body) get the same result the live path produces.
+// Uses strings.Builder for O(n) accumulation instead of O(n²) string concatenation.
+func BuildChatMessageFromChunks(chunks []*ChatStreamChunk) *schemas.ChatMessage {
 	completeMessage := &schemas.ChatMessage{
 		Role:    schemas.ChatMessageRoleAssistant,
 		Content: &schemas.ChatMessageContent{},
@@ -128,6 +187,8 @@ func (a *Accumulator) buildCompleteMessageFromChatStreamChunks(chunks []*ChatStr
 	var audioDataBuilder strings.Builder
 	var audioTranscriptBuilder strings.Builder
 	hasContent, hasRefusal, hasReasoning := false, false, false
+	var annotations []schemas.ChatAssistantMessageAnnotation
+	var images []schemas.ChatAssistantMessageImage
 
 	// Reasoning details builders keyed by detail index
 	type rdAccum struct {
@@ -140,10 +201,12 @@ func (a *Accumulator) buildCompleteMessageFromChatStreamChunks(chunks []*ChatStr
 
 	// Tool call argument builders keyed by delta index
 	type tcAccum struct {
-		id   *string
-		typ  *string
-		name *string
-		args strings.Builder
+		id           *string
+		typ          *string
+		name         *string
+		args         strings.Builder
+		custom       *strings.Builder // input of a custom tool call
+		extraContent json.RawMessage
 	}
 	var tcAccums map[uint16]*tcAccum
 
@@ -204,6 +267,9 @@ func (a *Accumulator) buildCompleteMessageFromChatStreamChunks(chunks []*ChatStr
 				acc.id = &idCopy
 			}
 		}
+		// Collect annotations and images (arrive whole per chunk, not incrementally)
+		annotations = append(annotations, chunk.Delta.Annotations...)
+		images = append(images, chunk.Delta.Images...)
 		// Handle audio data
 		if chunk.Delta.Audio != nil {
 			if completeMessage.ChatAssistantMessage == nil {
@@ -250,6 +316,20 @@ func (a *Accumulator) buildCompleteMessageFromChatStreamChunks(chunks []*ChatStr
 			}
 			if args := deltaToolCall.Function.Arguments; args != "" {
 				acc.args.WriteString(args)
+			}
+			if custom := deltaToolCall.Custom; custom != nil {
+				if acc.custom == nil {
+					acc.custom = &strings.Builder{}
+				}
+				if custom.Name != nil {
+					n := *custom.Name
+					acc.name = &n
+				}
+				acc.custom.WriteString(custom.Input)
+			}
+			if len(deltaToolCall.ExtraContent) > 0 {
+				acc.extraContent = make(json.RawMessage, len(deltaToolCall.ExtraContent))
+				copy(acc.extraContent, deltaToolCall.ExtraContent)
 			}
 		}
 	}
@@ -314,6 +394,22 @@ func (a *Accumulator) buildCompleteMessageFromChatStreamChunks(chunks []*ChatStr
 		}
 	}
 
+	// Finalize annotations
+	if len(annotations) > 0 {
+		if completeMessage.ChatAssistantMessage == nil {
+			completeMessage.ChatAssistantMessage = &schemas.ChatAssistantMessage{}
+		}
+		completeMessage.ChatAssistantMessage.Annotations = annotations
+	}
+
+	// Finalize images
+	if len(images) > 0 {
+		if completeMessage.ChatAssistantMessage == nil {
+			completeMessage.ChatAssistantMessage = &schemas.ChatAssistantMessage{}
+		}
+		completeMessage.ChatAssistantMessage.Images = images
+	}
+
 	// Finalize audio
 	if completeMessage.ChatAssistantMessage != nil && completeMessage.ChatAssistantMessage.Audio != nil {
 		completeMessage.ChatAssistantMessage.Audio.Data = audioDataBuilder.String()
@@ -333,7 +429,7 @@ func (a *Accumulator) buildCompleteMessageFromChatStreamChunks(chunks []*ChatStr
 		toolCalls := make([]schemas.ChatAssistantMessageToolCall, 0, len(tcIndices))
 		for _, idx := range tcIndices {
 			acc := tcAccums[uint16(idx)]
-			toolCalls = append(toolCalls, schemas.ChatAssistantMessageToolCall{
+			tc := schemas.ChatAssistantMessageToolCall{
 				Index: uint16(idx),
 				ID:    acc.id,
 				Type:  acc.typ,
@@ -341,7 +437,15 @@ func (a *Accumulator) buildCompleteMessageFromChatStreamChunks(chunks []*ChatStr
 					Name:      acc.name,
 					Arguments: acc.args.String(),
 				},
-			})
+			}
+			if acc.custom != nil {
+				tc.Function = schemas.ChatAssistantMessageToolCallFunction{}
+				tc.Custom = &schemas.ChatAssistantMessageToolCallCustom{Name: acc.name, Input: acc.custom.String()}
+			}
+			if len(acc.extraContent) > 0 {
+				tc.ExtraContent = acc.extraContent
+			}
+			toolCalls = append(toolCalls, tc)
 		}
 		completeMessage.ChatAssistantMessage.ToolCalls = toolCalls
 	}
@@ -410,10 +514,31 @@ func (a *Accumulator) processAccumulatedChatStreamingChunks(requestID string, re
 		if lastChunk.SemanticCacheDebug != nil {
 			data.CacheDebug = lastChunk.SemanticCacheDebug
 		}
+		if lastChunk.GuardrailDebug != nil {
+			data.GuardrailDebug = lastChunk.GuardrailDebug
+		}
 		if lastChunk.Cost != nil {
 			data.Cost = lastChunk.Cost
 		}
 		data.FinishReason = lastChunk.FinishReason
+	}
+	// service_tier can arrive before a trailing usage-only or synthetic terminal
+	// chunk, so retain the newest non-nil value rather than reading only the
+	// highest-index chunk.
+	tierChunkIndex := -1
+	for _, streamChunk := range accumulator.ChatStreamChunks {
+		if streamChunk.ServiceTier != nil && streamChunk.ChunkIndex > tierChunkIndex {
+			data.ServiceTier = streamChunk.ServiceTier
+			tierChunkIndex = streamChunk.ChunkIndex
+		}
+	}
+	// The highest-index chunk can carry a nil finish_reason (a usage-only chunk,
+	// or the synthetic terminal chunk the OpenAI-compatible handler appends after
+	// forwarding finish_reason on a content chunk). Fall back to the newest chunk
+	// that actually carries one so the accumulated response used for logging and
+	// plugins keeps it.
+	if data.FinishReason == nil {
+		data.FinishReason = accumulator.getChatFinishReasonLocked()
 	}
 	// Merge LogProbs from all chunks
 	if len(accumulator.ChatStreamChunks) > 0 {
@@ -445,6 +570,10 @@ func (a *Accumulator) processAccumulatedChatStreamingChunks(requestID string, re
 					rawBuilder.WriteString("\n\n")
 				}
 				rawBuilder.WriteString(*chunk.RawResponse)
+				// Every frame comes from one provider stream, so the first declared format describes them all.
+				if data.RawResponseFormat == "" {
+					data.RawResponseFormat = chunk.RawResponseFormat
+				}
 			}
 		}
 		if rawBuilder.Len() > 0 {
@@ -498,6 +627,7 @@ func (a *Accumulator) processChatStreamingResponse(ctx *schemas.BifrostContext, 
 		chunk.ChunkIndex = result.TextCompletionResponse.ExtraFields.ChunkIndex
 		if result.TextCompletionResponse.ExtraFields.RawResponse != nil {
 			chunk.RawResponse = bifrost.Ptr(fmt.Sprintf("%v", result.TextCompletionResponse.ExtraFields.RawResponse))
+			chunk.RawResponseFormat = result.TextCompletionResponse.ExtraFields.RawResponseFormat
 		}
 		if isFinalChunk {
 			if a.pricingManager != nil {
@@ -505,6 +635,7 @@ func (a *Accumulator) processChatStreamingResponse(ctx *schemas.BifrostContext, 
 				chunk.Cost = bifrost.Ptr(cost)
 			}
 			chunk.SemanticCacheDebug = result.GetExtraFields().CacheDebug
+			chunk.GuardrailDebug = result.GetExtraFields().GuardrailDebug
 		}
 	} else if result != nil && result.ChatResponse != nil {
 		// Extract delta and other information
@@ -521,9 +652,13 @@ func (a *Accumulator) processChatStreamingResponse(ctx *schemas.BifrostContext, 
 		if result.ChatResponse.Usage != nil && result.ChatResponse.Usage.TotalTokens > 0 {
 			chunk.TokenUsage = result.ChatResponse.Usage
 		}
+		if result.ChatResponse.ServiceTier != nil {
+			chunk.ServiceTier = new(schemas.BifrostServiceTier(*result.ChatResponse.ServiceTier))
+		}
 		chunk.ChunkIndex = result.ChatResponse.ExtraFields.ChunkIndex
 		if result.ChatResponse.ExtraFields.RawResponse != nil {
 			chunk.RawResponse = bifrost.Ptr(fmt.Sprintf("%v", result.ChatResponse.ExtraFields.RawResponse))
+			chunk.RawResponseFormat = result.ChatResponse.ExtraFields.RawResponseFormat
 		}
 		if isFinalChunk {
 			if a.pricingManager != nil {
@@ -531,9 +666,10 @@ func (a *Accumulator) processChatStreamingResponse(ctx *schemas.BifrostContext, 
 				chunk.Cost = bifrost.Ptr(cost)
 			}
 			chunk.SemanticCacheDebug = result.GetExtraFields().CacheDebug
+			chunk.GuardrailDebug = result.GetExtraFields().GuardrailDebug
 		}
 	}
-	if addErr := a.addChatStreamChunk(requestID, chunk, isFinalChunk); addErr != nil {
+	if addErr := a.addChatStreamChunk(requestID, streamType, chunk, isFinalChunk); addErr != nil {
 		return nil, fmt.Errorf("failed to add stream chunk for request %s: %w", requestID, addErr)
 	}
 	// If this is the final chunk, process accumulated chunks
@@ -568,6 +704,7 @@ func (a *Accumulator) processChatStreamingResponse(ctx *schemas.BifrostContext, 
 			Provider:       provider,
 			RequestedModel: model,
 			ResolvedModel:  resolvedModel,
+			RoutingInfo:    bifrost.GetResponseRoutingInfo(result, bifrostErr),
 			Data:           data,
 			RawRequest:     &rawRequest,
 		}, nil
@@ -580,6 +717,7 @@ func (a *Accumulator) processChatStreamingResponse(ctx *schemas.BifrostContext, 
 		Provider:       provider,
 		RequestedModel: model,
 		ResolvedModel:  resolvedModel,
+		RoutingInfo:    bifrost.GetResponseRoutingInfo(result, bifrostErr),
 		Data:           nil,
 	}, nil
 }

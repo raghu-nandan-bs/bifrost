@@ -1,7 +1,8 @@
 import { configureStore } from "@reduxjs/toolkit";
+import { setupListeners } from "@reduxjs/toolkit/query";
 import { baseApi } from "./apis/baseApi";
 import { appReducer, pluginReducer, providerReducer } from "./slices";
-import { reducers as enterpriseReducers, type EnterpriseState } from "@enterprise/lib/store/slices";
+import { middleware as enterpriseMiddleware, reducers as enterpriseReducers, type EnterpriseState } from "@enterprise/lib/store/slices";
 // Importing enterprise APIs triggers their self-injection into baseApi
 import "@enterprise/lib/store/apis";
 
@@ -37,9 +38,14 @@ export const store = configureStore({
 				// Ignore these paths in the state
 				ignoredPaths: ["api.queries", "api.mutations"],
 			},
-		}).concat(baseApi.middleware),
+		}).concat(baseApi.middleware, ...enterpriseMiddleware),
 	devTools: process.env.NODE_ENV !== "production",
 });
+
+// RTK Query only tracks window focus and connectivity once these listeners are
+// attached. Without them `config.focused` is frozen at store creation, so an app
+// first loaded in a background tab never runs any `skipPollingIfUnfocused` poll.
+setupListeners(store.dispatch);
 
 export type RootState = ReturnType<typeof store.getState> & EnterpriseState;
 

@@ -1,24 +1,32 @@
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
-import { ComboboxSelect } from "@/components/ui/combobox";
 import ModelParameters from "@/components/ui/custom/modelParameters";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { ModelMultiselect } from "@/components/ui/modelMultiselect";
+import { ModelSelector } from "@/components/ui/modelSelector";
+import { ProviderSelector } from "@/components/ui/providerSelector";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
+import { useDebouncedValue } from "@/hooks/useDebounce";
+import { resolveProviderIconKey } from "@/lib/constants/icons";
 import { getProviderLabel } from "@/lib/constants/logs";
-import { Input } from "@/components/ui/input";
 import { useGetVirtualKeysQuery } from "@/lib/store";
+import { useGetCoreConfigQuery } from "@/lib/store/apis/configApi";
 import { useGetAllKeysQuery, useGetProvidersQuery } from "@/lib/store/apis/providersApi";
-import { ModelProviderName } from "@/lib/types/config";
+import { ModelProvider } from "@/lib/types/config";
+import type { VirtualKey } from "@/lib/types/governance";
 import { ModelParams } from "@/lib/types/prompts";
 import { cn } from "@/lib/utils";
 import { PromptDeploymentsAccordionItem } from "@enterprise/components/prompt-deployments/promptDeploymentsAccordionItem";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { ApiKeySelectorView } from "../components/apiKeySelectorView";
 import { VariablesTableView } from "../components/variablesTableView";
 import { usePromptContext } from "../context";
 
+const VIRTUAL_KEY_PAGE_SIZE = 20;
+
 export function SettingsPanel() {
+	const { t } = useTranslation("config");
 	const {
 		provider,
 		setProvider,
@@ -54,35 +62,42 @@ export function SettingsPanel() {
 	);
 	// Dynamic providers
 	const { data: providers, isLoading: isLoadingProviders } = useGetProvidersQuery();
-	const { data: virtualKeysData } = useGetVirtualKeysQuery();
+
+	// Virtual keys are searched server-side and capped at one page — calling this
+	// with no params at all makes the handler return every key, fully hydrated.
+	const [vkSearch, setVkSearch] = useState("");
+	const debouncedVkSearch = useDebouncedValue(vkSearch, 300);
+	const { data: virtualKeysData, isFetching: isFetchingVirtualKeys } = useGetVirtualKeysQuery({
+		limit: VIRTUAL_KEY_PAGE_SIZE,
+		search: debouncedVkSearch || undefined,
+	});
+	const { data: coreConfig } = useGetCoreConfigQuery({});
+	const enforceVirtualKeys = coreConfig?.client_config?.enforce_auth_on_inference ?? false;
 	// Keys for the API Key selector (from /api/keys endpoint, provider-filtered)
 	const { data: allKeys, isSuccess: hasLoadedAllKeys } = useGetAllKeysQuery();
 
 	const isInitialLoading = isLoadingProviders;
 
-	const configuredProviders = useMemo(() => {
-		const activeVirtualKeys = virtualKeysData?.virtual_keys?.filter((vk) => vk.is_active) ?? [];
-		if (!hasLoadedAllKeys) {
-			return providers ?? [];
-		}
-		const keyedProviders = new Set((allKeys ?? []).map((k) => k.provider));
-		return (providers ?? []).filter((p) => {
-			if (keyedProviders.has(p.name)) return true;
-			// Include providers that have active virtual keys (wildcard or explicitly targeting this provider)
+	// Only a provider you could actually send a request to: one with a key of its own, or one
+	// an active virtual key covers.
+	const isUsableProvider = useCallback(
+		(p: ModelProvider) => {
+			if (!hasLoadedAllKeys) return true;
+			if ((allKeys ?? []).some((k) => k.provider === p.name)) return true;
+			const activeVirtualKeys = virtualKeysData?.virtual_keys?.filter((vk) => vk.is_active) ?? [];
 			return activeVirtualKeys.some(
 				(vk) => !vk.provider_configs || vk.provider_configs.length === 0 || vk.provider_configs.some((pc) => pc.provider === p.name),
 			);
-		});
-	}, [providers, virtualKeysData, allKeys, hasLoadedAllKeys]);
+		},
+		[virtualKeysData, allKeys, hasLoadedAllKeys],
+	);
 
-	// Ensure current provider always has a label-resolved option (even before providers query loads)
-	const providerOptions = useMemo(() => {
-		const opts = configuredProviders.map((p) => ({ label: getProviderLabel(p.name), value: p.name }));
-		if (provider && !opts.find((o) => o.value === provider)) {
-			opts.unshift({ label: getProviderLabel(provider), value: provider as ModelProviderName });
-		}
-		return opts;
-	}, [configuredProviders, provider]);
+	// A saved provider still names something the filter above drops, or the providers query has
+	// not landed yet. Either way the trigger has to say what the prompt is actually set to.
+	const savedProviderOption = useMemo(() => {
+		if (!provider || (providers ?? []).some((p) => p.name === provider)) return undefined;
+		return [{ value: provider, label: getProviderLabel(provider), iconKey: resolveProviderIconKey(provider) }];
+	}, [providers, provider]);
 
 	const providerKeys = useMemo(() => (allKeys ?? []).filter((k) => k.provider === provider), [allKeys, provider]);
 
@@ -98,24 +113,43 @@ export function SettingsPanel() {
 		});
 	}, [virtualKeysData, provider]);
 
-	// Separate keys/vks to pass to model fetch for filtering.
-	const filterKeys = useMemo(() => {
-		const isProviderKey = providerKeys.some((k) => k.key_id === apiKeyId);
-		if (isProviderKey) return [apiKeyId];
-		const isVirtualKey = providerVirtualKeys.some((vk) => vk.id === apiKeyId);
-		if (isVirtualKey) return undefined;
-		// Auto: pass all provider key IDs
-		return providerKeys.map((k) => k.key_id);
-	}, [apiKeyId, providerKeys, providerVirtualKeys]);
+	useEffect(() => {
+		if (!enforceVirtualKeys) return;
+		if (providerKeys.some((k) => k.key_id === apiKeyId)) {
+			setApiKeyId("__auto__");
+		}
+	}, [apiKeyId, enforceVirtualKeys, providerKeys, setApiKeyId]);
 
-	const filterVks = useMemo(() => {
-		const virtualKey = providerVirtualKeys.find((vk) => vk.value === apiKeyId);
-		if (virtualKey) return [virtualKey.id];
-		return undefined;
+	// Only one page of virtual keys is loaded, so the selected key can fall out of
+	// the list as the search narrows. Pin it once resolved — model filtering below
+	// reads its id, and losing it would silently widen the model list.
+	const [selectedVirtualKey, setSelectedVirtualKey] = useState<VirtualKey | null>(null);
+	useEffect(() => {
+		setSelectedVirtualKey((prev) => {
+			const match = providerVirtualKeys.find((vk) => vk.value === apiKeyId);
+			if (match) return match;
+			return prev?.value === apiKeyId ? prev : null;
+		});
 	}, [apiKeyId, providerVirtualKeys]);
 
+	// Separate keys/vks to pass to model fetch for filtering.
+	const filterKeys = useMemo(() => {
+		if (enforceVirtualKeys) return undefined;
+		const isProviderKey = providerKeys.some((k) => k.key_id === apiKeyId);
+		if (isProviderKey) return [apiKeyId];
+		if (selectedVirtualKey) return undefined;
+		// Auto: pass all provider key IDs
+		return providerKeys.map((k) => k.key_id);
+	}, [apiKeyId, enforceVirtualKeys, providerKeys, selectedVirtualKey]);
+
+	const filterVks = useMemo(() => (selectedVirtualKey ? [selectedVirtualKey.id] : undefined), [selectedVirtualKey]);
+
+	// A search that matches nothing must not unmount the picker in enforce mode —
+	// that would take the search box away with it.
+	const hasVirtualKeysForProvider = providerVirtualKeys.length > 0 || !!selectedVirtualKey || !!vkSearch;
+
 	const handleModelParamsChange = useCallback(
-		(params: Record<string, any>) => {
+		(params: Record<string, unknown>) => {
 			onModelParamsChange(params as ModelParams);
 		},
 		[onModelParamsChange],
@@ -145,7 +179,7 @@ export function SettingsPanel() {
 
 	return (
 		<div className="flex h-full min-h-0 flex-col">
-			<div className="flex min-h-0 flex-1 flex-col px-4 pt-2 pb-4">
+			<div className="flex min-h-0 flex-1 flex-col px-3 pt-2 pb-4">
 				<Accordion
 					type="single"
 					collapsible
@@ -165,48 +199,56 @@ export function SettingsPanel() {
 					>
 						<AccordionTrigger
 							data-testid="prompts-configuration-trigger"
-							className="text-muted-foreground shrink-0 py-3 pr-1 text-xs font-medium uppercase hover:no-underline"
+							className="text-muted-foreground shrink-0 pt-2 pr-1 pb-3 text-xs font-medium uppercase hover:no-underline"
 						>
-							<span className="min-w-0 flex-1 text-left font-semibold">Configuration</span>
+							<span className="min-w-0 flex-1 text-left font-semibold">{t("promptRepo.configuration")}</span>
 						</AccordionTrigger>
 						<AccordionContent
 							containerClassName="data-[state=open]:flex data-[state=open]:min-h-0 data-[state=open]:flex-1 data-[state=open]:flex-col"
-							className="min-h-0 flex-1 overflow-y-auto pt-0 pb-2"
+							className="min-h-0 flex-1 overflow-y-auto px-1 pt-0 pb-2"
 						>
 							<div className="space-y-6">
 								<div className="flex flex-col gap-2" data-testid="settings-provider">
-									<Label className="text-muted-foreground text-xs font-medium uppercase">Provider</Label>
-									<ComboboxSelect
-										options={providerOptions}
+									<Label className="text-muted-foreground text-xs font-medium uppercase">{t("promptRepo.provider")}</Label>
+									<ProviderSelector
+										filter={isUsableProvider}
+										extraOptions={savedProviderOption}
 										value={provider}
-										onValueChange={(v) => v && onProviderChange(v)}
-										placeholder="Select provider"
-										hideClear
+										onChange={(v: string) => v && onProviderChange(v)}
+										placeholder={t("caching.selectProvider")}
+										className="!h-9 !min-h-9"
 									/>
 								</div>
 
 								<div className="flex flex-col gap-2" data-testid="settings-model">
-									<Label className="text-muted-foreground text-xs font-medium uppercase">Model</Label>
-									<ModelMultiselect
+									<Label id="settings-model-label" className="text-muted-foreground text-xs font-medium uppercase">
+										{t("promptRepo.model")}
+									</Label>
+									<ModelSelector
+										ariaLabelledBy="settings-model-label"
 										provider={provider}
 										keys={filterKeys && filterKeys.length > 0 ? filterKeys : undefined}
 										vks={filterVks}
 										value={model}
-										onChange={(v) => onModelChange(v)}
-										isSingleSelect
-										placeholder={!provider ? "Select a provider first" : "Select model"}
+										onChange={onModelChange}
+										placeholder={!provider ? t("caching.selectProviderFirst") : t("promptRepo.selectModel")}
 										disabled={!provider}
-										unfiltered={true}
+										unfiltered
+										allowCustomModel
+										data-testid="settings-model-selector"
 									/>
 								</div>
 
-								{(providerKeys.length > 0 || providerVirtualKeys.length > 0) && !!provider && (
+								{!!provider && (enforceVirtualKeys ? hasVirtualKeysForProvider : true) && (
 									<ApiKeySelectorView
 										providerKeys={providerKeys}
 										virtualKeys={providerVirtualKeys}
 										value={apiKeyId}
 										onValueChange={(v) => onApiKeyIdChange(v ?? "__auto__")}
 										disabled={!provider}
+										requireVirtualKey={enforceVirtualKeys}
+										onSearchChange={setVkSearch}
+										isSearching={isFetchingVirtualKeys || vkSearch !== debouncedVkSearch}
 									/>
 								)}
 
@@ -221,10 +263,8 @@ export function SettingsPanel() {
 									<>
 										<Separator />
 										<div className="flex flex-col gap-2" data-testid="settings-required-headers">
-											<Label className="text-muted-foreground text-xs font-medium uppercase">Required Headers</Label>
-											<p className="text-muted-foreground text-xs">
-												These headers are required by the server. Provide a value for each to send requests from the playground.
-											</p>
+											<Label className="text-muted-foreground text-xs font-medium uppercase">{t("promptRepo.requiredHeaders")}</Label>
+											<p className="text-muted-foreground text-xs">{t("promptRepo.requiredHeadersHelp")}</p>
 											<div className="flex flex-col gap-2">
 												{requiredHeaders.map((name) => (
 													<div key={name} className="flex items-center gap-2">
@@ -235,7 +275,7 @@ export function SettingsPanel() {
 															id={`required-header-${name}`}
 															value={customHeaders[name] ?? ""}
 															onChange={(e) => setCustomHeaders((prev) => ({ ...prev, [name]: e.target.value }))}
-															placeholder="value"
+															placeholder={t("promptRepo.valuePlaceholder")}
 															className="h-8 flex-1"
 														/>
 													</div>

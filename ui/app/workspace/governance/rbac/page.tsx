@@ -2,7 +2,7 @@ import RBACView from "@enterprise/components/rbac/rbacView";
 
 export default function GovernanceRbacPage() {
 	return (
-		<div className="mx-auto w-full max-w-7xl h-[calc(100vh_-_50px)] flex flex-col overflow-y-auto">
+		<div className="no-padding-parent mx-auto flex h-[calc(var(--app-content-viewport)_-_var(--app-bottom-padding))] w-full flex-col p-4">
 			<RBACView />
 		</div>
 	);

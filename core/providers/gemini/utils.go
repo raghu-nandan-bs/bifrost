@@ -6,9 +6,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
+	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/bytedance/sonic"
 	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
@@ -18,25 +23,20 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-// isGemini3Plus returns true if the model is Gemini 3.0 or higher
-// Uses simple string operations for hot path performance
-func isGemini3Plus(model string) bool {
-	// Convert to lowercase for case-insensitive comparison
-	model = strings.ToLower(model)
+var defaultGeminiImageURLSchemes = []string{"http", "https"}
 
-	// Find "gemini-" prefix
+// isGemini3Plus returns true if the model is Gemini 3.0 or higher.
+// Uses simple string operations for hot path performance.
+func isGemini3Plus(model string) bool {
+	model = strings.ToLower(model)
 	idx := strings.Index(model, "gemini-")
 	if idx == -1 {
 		return false
 	}
-
-	// Get the part after "gemini-"
 	afterPrefix := model[idx+7:] // len("gemini-") = 7
 	if len(afterPrefix) == 0 {
 		return false
 	}
-
-	// Check first character - must be a digit, and '3' or higher for 3.0+
 	firstChar := afterPrefix[0]
 	if firstChar < '0' || firstChar > '9' {
 		return false
@@ -44,18 +44,82 @@ func isGemini3Plus(model string) bool {
 	return firstChar >= '3'
 }
 
+// isGemini4Plus reports whether model is Gemini 4.0 or newer.
+func isGemini4Plus(model string) bool {
+	model = strings.ToLower(model)
+	idx := strings.Index(model, "gemini-")
+	if idx == -1 {
+		return false
+	}
+	afterPrefix := model[idx+7:] // len("gemini-") = 7
+	end := 0
+	for end < len(afterPrefix) && afterPrefix[end] >= '0' && afterPrefix[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return false
+	}
+	major, err := strconv.Atoi(afterPrefix[:end])
+	return err == nil && major >= 4
+}
+
+// ---- Name-based capability defaults ----
+//
+// Used when the datasheet publishes no row for a (provider, model) pair. Every
+// caps gate in this package passes one of these as its fallback, so the whole
+// compatibility layer lives here and is deletable once the feed carries data.
+
+// defaultSupportsReasoning matches Gemini models with a thinking surface:
+// explicitly-named thinking models, the 2.5 series, and 3.0+.
+func defaultSupportsReasoning(model string) bool {
+	modelLower := strings.ToLower(model)
+	if strings.Contains(modelLower, "thinking") || strings.Contains(modelLower, "gemini-2.5") {
+		return true
+	}
+	return isGemini3Plus(model)
+}
+
+// defaultCanDisableReasoning: Gemini 2.5 Pro rejects a zero thinking budget, so
+// the config has to be omitted rather than explicitly disabled.
+func defaultCanDisableReasoning(model string) bool {
+	return !strings.Contains(strings.ToLower(model), "gemini-2.5-pro")
+}
+
+// defaultSupportsReasoningBudget: Gemini 4 removed thinkingBudget and answers it
+// with a 400, so only thinkingLevel reaches those models.
+// Source: https://ai.google.dev/gemini-api/docs/thinking
+func defaultSupportsReasoningBudget(model string) bool {
+	return !isGemini4Plus(model)
+}
+
+// defaultEffortControl is the thinkingLevel surface for Gemini 3+, taken from
+// the per-model rung table below. nil for models that take a budget instead,
+// which is what tells callers to convert an effort into thinkingBudget.
+func defaultEffortControl(model string) *schemas.EffortControl {
+	if !isGemini3Plus(model) {
+		return nil
+	}
+	// No Renames: the rung set is authoritative and NormalizeReasoningEffort
+	// clamps onto it, so "medium" on a low/high model lands on "high" without a
+	// second mechanism saying the same thing.
+	return &schemas.EffortControl{Levels: supportedThinkingLevels(model)}
+}
+
 // NormalizeRawGenerateContentRequestForCompatibility applies the same
 // provider-compatibility cleanup expected by the typed conversion path, while
-// preserving JSON key order with gjson/sjson-style byte edits.
-func NormalizeRawGenerateContentRequestForCompatibility(jsonBody []byte) []byte {
+// preserving JSON key order with gjson/sjson-style byte edits. model is the target
+// model, used to translate a thinking budget the model would reject; "" skips that.
+func NormalizeRawGenerateContentRequestForCompatibility(ctx *schemas.BifrostContext, jsonBody []byte, providerName schemas.ModelProvider, model string) []byte {
 	if len(jsonBody) == 0 {
 		return jsonBody
 	}
 
+	// responseLogprobs/logprobs are forwarded as sent, as the typed path does: Google
+	// validates the range and returns logprobsResult. The penalties are still stripped:
+	// the typed path lets compat's drop-params remove them per model from the catalog,
+	// and this raw path has no such check. "fallbacks" is Bifrost's own key.
 	out := jsonBody
 	for _, path := range []string{
-		"generationConfig.responseLogprobs",
-		"generationConfig.logprobs",
 		"generationConfig.presencePenalty",
 		"generationConfig.frequencyPenalty",
 		"fallbacks",
@@ -66,6 +130,7 @@ func NormalizeRawGenerateContentRequestForCompatibility(jsonBody []byte) []byte 
 			}
 		}
 	}
+	out = rewriteRawThinkingBudgetToLevel(ctx, out, providerName, model)
 
 	contents := gjson.GetBytes(out, "contents")
 	if !contents.IsArray() {
@@ -138,110 +203,415 @@ func NormalizeRawGenerateContentRequestForCompatibility(jsonBody []byte) []byte 
 	return out
 }
 
+// rawThinkingBudgetKeys pairs each budget key spelling with the level key of the same
+// spelling, so a rewrite keeps the caller's casing. The native decoder accepts either
+// spelling of each field independently, so every pair is checked under both config keys.
+var rawThinkingBudgetKeys = [...]struct{ budget, level string }{
+	{"thinkingBudget", "thinkingLevel"},
+	{"thinking_budget", "thinking_level"},
+}
+
+// rawThinkingTarget resolves the target model's capabilities at most once per body, and
+// only after a budget is found, so bodies without one never pay for the lookup. The
+// lookup uses the canonical model so an alias with an opaque wire id still resolves.
+type rawThinkingTarget struct {
+	ctx      *schemas.BifrostContext
+	provider schemas.ModelProvider
+	model    string
+	caps     schemas.ModelCaps
+	resolved bool
+}
+
+func (t *rawThinkingTarget) resolve() schemas.ModelCaps {
+	if !t.resolved {
+		t.caps = schemas.ResolveModelCaps(t.provider, schemas.ResolveCanonicalModel(t.ctx, t.model))
+		t.resolved = true
+	}
+	return t.caps
+}
+
+// rewriteRawThinkingBudgetToLevel is the raw-body twin of applyThinkingBudget. Raw
+// passthrough forwards the client's thinkingConfig as sent, so a budget aimed at a
+// model that rejects budgets (Gemini 4) is swapped here for the nearest level. Inline
+// batch items carry their own generationConfig and are rewritten the same way.
+func rewriteRawThinkingBudgetToLevel(ctx *schemas.BifrostContext, body []byte, providerName schemas.ModelProvider, model string) []byte {
+	if model == "" {
+		return body
+	}
+	view := rawJSONView(body)
+	for _, genKey := range [...]string{"generationConfig", "generation_config"} {
+		genConfig := gjson.Get(view, genKey)
+		if !genConfig.IsObject() {
+			continue
+		}
+		target := rawThinkingTarget{ctx: ctx, provider: providerName, model: model}
+		if updated, changed := rewriteGenerationConfigThinkingBudget(genConfig.Raw, &target); changed {
+			if rewritten, err := providerUtils.SetRawJSONField(body, genKey, updated); err == nil {
+				body = rewritten
+			}
+		}
+		return body
+	}
+	return rewriteRawBatchThinkingBudgets(ctx, body, view, providerName, model)
+}
+
+// rawJSONView reads body as a string without copying it, so probing a body that has no
+// thinking budget allocates nothing (gjson.GetBytes copies every match). Results taken
+// from the view alias body: callers only read them before any edit, and every edit
+// goes through sjson, which writes a new buffer.
+func rawJSONView(body []byte) string {
+	return unsafe.String(unsafe.SliceData(body), len(body))
+}
+
+// rewriteRawBatchThinkingBudgets applies the rewrite to every inline request of a
+// batchGenerateContent body. Nothing is copied until the first item that needs a
+// rewrite: the untouched items before it are copied as one slice of the body, each
+// later item is edited on its own bytes, and the array is set once. An unchanged batch
+// allocates nothing.
+func rewriteRawBatchThinkingBudgets(ctx *schemas.BifrostContext, body []byte, view string, providerName schemas.ModelProvider, model string) []byte {
+	const itemsPath = "batch.inputConfig.requests.requests"
+	items := gjson.Get(view, itemsPath)
+	if !items.IsArray() || items.Index <= 0 || view[items.Index] != '[' {
+		return body
+	}
+	target := rawThinkingTarget{ctx: ctx, provider: providerName, model: model}
+	var rebuilt *bytes.Buffer
+	items.ForEach(func(_, item gjson.Result) bool {
+		var updatedItem []byte
+		for _, genKey := range [...]string{"request.generationConfig", "request.generation_config"} {
+			genConfig := item.Get(genKey)
+			if !genConfig.IsObject() {
+				continue
+			}
+			if updated, changed := rewriteGenerationConfigThinkingBudget(genConfig.Raw, &target); changed {
+				if rewritten, err := providerUtils.SetRawJSONField([]byte(item.Raw), genKey, updated); err == nil {
+					updatedItem = rewritten
+				}
+			}
+			break
+		}
+		if rebuilt == nil {
+			if updatedItem == nil {
+				return true
+			}
+			// First rewritten item: carry over everything before it verbatim, commas included.
+			rebuilt = bytes.NewBuffer(make([]byte, 0, len(items.Raw)+64))
+			rebuilt.WriteString(view[items.Index:item.Index])
+		} else {
+			rebuilt.WriteByte(',')
+		}
+		if updatedItem != nil {
+			rebuilt.Write(updatedItem)
+		} else {
+			rebuilt.WriteString(item.Raw)
+		}
+		return true
+	})
+	if rebuilt == nil {
+		return body
+	}
+	rebuilt.WriteByte(']')
+	if rewritten, err := providerUtils.SetRawJSONField(body, itemsPath, rebuilt.Bytes()); err == nil {
+		return rewritten
+	}
+	return body
+}
+
+// rawThinkingBudgetValue reads a budget the way Google's JSON parser does: an int32 as a
+// JSON number or as a quoted string. null means unset, and anything else (booleans,
+// objects, fractions, non-numeric strings) is invalid, so neither is rewritten into a
+// level that would silently change the request.
+func rawThinkingBudgetValue(budget gjson.Result) (int, bool) {
+	var text string
+	switch budget.Type {
+	case gjson.Number:
+		text = budget.Raw
+	case gjson.String:
+		text = budget.Str
+	default:
+		return 0, false
+	}
+	value, err := strconv.ParseInt(text, 10, 32)
+	if err != nil {
+		return 0, false
+	}
+	return int(value), true
+}
+
+// rewriteGenerationConfigThinkingBudget swaps a thinking budget inside one
+// generationConfig object for the nearest level when the target model rejects budgets.
+// An explicit level in either spelling wins, since Google rejects a budget and a level
+// together. 0 lands on the model's floor and -1 leaves the level to the model default.
+// Any other negative budget is invalid, so it is left for Google to reject rather than
+// turned into a valid level. genConfig is probed as a string and only copied once a
+// budget is found, so a config without one costs no allocation.
+func rewriteGenerationConfigThinkingBudget(genConfig string, target *rawThinkingTarget) ([]byte, bool) {
+	for _, configKey := range [...]string{"thinkingConfig", "thinking_config"} {
+		thinking := gjson.Get(genConfig, configKey)
+		if !thinking.IsObject() {
+			continue
+		}
+		for _, keys := range rawThinkingBudgetKeys {
+			budget := thinking.Get(keys.budget)
+			if !budget.Exists() {
+				continue
+			}
+			value, ok := rawThinkingBudgetValue(budget)
+			if !ok || value < DynamicReasoningBudget {
+				return nil, false
+			}
+			caps := target.resolve()
+			if caps.SupportsReasoningBudget(defaultSupportsReasoningBudget(caps.Model())) {
+				return nil, false
+			}
+			updated, err := providerUtils.DeleteJSONField([]byte(genConfig), configKey+"."+keys.budget)
+			if err != nil {
+				return nil, false
+			}
+			hasLevel := thinking.Get("thinkingLevel").Exists() || thinking.Get("thinking_level").Exists()
+			if !hasLevel && value != DynamicReasoningBudget {
+				level := lowestThinkingLevel(caps.Model())
+				if value != 0 {
+					level = effortToThinkingLevel(caps, thinkingLevelFromBudget(value))
+				}
+				if updated, err = providerUtils.SetJSONField(updated, configKey+"."+keys.level, level); err != nil {
+					return nil, false
+				}
+			}
+			return updated, true
+		}
+	}
+	return nil, false
+}
+
 func isValidAudioBase64Payload(data string) bool {
 	decoded, err := decodeBase64StringToBytes(data)
 	return err == nil && len(decoded) > 0
 }
 
-// supportsThinkingConfig returns true if the model supports ThinkingConfig.
-// Only specific Gemini models support thinking:
-// - gemini-*-thinking models (e.g., gemini-2.0-flash-thinking)
-// - gemini-2.5-* models
-// - gemini-3.* and higher models
-func supportsThinkingConfig(model string) bool {
-	modelLower := strings.ToLower(model)
+// geminiThinkingLevels is the thinkingLevel ladder ordered from least to most
+// thinking. Source: https://ai.google.dev/api/generate-content#ThinkingLevel
+var geminiThinkingLevels = []string{"minimal", "low", "medium", "high"}
 
-	// Check for explicit "thinking" in model name
-	if strings.Contains(modelLower, "thinking") {
-		return true
-	}
-
-	// Check for gemini-2.5-* models
-	if strings.Contains(modelLower, "gemini-2.5") {
-		return true
-	}
-
-	// Check for Gemini 3.0+ models
-	return isGemini3Plus(model)
+// geminiThinkingLevelSupport records which rungs of that ladder each model actually
+// implements. The sets are not uniform across the Gemini 3 family - gemini-3.7-flash
+// has no "minimal", gemini-3-pro-preview has neither "minimal" nor "medium" - and the
+// API rejects a level the model does not implement, so an effort has to be clamped per
+// model rather than per family.
+// Source: https://ai.google.dev/gemini-api/docs/thinking#thinking-levels
+// Matching is first-prefix-wins, so longer prefixes are listed before the shorter
+// prefixes they would otherwise be shadowed by.
+var geminiThinkingLevelSupport = []struct {
+	prefix string
+	levels []string
+}{
+	{"gemini-4-argon", []string{"low", "medium", "high"}},
+	{"gemini-3.1-flash-lite-image", []string{"minimal", "high"}},
+	{"gemini-3.1-flash-lite", []string{"minimal", "low", "medium", "high"}},
+	{"gemini-3.7-flash", []string{"low", "medium", "high"}},
+	{"gemini-3.6-flash", []string{"minimal", "low", "medium", "high"}},
+	{"gemini-3.5-flash-lite", []string{"minimal", "low", "medium", "high"}},
+	{"gemini-3.5-flash", []string{"minimal", "low", "medium", "high"}},
+	{"gemini-3.1-pro", []string{"low", "medium", "high"}},
+	{"gemini-3-flash", []string{"minimal", "low", "medium", "high"}},
+	{"gemini-3-pro", []string{"low", "high"}},
 }
 
-// effortToThinkingLevel converts reasoning effort to Gemini ThinkingLevel string
-// Pro models only support "low" or "high"
-// Other models support "minimal", "low", "medium", and "high"
-func effortToThinkingLevel(effort string, model string) string {
-	isPro := strings.Contains(strings.ToLower(model), "pro")
+// defaultGemini3ThinkingLevels is the fallback for a Gemini 3 model not yet in the table.
+//
+// It omits "minimal" because that is the rung the text models most often lack: of the
+// documented Gemini 3 text models, gemini-3.7-flash, gemini-3.1-pro-preview and
+// gemini-3-pro-preview all reject it, so defaulting to it would send an unreleased model
+// a level it is more likely than not to refuse.
+//
+// This is a heuristic, not a guarantee -- there is no rung every documented Gemini 3 model
+// accepts. gemini-3.1-flash-lite-image implements only "minimal" and "high", so even "low"
+// is not universal, which is why that model has its own entry above rather than relying on
+// this fallback. Any model whose set genuinely differs needs an explicit entry too.
+// TestNotEveryDocumentedGemini3ModelAcceptsLow pins that counterexample.
+// Source: https://ai.google.dev/gemini-api/docs/thinking#thinking-levels
+var defaultGemini3ThinkingLevels = []string{"low", "medium", "high"}
 
-	switch effort {
-	case "none":
-		return "" // Empty string for no thinking
-	case "minimal":
-		if isPro {
-			return "low" // Pro models don't support minimal, use low
-		}
-		return "minimal"
-	case "low":
-		return "low"
-	case "medium":
-		if isPro {
-			return "high" // Pro models don't support medium, use high
-		}
-		return "medium"
-	case "high", "xhigh", "max":
-		return "high"
-	default:
-		if isPro {
-			return "high"
-		}
-		return "medium"
-	}
-}
-
-func getThinkingBudgetRange(model string, defaultMaxTokens int) thinkingBudgetRange {
+// supportedThinkingLevels returns the thinkingLevel values model accepts.
+func supportedThinkingLevels(model string) []string {
 	modelLower := strings.ToLower(model)
-	for _, entry := range thinkingBudgetRanges {
+	for _, entry := range geminiThinkingLevelSupport {
 		if strings.Contains(modelLower, entry.prefix) {
-			return entry.r
+			return entry.levels
 		}
 	}
-	// Fallback for unknown thinking-capable models
-	return thinkingBudgetRange{Min: DefaultReasoningMinBudget, Max: defaultMaxTokens}
+	return defaultGemini3ThinkingLevels
+}
+
+// lowestThinkingLevel returns the least amount of thinking model can be asked for.
+// Gemini 3 has no "off" switch, so this is the floor a "none" effort lands on.
+func lowestThinkingLevel(model string) string {
+	levels := supportedThinkingLevels(model)
+	if len(levels) == 0 {
+		return "low"
+	}
+	return levels[0]
+}
+
+// clampThinkingLevel snaps a requested level onto the nearest rung model implements.
+// Ties break upward so a clamp never silently spends less reasoning than asked for.
+func clampThinkingLevel(level string, model string) string {
+	supported := supportedThinkingLevels(model)
+	if slices.Contains(supported, level) {
+		return level
+	}
+	want := slices.Index(geminiThinkingLevels, level)
+	if want < 0 {
+		return level
+	}
+	best := ""
+	bestDistance := 0
+	for _, candidate := range supported {
+		idx := slices.Index(geminiThinkingLevels, candidate)
+		if idx < 0 {
+			continue
+		}
+		distance := idx - want
+		if distance < 0 {
+			distance = -distance
+		}
+		if best == "" || distance < bestDistance || (distance == bestDistance && idx > want) {
+			best = candidate
+			bestDistance = distance
+		}
+	}
+	if best == "" {
+		return level
+	}
+	return best
+}
+
+func setThinkingBudgetZeroIfSupported(config *GenerationConfig, caps schemas.ModelCaps) {
+	model := caps.Model()
+	// Gemini 3 cannot turn thinking off. Depth is controlled by thinkingLevel and the
+	// floor is the model's lowest supported rung, so a "none" effort clamps to that rung
+	// instead of zeroing the budget. Sending thinkingBudget:0 here used the pre-3.0
+	// control surface and suppressed the internal reasoning Gemini 3 leans on to pick
+	// functions, which surfaced as tools being advertised but never called.
+	// Docs: https://ai.google.dev/gemini-api/docs/thinking#thinking-levels
+	//       https://ai.google.dev/gemini-api/docs/function-calling#thinking
+	if caps.SupportsReasoningEffort(isGemini3Plus(model)) {
+		if config.ThinkingConfig == nil {
+			config.ThinkingConfig = &GenerationConfigThinkingConfig{}
+		}
+		config.ThinkingConfig.IncludeThoughts = false
+		config.ThinkingConfig.ThinkingBudget = nil
+		config.ThinkingConfig.ThinkingLevel = schemas.Ptr(lowestThinkingLevel(model))
+		return
+	}
+	if !caps.CanDisableReasoning(defaultCanDisableReasoning(model)) {
+		config.ThinkingConfig = nil
+		return
+	}
+	if config.ThinkingConfig == nil {
+		config.ThinkingConfig = &GenerationConfigThinkingConfig{}
+	}
+	config.ThinkingConfig.IncludeThoughts = false
+	config.ThinkingConfig.ThinkingBudget = schemas.Ptr(int32(0))
+}
+
+// effortToThinkingLevel converts reasoning effort to a Gemini ThinkingLevel,
+// clamped to the rungs the target model implements. Returns "" for "none", which
+// callers handle through setThinkingBudgetZeroIfSupported instead.
+//
+// The rung set comes from the datasheet when it publishes one, otherwise from
+// geminiThinkingLevelSupport below; NormalizeReasoningEffort does the clamping,
+// snapping to the nearest supported rung and breaking ties upward.
+func effortToThinkingLevel(caps schemas.ModelCaps, effort string) string {
+	if effort == schemas.ReasoningEffortNone {
+		return "" // Empty string for no thinking
+	}
+	return caps.NormalizeReasoningEffort(effort, defaultEffortControl(caps.Model()))
+}
+
+// thinkingLevelFromBudget picks the thinkingLevel a token budget stands for on a
+// model that only takes a level. The cut-offs are fixed rather than scaled to a
+// budget range because these models publish no range to scale against.
+func thinkingLevelFromBudget(budget int) string {
+	switch {
+	case budget <= 1024:
+		return schemas.ReasoningEffortLow
+	case budget <= 8192:
+		return schemas.ReasoningEffortMedium
+	default:
+		return schemas.ReasoningEffortHigh
+	}
+}
+
+// applyThinkingBudget writes an explicit thinking budget onto config. A model that
+// rejects budgets gets the nearest thinkingLevel instead: 0 lands on its floor
+// (thinking cannot be turned off there) and -1 leaves the level to the model default.
+func applyThinkingBudget(config *GenerationConfig, caps schemas.ModelCaps, budget int) error {
+	if budget == 0 {
+		setThinkingBudgetZeroIfSupported(config, caps)
+		return nil
+	}
+	if budget < DynamicReasoningBudget {
+		return validateThinkingBudget(caps, budget)
+	}
+	if !caps.SupportsReasoningBudget(defaultSupportsReasoningBudget(caps.Model())) {
+		if budget != DynamicReasoningBudget {
+			if level := effortToThinkingLevel(caps, thinkingLevelFromBudget(budget)); level != "" {
+				config.ThinkingConfig.ThinkingLevel = schemas.Ptr(level)
+			}
+		}
+		return nil
+	}
+	if budget == DynamicReasoningBudget {
+		config.ThinkingConfig.ThinkingBudget = schemas.Ptr(int32(DynamicReasoningBudget))
+		return nil
+	}
+	if err := validateThinkingBudget(caps, budget); err != nil {
+		return err
+	}
+	config.ThinkingConfig.ThinkingBudget = schemas.Ptr(int32(budget))
+	return nil
+}
+
+func getThinkingBudgetRange(caps schemas.ModelCaps, defaultMaxTokens int) thinkingBudgetRange {
+	min, max, _ := caps.ReasoningBudgetRange(defaultMaxTokens, providerUtils.KnownGeminiReasoningBudget(caps.Model()))
+	return thinkingBudgetRange{Min: min, Max: max}
 }
 
 // validateThinkingBudget returns an error if the explicit thinking budget is outside the
-// model's allowed range. Budget 0 (disable) and -1 (dynamic) are always valid.
-// Models not present in thinkingBudgetRanges are skipped — limits are only enforced
-// for models whose ranges are explicitly known.
-func validateThinkingBudget(model string, budget int) error {
-	if budget == 0 || budget == DynamicReasoningBudget {
-		return nil // 0 = disable thinking, -1 = dynamic
+// model's allowed range. Budget 0 (disable) is always valid; -1 (dynamic) is valid unless
+// a datasheet row says otherwise. Models with no known range are skipped — limits are only
+// enforced when the datasheet or the static fallback publishes one.
+func validateThinkingBudget(caps schemas.ModelCaps, budget int) error {
+	if budget == 0 {
+		return nil // disable thinking
+	}
+	if budget == DynamicReasoningBudget {
+		if caps.SupportsDynamicReasoningBudget(true) {
+			return nil
+		}
+		return fmt.Errorf("thinking budget -1 (dynamic) is not supported for model %s", caps.Model())
 	}
 	if budget < 0 {
 		return fmt.Errorf("thinking budget %d is invalid; only 0 and -1 are supported special values", budget)
 	}
-	modelLower := strings.ToLower(model)
-
-	var budgetRange thinkingBudgetRange
-	found := false
-	for _, entry := range thinkingBudgetRanges {
-		if strings.Contains(modelLower, entry.prefix) {
-			budgetRange = entry.r
-			found = true
-			break
-		}
-	}
-	if !found {
+	min, max, ok := caps.ReasoningBudgetRange(0, providerUtils.KnownGeminiReasoningBudget(caps.Model()))
+	if !ok {
 		return nil // skip validation
 	}
-	if budget < budgetRange.Min {
-		return fmt.Errorf("thinking budget %d is below the minimum of %d for model %s", budget, budgetRange.Min, model)
+	if budget < min {
+		return fmt.Errorf("thinking budget %d is below the minimum of %d for model %s", budget, min, caps.Model())
 	}
-	if budget > budgetRange.Max {
-		return fmt.Errorf("thinking budget %d exceeds the maximum of %d for model %s", budget, budgetRange.Max, model)
+	if budget > max {
+		return fmt.Errorf("thinking budget %d exceeds the maximum of %d for model %s", budget, max, caps.Model())
 	}
 	return nil
 }
 
-func (r *GeminiGenerationRequest) convertGenerationConfigToResponsesParameters() *schemas.ResponsesParameters {
+// capModel is the provider-stripped model used for catalog and capability
+// lookups; r.Model keeps the wire form, which still carries the prefix some
+// checks below rely on.
+func (r *GeminiGenerationRequest) convertGenerationConfigToResponsesParameters(provider schemas.ModelProvider, capModel string) *schemas.ResponsesParameters {
 	params := &schemas.ResponsesParameters{
 		ExtraParams: make(map[string]interface{}),
 	}
@@ -263,6 +633,9 @@ func (r *GeminiGenerationRequest) convertGenerationConfigToResponsesParameters()
 	if config.MaxOutputTokens > 0 {
 		params.MaxOutputTokens = schemas.Ptr(int(config.MaxOutputTokens))
 	}
+	if config.MediaResolution != "" {
+		params.ExtraParams["media_resolution"] = config.MediaResolution
+	}
 	if config.ThinkingConfig != nil {
 		params.Reasoning = &schemas.ResponsesParametersReasoning{}
 		if strings.Contains(r.Model, "openai") {
@@ -270,11 +643,11 @@ func (r *GeminiGenerationRequest) convertGenerationConfigToResponsesParameters()
 		}
 
 		// Determine max tokens for conversions
-		maxTokens := providerUtils.GetMaxOutputTokensOrDefault(r.Model, DefaultCompletionMaxTokens)
+		maxTokens := providerUtils.GetMaxOutputTokensOrDefault(provider, capModel, DefaultCompletionMaxTokens)
 		if config.MaxOutputTokens > 0 {
 			maxTokens = int(config.MaxOutputTokens)
 		}
-		budgetRange := getThinkingBudgetRange(r.Model, maxTokens)
+		budgetRange := getThinkingBudgetRange(schemas.ResolveModelCaps(provider, capModel), maxTokens)
 
 		// Priority: Budget first (if present), then Level
 		if config.ThinkingConfig.ThinkingBudget != nil {
@@ -536,6 +909,12 @@ func convertSchemaToOrderedMap(schema *Schema) *schemas.OrderedMap {
 	if schema.MaxItems != nil {
 		result.Set("maxItems", *schema.MaxItems)
 	}
+	if schema.MinProperties != nil {
+		result.Set("minProperties", *schema.MinProperties)
+	}
+	if schema.MaxProperties != nil {
+		result.Set("maxProperties", *schema.MaxProperties)
+	}
 	if schema.Minimum != nil {
 		result.Set("minimum", *schema.Minimum)
 	}
@@ -708,6 +1087,7 @@ var (
 		FinishReasonTooManyToolCalls:        "stop",
 		FinishReasonMissingThoughtSignature: "stop",
 		FinishReasonMalformedResponse:       "stop",
+		FinishReasonContinuation:            "continuation",
 	}
 
 	// Maps Bifrost canonical finish reasons back to the most representative Gemini finish reason
@@ -716,6 +1096,7 @@ var (
 		"length":         FinishReasonMaxTokens,
 		"content_filter": FinishReasonSafety,
 		"tool_calls":     FinishReasonStop,
+		"continuation":   FinishReasonContinuation,
 	}
 )
 
@@ -725,6 +1106,36 @@ func ConvertGeminiFinishReasonToBifrost(providerReason FinishReason) string {
 		return bifrostReason
 	}
 	return string(providerReason)
+}
+
+// geminiResponsesStatus derives the Responses status and incomplete_details from a
+// stop reason already converted by ConvertGeminiFinishReasonToBifrost. Error finish
+// reasons are handled by the callers (status "failed") before this is consulted.
+func geminiResponsesStatus(stopReason string) (*string, *schemas.ResponsesResponseIncompleteDetails) {
+	status, details, mapped := schemas.ResponsesStatusFromFinishReason(stopReason)
+	if !mapped {
+		// A finish reason with no Responses equivalent is not a confirmed clean finish.
+		return schemas.Ptr(schemas.ResponsesResponseStatusIncomplete), nil
+	}
+	return &status, details
+}
+
+// promptBlockError returns the Responses error for a prompt Gemini refused before generating
+// (promptFeedback.blockReason set, no candidates), or nil when the prompt was not blocked.
+// invalid_prompt is OpenAI's ResponseError code for a refused prompt.
+func (response *GenerateContentResponse) promptBlockError() *schemas.ResponsesResponseError {
+	feedback := response.PromptFeedback
+	if feedback == nil || len(response.Candidates) > 0 || feedback.BlockReason == "" || feedback.BlockReason == "BLOCK_REASON_UNSPECIFIED" {
+		return nil
+	}
+	message := feedback.BlockReasonMessage
+	if message == "" {
+		message = feedback.BlockReason
+	}
+	return &schemas.ResponsesResponseError{
+		Code:    "invalid_prompt",
+		Message: message,
+	}
 }
 
 // ConvertBifrostFinishReasonToGemini converts Bifrost canonical finish reasons back to Gemini format.
@@ -966,6 +1377,15 @@ func convertGeminiUsageMetadataToImageUsage(metadata *GenerateContentResponseUsa
 		usage.OutputTokensDetails = outputDetails
 	}
 
+	// thoughtsTokenCount sits outside candidatesTokenCount; fold it into output like the chat and responses converters
+	if metadata.ThoughtsTokenCount > 0 {
+		if usage.OutputTokensDetails == nil {
+			usage.OutputTokensDetails = &schemas.ImageTokenDetails{}
+		}
+		usage.OutputTokensDetails.ReasoningTokens = int(metadata.ThoughtsTokenCount)
+		usage.OutputTokens += int(metadata.ThoughtsTokenCount)
+	}
+
 	return usage
 }
 
@@ -979,6 +1399,10 @@ func convertBifrostImageUsageToGeminiUsageMetadata(usage *schemas.ImageUsage) *G
 		PromptTokenCount:     int32(usage.InputTokens),
 		CandidatesTokenCount: int32(usage.OutputTokens),
 		TotalTokenCount:      int32(usage.TotalTokens),
+	}
+	if usage.OutputTokensDetails != nil && usage.OutputTokensDetails.ReasoningTokens > 0 {
+		metadata.ThoughtsTokenCount = int32(usage.OutputTokensDetails.ReasoningTokens)
+		metadata.CandidatesTokenCount -= metadata.ThoughtsTokenCount
 	}
 
 	// Process input token details to PromptTokensDetails
@@ -1134,7 +1558,7 @@ func ConvertBifrostResponsesUsageToGeminiUsageMetadata(usage *schemas.ResponsesR
 }
 
 // convertParamsToGenerationConfig converts Bifrost parameters to Gemini GenerationConfig
-func convertParamsToGenerationConfig(params *schemas.ChatParameters, responseModalities []string, model string) (GenerationConfig, error) {
+func convertParamsToGenerationConfig(params *schemas.ChatParameters, responseModalities []string, provider schemas.ModelProvider, model string) (GenerationConfig, error) {
 	config := GenerationConfig{}
 
 	// Add response modalities if specified
@@ -1147,6 +1571,12 @@ func convertParamsToGenerationConfig(params *schemas.ChatParameters, responseMod
 	}
 
 	// Map standard parameters
+	if params.N != nil {
+		if *params.N < 1 || *params.N > math.MaxInt32 {
+			return config, fmt.Errorf("n must be between 1 and %d for Gemini candidateCount, got %d", math.MaxInt32, *params.N)
+		}
+		config.CandidateCount = int32(*params.N)
+	}
 	if params.Stop != nil {
 		config.StopSequences = params.Stop
 	}
@@ -1170,50 +1600,41 @@ func convertParamsToGenerationConfig(params *schemas.ChatParameters, responseMod
 		config.FrequencyPenalty = &penalty
 	}
 	// Only set ThinkingConfig if the model actually supports thinking
-	if params.Reasoning != nil && supportsThinkingConfig(model) {
+	caps := schemas.ResolveModelCaps(provider, model)
+	if params.Reasoning != nil && caps.SupportsReasoning(defaultSupportsReasoning(model)) {
 		config.ThinkingConfig = &GenerationConfigThinkingConfig{
 			IncludeThoughts: true,
 		}
 
 		hasMaxTokens := params.Reasoning.MaxTokens != nil
 		hasEffort := params.Reasoning.Effort != nil
-		supportsLevel := isGemini3Plus(model) // Check if model is 3.0+
+		supportsLevel := caps.SupportsReasoningEffort(isGemini3Plus(model)) // thinkingLevel vs thinkingBudget
 
 		// PRIORITY RULE: If both max_tokens and effort are present, use ONLY max_tokens (budget)
 		// This ensures we send only thinkingBudget to Gemini, not thinkingLevel
 
 		// Handle "none" effort explicitly (only if max_tokens not present)
 		if !hasMaxTokens && hasEffort && *params.Reasoning.Effort == "none" {
-			config.ThinkingConfig.IncludeThoughts = false
-			config.ThinkingConfig.ThinkingBudget = schemas.Ptr(int32(0))
+			setThinkingBudgetZeroIfSupported(&config, caps)
 		} else if hasMaxTokens {
-			// User provided max_tokens - use thinkingBudget (all Gemini models support this)
+			// User provided max_tokens - use thinkingBudget, or the nearest level on models without one
 			// If both max_tokens and effort are present, we ignore effort and use ONLY max_tokens
-			budget := *params.Reasoning.MaxTokens
-			switch budget {
-			case 0:
-				config.ThinkingConfig.IncludeThoughts = false
-				config.ThinkingConfig.ThinkingBudget = schemas.Ptr(int32(0))
-			case DynamicReasoningBudget: // Special case: -1 means dynamic budget
-				config.ThinkingConfig.ThinkingBudget = schemas.Ptr(int32(DynamicReasoningBudget))
-			default:
-				if err := validateThinkingBudget(model, budget); err != nil {
-					return config, err
-				}
-				config.ThinkingConfig.ThinkingBudget = schemas.Ptr(int32(budget))
+			if err := applyThinkingBudget(&config, caps, *params.Reasoning.MaxTokens); err != nil {
+				return config, err
 			}
 		} else if hasEffort {
 			// User provided effort only (no max_tokens)
 			if supportsLevel {
 				// Gemini 3.0+ - use thinkingLevel (more native)
-				level := effortToThinkingLevel(*params.Reasoning.Effort, model)
-				config.ThinkingConfig.ThinkingLevel = &level
+				if level := effortToThinkingLevel(caps, *params.Reasoning.Effort); level != "" {
+					config.ThinkingConfig.ThinkingLevel = &level
+				}
 			} else {
-				maxTokens := providerUtils.GetMaxOutputTokensOrDefault(model, DefaultCompletionMaxTokens)
+				maxTokens := providerUtils.GetMaxOutputTokensOrDefault(provider, model, DefaultCompletionMaxTokens)
 				if config.MaxOutputTokens > 0 {
 					maxTokens = int(config.MaxOutputTokens)
 				}
-				budgetRange := getThinkingBudgetRange(model, maxTokens)
+				budgetRange := getThinkingBudgetRange(caps, maxTokens)
 				// Gemini < 3.0 - must convert effort to budget
 				budgetTokens, err := providerUtils.GetBudgetTokensFromReasoningEffort(
 					*params.Reasoning.Effort,
@@ -1227,23 +1648,17 @@ func convertParamsToGenerationConfig(params *schemas.ChatParameters, responseMod
 		}
 	}
 	// Handle response_format to response_schema conversion
-	if params.ResponseFormat != nil {
-		formatMap, ok := (*params.ResponseFormat).(map[string]interface{})
-		if ok {
-			formatType, typeOk := formatMap["type"].(string)
-			if typeOk {
-				switch formatType {
-				case "json_schema":
-					// OpenAI Structured Outputs: {"type": "json_schema", "json_schema": {...}}
-					if schemaMap := extractSchemaMapFromResponseFormat(params.ResponseFormat); schemaMap != nil {
-						config.ResponseMIMEType = "application/json"
-						config.ResponseJSONSchema = schemaMap
-					}
-				case "json_object":
-					// Maps to Gemini's responseMimeType without schema
-					config.ResponseMIMEType = "application/json"
-				}
+	if rf, ok := schemas.ParseChatResponseFormat(params.ResponseFormat); ok {
+		switch rf.Type {
+		case "json_schema":
+			// OpenAI Structured Outputs: {"type": "json_schema", "json_schema": {...}}
+			if schemaMap := extractSchemaMapFromResponseFormat(params.ResponseFormat); schemaMap != nil {
+				config.ResponseMIMEType = "application/json"
+				config.ResponseJSONSchema = schemaMap
 			}
+		case "json_object":
+			// Maps to Gemini's responseMimeType without schema
+			config.ResponseMIMEType = "application/json"
 		}
 	}
 	if params.ExtraParams != nil {
@@ -1275,18 +1690,26 @@ func convertParamsToGenerationConfig(params *schemas.ChatParameters, responseMod
 			config.Logprobs = schemas.Ptr(int32(topLogProbs))
 		}
 	}
-	// Gemini 2.5 and earlier reject function declarations sent together with
-	// responseMimeType "application/json" (structured output / JSON mode). That
-	// pairing is only supported on Gemini 3.x. Keep function calling working by
-	// dropping the JSON response-format hint for older models.
-	// Docs: https://ai.google.dev/gemini-api/docs/structured-output
-	if len(params.Tools) > 0 &&
-		config.ResponseMIMEType == "application/json" &&
-		!isGemini3Plus(model) {
-		config.ResponseMIMEType = ""
-		config.ResponseJSONSchema = nil
-	}
+	dropJSONResponseFormatWithToolsIfUnsupported(&config, len(params.Tools) > 0, caps, model)
 	return config, nil
+}
+
+// dropJSONResponseFormatWithToolsIfUnsupported clears the JSON response format when
+// tools ride along on a model that cannot combine them. Gemini 2.5 and earlier reject
+// function declarations sent together with responseMimeType "application/json"
+// (structured output / JSON mode); the pairing is only supported on Gemini 3.x. Function
+// calling is kept working by dropping the JSON response-format hint for older models.
+// Shared by the chat and Responses converters so the two paths cannot drift.
+// Docs: https://ai.google.dev/gemini-api/docs/structured-output
+func dropJSONResponseFormatWithToolsIfUnsupported(config *GenerationConfig, hasTools bool, caps schemas.ModelCaps, model string) {
+	if !hasTools || config.ResponseMIMEType != "application/json" {
+		return
+	}
+	if caps.SupportsResponseSchemaWithTools(isGemini3Plus(model)) {
+		return
+	}
+	config.ResponseMIMEType = ""
+	config.ResponseJSONSchema = nil
 }
 
 // mapBifrostServiceTierToGemini converts a BifrostServiceTier to a Gemini ServiceTier.
@@ -1772,6 +2195,77 @@ func convertToolChoiceToToolConfig(toolChoice *schemas.ChatToolChoice) *ToolConf
 	return config
 }
 
+// countGeminiSearchQueries returns the number of billable Google Search units for a
+// grounded response, or nil when the response was not grounded. Gemini 3+ is billed per
+// search query the model executed; Gemini 2.5 and older are billed per grounded prompt
+// however many queries ran. Empty queries are not billable and duplicates count once.
+func countGeminiSearchQueries(metadata *GroundingMetadata, model string) *int {
+	if metadata == nil {
+		return nil
+	}
+	unique := make(map[string]struct{}, len(metadata.WebSearchQueries))
+	for _, query := range metadata.WebSearchQueries {
+		if trimmed := strings.TrimSpace(query); trimmed != "" {
+			unique[trimmed] = struct{}{}
+		}
+	}
+	if len(unique) == 0 {
+		return nil
+	}
+	if !isGemini3Plus(model) {
+		return new(1)
+	}
+	return new(len(unique))
+}
+
+// applyGeminiSearchQueryChatUsage records billable Google Search units on chat usage so
+// CalculateCost can charge the per-query search fee.
+func applyGeminiSearchQueryChatUsage(usage *schemas.BifrostLLMUsage, metadata *GroundingMetadata, model string) {
+	count := countGeminiSearchQueries(metadata, model)
+	if usage == nil || count == nil {
+		return
+	}
+	if usage.CompletionTokensDetails == nil {
+		usage.CompletionTokensDetails = &schemas.ChatCompletionTokensDetails{}
+	}
+	usage.CompletionTokensDetails.NumSearchQueries = count
+	usage.ToolUsage = &schemas.ToolUsage{WebSearch: &schemas.WebSearchToolUsage{NumRequests: *count}}
+}
+
+// applyGeminiSearchQueryResponsesUsage is the Responses-shaped counterpart of
+// applyGeminiSearchQueryChatUsage.
+func applyGeminiSearchQueryResponsesUsage(usage *schemas.ResponsesResponseUsage, metadata *GroundingMetadata, model string) {
+	count := countGeminiSearchQueries(metadata, model)
+	if usage == nil || count == nil {
+		return
+	}
+	if usage.OutputTokensDetails == nil {
+		usage.OutputTokensDetails = &schemas.ResponsesResponseOutputTokens{}
+	}
+	usage.OutputTokensDetails.NumSearchQueries = count
+	usage.ToolUsage = &schemas.ToolUsage{WebSearch: &schemas.WebSearchToolUsage{NumRequests: *count}}
+}
+
+// applyServerSideToolInvocations opts the request into Gemini's tool combination mode,
+// which is what lets built-in tools (Google Search) run in the same turn as function
+// declarations. Gemini rejects AUTO in this mode, so an existing AUTO (or unset, which
+// the server treats as AUTO) is promoted to VALIDATED. A functionCallingConfig is never
+// synthesized here — Gemini rejects one without function declarations.
+func applyServerSideToolInvocations(req *GeminiGenerationRequest) {
+	if req == nil {
+		return
+	}
+	if req.ToolConfig == nil {
+		req.ToolConfig = &ToolConfig{}
+	}
+	req.ToolConfig.IncludeServerSideToolInvocations = schemas.Ptr(true)
+	if fc := req.ToolConfig.FunctionCallingConfig; fc != nil {
+		if fc.Mode == FunctionCallingConfigModeAuto || fc.Mode == "" {
+			fc.Mode = FunctionCallingConfigModeValidated
+		}
+	}
+}
+
 // addSpeechConfigToGenerationConfig adds speech configuration to the generation config
 func addSpeechConfigToGenerationConfig(config *GenerationConfig, voiceConfig *schemas.SpeechVoiceInput) {
 	speechConfig := SpeechConfig{}
@@ -1807,13 +2301,46 @@ func addSpeechConfigToGenerationConfig(config *GenerationConfig, voiceConfig *sc
 	config.SpeechConfig = &speechConfig
 }
 
+// inlineGeminiChatSystemReminder is the Chat Completions twin of inlineGeminiSystemReminder: a
+// mid-conversation role:"system" chat message rendered as a user turn, each text wrapped in the
+// <system-reminder> envelope, kept at its original position. Text-only, like the systemInstruction
+// branch it replaces for these messages. Returns nil when the message yields no text.
+func inlineGeminiChatSystemReminder(message schemas.ChatMessage) *Content {
+	if message.Content == nil {
+		return nil
+	}
+	wrap := func(text string) *Part {
+		return &Part{Text: "<system-reminder>\n" + text + "\n</system-reminder>\n"}
+	}
+	content := &Content{Role: "user"}
+	if message.Content.ContentStr != nil {
+		if *message.Content.ContentStr != "" {
+			content.Parts = append(content.Parts, wrap(*message.Content.ContentStr))
+		}
+	} else if message.Content.ContentBlocks != nil {
+		for _, block := range message.Content.ContentBlocks {
+			if block.Text != nil && *block.Text != "" {
+				content.Parts = append(content.Parts, wrap(*block.Text))
+			}
+		}
+	}
+	if len(content.Parts) == 0 {
+		return nil
+	}
+	return content
+}
+
 // convertBifrostMessagesToGemini converts Bifrost messages to Gemini format
-func convertBifrostMessagesToGemini(messages []schemas.ChatMessage) ([]Content, *Content) {
+func convertBifrostMessagesToGemini(messages []schemas.ChatMessage, allowedImageURLSchemes ...string) ([]Content, *Content, error) {
+	if len(allowedImageURLSchemes) == 0 {
+		allowedImageURLSchemes = defaultGeminiImageURLSchemes
+	}
+
 	// if only system / developer message is there, convert it to user message (since openai allows it)
 	if len(messages) == 1 && (messages[0].Role == schemas.ChatMessageRoleSystem || messages[0].Role == schemas.ChatMessageRoleDeveloper) {
 		content := convertSystemChatMessageToGeminiUserContent(messages[0])
 		if len(content.Parts) > 0 {
-			return []Content{content}, nil
+			return []Content{content}, nil, nil
 		}
 	}
 
@@ -1826,10 +2353,34 @@ func convertBifrostMessagesToGemini(messages []schemas.ChatMessage) ([]Content, 
 	// Map callID to function name for correlating tool responses with function declarations
 	callIDToFunctionName := make(map[string]string)
 
+	// Set once the leading system prompt ends (first non-system message). A system/developer
+	// message after that point is a mid-conversation reminder and is inlined in place as a
+	// user turn (see inlineGeminiChatSystemReminder) rather than hoisted into systemInstruction,
+	// which renders ahead of every message and, when it grows by one reminder per turn,
+	// invalidates Gemini's prefix-based implicit cache for the whole conversation behind it.
+	// Same rule as the Responses path (inlineGeminiSystemReminder).
+	seenNonSystemMessage := false
+
 	for i, message := range messages {
+		isSystemMessage := message.Role == schemas.ChatMessageRoleSystem || message.Role == schemas.ChatMessageRoleDeveloper
+		if !isSystemMessage {
+			seenNonSystemMessage = true
+		}
+		if isSystemMessage && seenNonSystemMessage {
+			// Flush first: the reminder is a user turn of its own and must not be filed
+			// behind function responses that precede it.
+			if len(pendingToolResponseParts) > 0 {
+				contents = append(contents, Content{Parts: pendingToolResponseParts, Role: "user"})
+				pendingToolResponseParts = nil
+			}
+			if inlined := inlineGeminiChatSystemReminder(message); inlined != nil {
+				contents = append(contents, *inlined)
+			}
+			continue
+		}
 		// Handle system messages separately - Gemini requires them in SystemInstruction field
 		// Gemini has no support for role "developer", so we treat it as "system"
-		if message.Role == schemas.ChatMessageRoleSystem || message.Role == schemas.ChatMessageRoleDeveloper {
+		if isSystemMessage {
 			if systemInstruction == nil {
 				systemInstruction = &Content{}
 			}
@@ -1874,14 +2425,14 @@ func convertBifrostMessagesToGemini(messages []schemas.ChatMessage) ([]Content, 
 			var responseData json.RawMessage
 			var contentStr string
 
-			if message.Content != nil {
+			if content := schemas.FlattenToolResultMedia(message.Content, nil); content != nil {
 				// Extract content string from ContentStr or ContentBlocks
-				if message.Content.ContentStr != nil && *message.Content.ContentStr != "" {
-					contentStr = *message.Content.ContentStr
-				} else if message.Content.ContentBlocks != nil {
+				if content.ContentStr != nil && *content.ContentStr != "" {
+					contentStr = *content.ContentStr
+				} else if content.ContentBlocks != nil {
 					// Fallback: try to extract text from content blocks
 					var textParts []string
-					for _, block := range message.Content.ContentBlocks {
+					for _, block := range content.ContentBlocks {
 						if block.Text != nil && *block.Text != "" {
 							textParts = append(textParts, *block.Text)
 						}
@@ -1892,14 +2443,15 @@ func convertBifrostMessagesToGemini(messages []schemas.ChatMessage) ([]Content, 
 				}
 			}
 
-			// Try to use raw JSON if it's a valid JSON object (Gemini requires Struct/object)
+			// Try to use raw JSON if it's a valid JSON object (Gemini requires Struct/object).
+			// An object carrying a "$ref" key anywhere is wrapped instead: see containsJSONRefKey.
 			if contentStr != "" {
 				var buf bytes.Buffer
-				if err := json.Compact(&buf, []byte(contentStr)); err == nil && buf.Len() > 0 && buf.Bytes()[0] == '{' {
-					// Valid JSON object — use raw bytes directly
+				if err := json.Compact(&buf, []byte(contentStr)); err == nil && buf.Len() > 0 && buf.Bytes()[0] == '{' && !containsJSONRefKey(buf.Bytes()) {
+					// Valid JSON object without reserved keys — use raw bytes directly
 					responseData = json.RawMessage(buf.Bytes())
 				} else {
-					// Not valid JSON or not an object — wrap to preserve content
+					// Not valid JSON, not an object, or holds "$ref" — wrap to preserve content
 					responseData, _ = providerUtils.MarshalSorted(map[string]any{
 						"content": contentStr,
 					})
@@ -1925,7 +2477,9 @@ func convertBifrostMessagesToGemini(messages []schemas.ChatMessage) ([]Content, 
 			// This ensures the number of functionResponse parts equals functionCall parts
 			pendingToolResponseParts = append(pendingToolResponseParts, &Part{
 				FunctionResponse: &FunctionResponse{
-					ID:       callID,
+					// Stripped to match the FunctionCall.ID sent for this call, so the two
+					// still pair up. The lookup above still uses the full id as its key.
+					ID:       providerUtils.StripThoughtSignature(callID),
 					Name:     functionName,
 					Response: responseData,
 				},
@@ -1961,16 +2515,16 @@ func convertBifrostMessagesToGemini(messages []schemas.ChatMessage) ([]Content, 
 					} else if block.File != nil {
 						// Handle file blocks - use FileURL if available (uploaded file)
 						if block.File.FileURL != nil && *block.File.FileURL != "" {
-							mimeType := "application/pdf"
+							// Prefer the caller's MIMEType; otherwise take whatever the URI itself
+							// states. Vertex rejects a fileData with no mimeType outright, and the
+							// OpenAI dialect has no field to carry one - see mimeTypeFromURI.
+							fileData := &FileData{FileURI: *block.File.FileURL}
 							if block.File.FileType != nil {
-								mimeType = *block.File.FileType
+								fileData.MIMEType = *block.File.FileType
+							} else {
+								fileData.MIMEType = mimeTypeFromURI(*block.File.FileURL)
 							}
-							parts = append(parts, &Part{
-								FileData: &FileData{
-									FileURI:  *block.File.FileURL,
-									MIMEType: mimeType,
-								},
-							})
+							parts = append(parts, &Part{FileData: fileData})
 						} else if block.File.FileData != nil {
 							// Inline file data - convert to InlineData (Blob)
 							fileData := *block.File.FileData
@@ -1999,10 +2553,9 @@ func convertBifrostMessagesToGemini(messages []schemas.ChatMessage) ([]Content, 
 						imageURL := block.ImageURLStruct.URL
 
 						// Sanitize and parse the image URL
-						sanitizedURL, err := schemas.SanitizeImageURL(imageURL)
+						sanitizedURL, err := schemas.SanitizeImageURLWithAllowedSchemes(imageURL, allowedImageURLSchemes...)
 						if err != nil {
-							// Skip this block if URL is invalid
-							continue
+							return nil, nil, fmt.Errorf("failed to sanitize image URL: %w", err)
 						}
 
 						urlInfo := schemas.ExtractURLTypeInfo(sanitizedURL)
@@ -2100,12 +2653,17 @@ func convertBifrostMessagesToGemini(messages []schemas.ChatMessage) ([]Content, 
 
 					part := &Part{
 						FunctionCall: &FunctionCall{
-							ID:   callID,
+							// Send Gemini the id it issued. The signature extracted above
+							// travels in the dedicated thoughtSignature field, so leaving it
+							// joined to the id as well would ship a ~500-char id whose base64
+							// tail the model can read and echo into its own output.
+							ID:   providerUtils.StripThoughtSignature(callID),
 							Name: *toolCall.Function.Name,
 							Args: argsRaw,
 						},
 					}
-					// Store the mapping for later use in FunctionResponse
+					// Store the mapping for later use in FunctionResponse. Keyed on the full
+					// id, which is what the client echoes back on the tool result message.
 					callIDToFunctionName[callID] = *toolCall.Function.Name
 
 					// Decode thought signature if extracted from ID
@@ -2164,7 +2722,7 @@ func convertBifrostMessagesToGemini(messages []schemas.ChatMessage) ([]Content, 
 		}
 	}
 
-	return contents, systemInstruction
+	return contents, systemInstruction, nil
 }
 
 func convertSystemChatMessageToGeminiUserContent(message schemas.ChatMessage) Content {
@@ -2271,8 +2829,8 @@ func buildJSONSchemaFromMap(schemaMap map[string]interface{}) *schemas.Responses
 	}
 
 	// Extract properties
-	if properties, ok := normalizedSchemaMap["properties"].(map[string]interface{}); ok {
-		jsonSchema.Properties = &properties
+	if properties, ok := schemas.SafeExtractOrderedMap(normalizedSchemaMap["properties"]); ok {
+		jsonSchema.Properties = properties
 	}
 
 	// Extract required fields
@@ -2316,13 +2874,13 @@ func buildJSONSchemaFromMap(schemaMap map[string]interface{}) *schemas.Responses
 	}
 
 	// Extract $defs (JSON Schema draft 2019-09+)
-	if defs, ok := normalizedSchemaMap["$defs"].(map[string]interface{}); ok {
-		jsonSchema.Defs = &defs
+	if defs, ok := schemas.SafeExtractOrderedMap(normalizedSchemaMap["$defs"]); ok {
+		jsonSchema.Defs = defs
 	}
 
 	// Extract definitions (legacy JSON Schema draft-07)
-	if definitions, ok := normalizedSchemaMap["definitions"].(map[string]interface{}); ok {
-		jsonSchema.Definitions = &definitions
+	if definitions, ok := schemas.SafeExtractOrderedMap(normalizedSchemaMap["definitions"]); ok {
+		jsonSchema.Definitions = definitions
 	}
 
 	// Extract $ref
@@ -2331,8 +2889,8 @@ func buildJSONSchemaFromMap(schemaMap map[string]interface{}) *schemas.Responses
 	}
 
 	// Extract items (array element schema)
-	if items, ok := normalizedSchemaMap["items"].(map[string]interface{}); ok {
-		jsonSchema.Items = &items
+	if items, ok := schemas.SafeExtractOrderedMap(normalizedSchemaMap["items"]); ok {
+		jsonSchema.Items = items
 	}
 
 	// Extract minItems
@@ -2347,10 +2905,10 @@ func buildJSONSchemaFromMap(schemaMap map[string]interface{}) *schemas.Responses
 
 	// Extract anyOf
 	if anyOf, ok := normalizedSchemaMap["anyOf"].([]interface{}); ok {
-		anyOfMaps := make([]map[string]any, 0, len(anyOf))
+		anyOfMaps := make([]schemas.OrderedMap, 0, len(anyOf))
 		for _, item := range anyOf {
-			if m, ok := item.(map[string]interface{}); ok {
-				anyOfMaps = append(anyOfMaps, m)
+			if om, ok := schemas.SafeExtractOrderedMap(item); ok {
+				anyOfMaps = append(anyOfMaps, *om)
 			}
 		}
 		if len(anyOfMaps) > 0 {
@@ -2360,10 +2918,10 @@ func buildJSONSchemaFromMap(schemaMap map[string]interface{}) *schemas.Responses
 
 	// Extract oneOf
 	if oneOf, ok := normalizedSchemaMap["oneOf"].([]interface{}); ok {
-		oneOfMaps := make([]map[string]any, 0, len(oneOf))
+		oneOfMaps := make([]schemas.OrderedMap, 0, len(oneOf))
 		for _, item := range oneOf {
-			if m, ok := item.(map[string]interface{}); ok {
-				oneOfMaps = append(oneOfMaps, m)
+			if om, ok := schemas.SafeExtractOrderedMap(item); ok {
+				oneOfMaps = append(oneOfMaps, *om)
 			}
 		}
 		if len(oneOfMaps) > 0 {
@@ -2373,10 +2931,10 @@ func buildJSONSchemaFromMap(schemaMap map[string]interface{}) *schemas.Responses
 
 	// Extract allOf
 	if allOf, ok := normalizedSchemaMap["allOf"].([]interface{}); ok {
-		allOfMaps := make([]map[string]any, 0, len(allOf))
+		allOfMaps := make([]schemas.OrderedMap, 0, len(allOf))
 		for _, item := range allOf {
-			if m, ok := item.(map[string]interface{}); ok {
-				allOfMaps = append(allOfMaps, m)
+			if om, ok := schemas.SafeExtractOrderedMap(item); ok {
+				allOfMaps = append(allOfMaps, *om)
 			}
 		}
 		if len(allOfMaps) > 0 {
@@ -2466,11 +3024,20 @@ func buildOpenAIResponseFormat(responseJsonSchema interface{}, responseSchema *S
 
 	// Try to use responseJsonSchema first
 	if responseJsonSchema != nil {
-		// Use responseJsonSchema directly if it's a map
-		var ok bool
-		schemaMap, ok = responseJsonSchema.(map[string]interface{})
-		if !ok {
-			// If not a map, fall back to json_object mode
+		// The schema may be a plain map or an order-preserving OrderedMap
+		// (e.g. when extracted from a Responses request).
+		switch tv := responseJsonSchema.(type) {
+		case map[string]interface{}:
+			schemaMap = tv
+		case *schemas.OrderedMap:
+			if tv != nil {
+				schemaMap = tv.ToMap() // shallow: nested OrderedMap values keep their order
+			}
+		case schemas.OrderedMap:
+			schemaMap = tv.ToMap()
+		}
+		if schemaMap == nil {
+			// Unsupported shape - fall back to json_object mode
 			return &schemas.ResponsesTextConfig{
 				Format: &schemas.ResponsesTextConfigFormat{
 					Type: "json_object",
@@ -2624,95 +3191,188 @@ func normalizeSchemaForGemini(schema map[string]interface{}) map[string]interfac
 	}
 
 	// Recursively normalize properties
-	if properties, ok := schema["properties"].(map[string]interface{}); ok {
+	switch properties := schema["properties"].(type) {
+	case map[string]interface{}:
 		newProps := make(map[string]interface{})
 		for key, prop := range properties {
-			if propMap, ok := prop.(map[string]interface{}); ok {
-				newProps[key] = normalizeSchemaForGemini(propMap)
-			} else {
-				newProps[key] = prop
-			}
+			newProps[key] = normalizeSchemaValueForGemini(prop)
 		}
+		normalized["properties"] = newProps
+	case *schemas.OrderedMap:
+		newProps := schemas.NewOrderedMapWithCapacity(properties.Len())
+		properties.Range(func(key string, prop interface{}) bool {
+			newProps.Set(key, normalizeSchemaValueForGemini(prop))
+			return true
+		})
+		normalized["properties"] = newProps
+	case schemas.OrderedMap:
+		newProps := schemas.NewOrderedMapWithCapacity(properties.Len())
+		properties.Range(func(key string, prop interface{}) bool {
+			newProps.Set(key, normalizeSchemaValueForGemini(prop))
+			return true
+		})
 		normalized["properties"] = newProps
 	}
 
 	// Recursively normalize items (for arrays)
-	if items, ok := schema["items"].(map[string]interface{}); ok {
-		normalized["items"] = normalizeSchemaForGemini(items)
+	switch schema["items"].(type) {
+	case map[string]interface{}, *schemas.OrderedMap, schemas.OrderedMap:
+		normalized["items"] = normalizeSchemaValueForGemini(schema["items"])
 	}
 
-	// Recursively normalize anyOf
-	if anyOf, ok := schema["anyOf"].([]interface{}); ok {
-		newAnyOf := make([]interface{}, 0, len(anyOf))
-		for _, item := range anyOf {
-			if itemMap, ok := item.(map[string]interface{}); ok {
-				newAnyOf = append(newAnyOf, normalizeSchemaForGemini(itemMap))
-			} else {
-				newAnyOf = append(newAnyOf, item)
-			}
+	// Recursively normalize composition fields (anyOf, oneOf, allOf), which may
+	// be []interface{} (JSON-decoded) or []schemas.OrderedMap (typed struct fields).
+	for _, key := range []string{"anyOf", "oneOf", "allOf"} {
+		switch schema[key].(type) {
+		case []interface{}, []schemas.OrderedMap:
+			normalized[key] = normalizeSchemaValueForGemini(schema[key])
 		}
-		normalized["anyOf"] = newAnyOf
-	}
-
-	// Recursively normalize oneOf
-	if oneOf, ok := schema["oneOf"].([]interface{}); ok {
-		newOneOf := make([]interface{}, 0, len(oneOf))
-		for _, item := range oneOf {
-			if itemMap, ok := item.(map[string]interface{}); ok {
-				newOneOf = append(newOneOf, normalizeSchemaForGemini(itemMap))
-			} else {
-				newOneOf = append(newOneOf, item)
-			}
-		}
-		normalized["oneOf"] = newOneOf
 	}
 
 	return normalized
 }
 
-// extractSchemaMapFromResponseFormat extracts the JSON schema map from OpenAI's response_format structure
-// This returns the raw schema map to be used with ResponseJSONSchema
-func extractSchemaMapFromResponseFormat(responseFormat *interface{}) map[string]interface{} {
-	formatMap, ok := (*responseFormat).(map[string]interface{})
+// normalizeSchemaValueForGemini applies normalizeSchemaForGemini to a schema
+// value that may be a plain map or an order-preserving OrderedMap; other values
+// pass through unchanged.
+func normalizeSchemaValueForGemini(v interface{}) interface{} {
+	switch tv := v.(type) {
+	case []interface{}:
+		out := make([]interface{}, len(tv))
+		for i, item := range tv {
+			out[i] = normalizeSchemaValueForGemini(item)
+		}
+		return out
+	case []schemas.OrderedMap:
+		out := make([]schemas.OrderedMap, len(tv))
+		for i := range tv {
+			if normalized := normalizeOrderedSchemaForGemini(&tv[i]); normalized != nil {
+				out[i] = *normalized
+			} else {
+				out[i] = tv[i]
+			}
+		}
+		return out
+	case map[string]interface{}:
+		return normalizeSchemaForGemini(tv)
+	case *schemas.OrderedMap:
+		return normalizeOrderedSchemaForGemini(tv)
+	case schemas.OrderedMap:
+		if normalized := normalizeOrderedSchemaForGemini(&tv); normalized != nil {
+			return *normalized
+		}
+		return tv
+	}
+	return v
+}
+
+// normalizeOrderedSchemaForGemini runs normalizeSchemaForGemini over an
+// OrderedMap schema while preserving the original key order. Keys added by
+// normalization (e.g. anyOf replacing a union type) are appended after the
+// original keys in sorted order for determinism.
+func normalizeOrderedSchemaForGemini(om *schemas.OrderedMap) *schemas.OrderedMap {
+	if om == nil {
+		return nil
+	}
+	normalized := normalizeSchemaForGemini(om.ToMap())
+	out := schemas.NewOrderedMapWithCapacity(om.Len())
+	for _, key := range om.Keys() {
+		if value, ok := normalized[key]; ok {
+			out.Set(key, value)
+			delete(normalized, key)
+		}
+	}
+	added := make([]string, 0, len(normalized))
+	for key := range normalized {
+		added = append(added, key)
+	}
+	sort.Strings(added)
+	for _, key := range added {
+		out.Set(key, normalized[key])
+	}
+	return out
+}
+
+// extractSchemaMapFromResponseFormat extracts the JSON schema from OpenAI's response_format
+// structure. The schema may be a plain map or an order-preserving OrderedMap (e.g. when built
+// from a Responses request); the result is used with ResponseJSONSchema.
+func extractSchemaMapFromResponseFormat(responseFormat *interface{}) interface{} {
+	rf, ok := schemas.ParseChatResponseFormat(responseFormat)
+	if !ok || rf.Type != "json_schema" {
+		return nil
+	}
+
+	// normalizeSchemaForGemini only rewrites union `type` arrays; on a schema
+	// without any, it is an identity transform. Detect that case and hand Gemini
+	// the client's own bytes instead of a re-encoding of them.
+	if raw := rf.RawSchema(); len(raw) > 0 && !schemaNeedsGeminiNormalization(raw) {
+		return raw
+	}
+
+	schemaObj, ok := rf.Schema()
 	if !ok {
 		return nil
 	}
 
-	formatType, ok := formatMap["type"].(string)
-	if !ok || formatType != "json_schema" {
-		return nil
+	switch schemaObj.(type) {
+	case map[string]interface{}, *schemas.OrderedMap, schemas.OrderedMap:
+		// Normalize the schema for Gemini compatibility
+		return normalizeSchemaValueForGemini(schemaObj)
 	}
+	return nil
+}
 
-	jsonSchemaObj, ok := formatMap["json_schema"].(map[string]interface{})
-	if !ok {
-		return nil
+// containsJSONRefKey reports whether any object nested anywhere in raw carries a "$ref" key.
+//
+// Gemini reads {"$ref": "<displayName>"} inside function_response.response as a pointer to a
+// multimodal part in function_response.parts and rejects the whole request with 400 ("does not
+// match to a display_name") when no such part exists. Tool output uses "$ref" for ordinary
+// reasons (JSON Schema, OpenAPI), so the converters send such a result as opaque text instead of
+// a structured object (#7694). There is deliberately no byte-level pre-check: JSON lets any
+// character of a key be written as a \uXXXX escape, and only the parser walk, which compares the
+// unescaped key, catches every spelling.
+func containsJSONRefKey(raw []byte) bool {
+	found := false
+	var walk func(v gjson.Result)
+	walk = func(v gjson.Result) {
+		isObject := v.IsObject()
+		v.ForEach(func(key, value gjson.Result) bool {
+			if isObject && key.String() == "$ref" {
+				found = true
+				return false
+			}
+			if value.IsObject() || value.IsArray() {
+				walk(value)
+			}
+			return !found
+		})
 	}
+	walk(gjson.ParseBytes(raw))
+	return found
+}
 
-	schemaObj, ok := jsonSchemaObj["schema"]
-	if !ok {
-		return nil
+// geminiFunctionOutputValue returns a function result for embedding under a key of
+// function_response.response: raw JSON when output is valid JSON with no "$ref" key at any
+// depth, otherwise the string itself so Gemini treats it as opaque text (#7694).
+func geminiFunctionOutputValue(output string) any {
+	if json.Valid([]byte(output)) && !containsJSONRefKey([]byte(output)) {
+		return json.RawMessage(output)
 	}
-
-	schemaMap, ok := schemaObj.(map[string]interface{})
-	if !ok {
-		return nil
-	}
-
-	// Normalize the schema for Gemini compatibility
-	return normalizeSchemaForGemini(schemaMap)
+	return output
 }
 
 // extractFunctionResponseOutput extracts the output text from a FunctionResponse.
-// It first tries to extract the "output" field if present, otherwise marshals the entire response.
-// Returns an empty string if the response is nil or extraction fails.
+// It unwraps only the documented {"output": X} envelope, where "output" is the sole key.
+// Any sibling field (stderr, ok, error, ...) means the whole object is the tool result,
+// so the raw response is returned intact rather than dropping the siblings.
+// Returns an empty string if the response is nil.
 func extractFunctionResponseOutput(funcResp *FunctionResponse) string {
 	if funcResp == nil || funcResp.Response == nil {
 		return ""
 	}
 
-	// Try to extract "output" field first
 	var respMap map[string]json.RawMessage
-	if err := sonic.Unmarshal(funcResp.Response, &respMap); err == nil {
+	if err := sonic.Unmarshal(funcResp.Response, &respMap); err == nil && len(respMap) == 1 {
 		if outputVal, ok := respMap["output"]; ok {
 			var outputStr string
 			if err := sonic.Unmarshal(outputVal, &outputStr); err == nil {
@@ -2722,7 +3382,7 @@ func extractFunctionResponseOutput(funcResp *FunctionResponse) string {
 		}
 	}
 
-	// If no "output" key or unmarshal failed, return raw JSON
+	// No sole "output" key, or not a JSON object: return the raw JSON
 	return string(funcResp.Response)
 }
 
@@ -2839,4 +3499,150 @@ func ConvertGeminiLogprobsResultToBifrost(result *LogprobsResult) *schemas.Bifro
 		}
 	}
 	return &schemas.BifrostLogProbs{Content: content}
+}
+
+// mimeTypeFromURI returns the IANA MIME type a URI's own file extension declares, or "" when the
+// URI does not state one.
+//
+// Vertex rejects a fileData part that carries no mimeType ("Unable to submit request because it
+// has an empty mimeType parameter in fileData"), while the Gemini API infers it. The OpenAI
+// dialect has no field for a file's type, so a PDF referenced by URL through /openai reached
+// Vertex typeless and 400'd - with a body byte-identical to the one gemini accepted.
+//
+// Deliberately NOT a default. Bifrost previously stamped every typeless fileData as
+// application/pdf, which sent a lie upstream for non-PDF content; filedata_mime_test.go pins that
+// bug shut. Reading an extension the caller already wrote is not the same as inventing a type, so
+// an extensionless URI - notably the Files API form https://.../v1beta/files/abc - still yields "".
+//
+// The table is explicit rather than mime.TypeByExtension because that consults the host's
+// /etc/mime.types and appends charset parameters, making the wire format depend on the machine
+// Bifrost happens to run on.
+var uriExtensionMIMETypes = map[string]string{
+	".pdf":  "application/pdf",
+	".txt":  "text/plain",
+	".csv":  "text/csv",
+	".md":   "text/markdown",
+	".html": "text/html",
+	".json": "application/json",
+	".xml":  "application/xml",
+	".png":  "image/png",
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".webp": "image/webp",
+	".gif":  "image/gif",
+	".heic": "image/heic",
+	".heif": "image/heif",
+	".mp3":  "audio/mpeg",
+	".wav":  "audio/wav",
+	".ogg":  "audio/ogg",
+	".flac": "audio/flac",
+	".aac":  "audio/aac",
+	".mp4":  "video/mp4",
+	".mov":  "video/quicktime",
+	".webm": "video/webm",
+	".avi":  "video/x-msvideo",
+	".mpeg": "video/mpeg",
+}
+
+func mimeTypeFromURI(uri string) string {
+	if uri == "" {
+		return ""
+	}
+	// Strip query and fragment first: "report.pdf?sig=abc" must still resolve, and a "." inside a
+	// query value must not be mistaken for the extension.
+	if i := strings.IndexAny(uri, "?#"); i >= 0 {
+		uri = uri[:i]
+	}
+	// Only the LAST path segment can carry the extension. Without this, a versioned directory such
+	// as "/v1.2/files/abc" would look like an ".2/files/abc" extension.
+	if i := strings.LastIndex(uri, "/"); i >= 0 {
+		uri = uri[i+1:]
+	}
+	dot := strings.LastIndex(uri, ".")
+	if dot < 0 {
+		return ""
+	}
+	return uriExtensionMIMETypes[strings.ToLower(uri[dot:])]
+}
+
+// schemaNeedsGeminiNormalization reports whether a raw JSON Schema contains any
+// `type` whose value is an array (e.g. ["string","null"]). That is the only
+// construct normalizeSchemaForGemini rewrites, so a schema without one can be
+// forwarded byte for byte instead of being decoded and re-encoded.
+func schemaNeedsGeminiNormalization(raw []byte) bool {
+	return resultNeedsGeminiNormalization(gjson.ParseBytes(raw))
+}
+
+// geminiTypeArrayNeedsRewrite reports whether normalizeSchemaForGemini would actually
+// change an array-valued "type", rather than reproduce it.
+//
+// The distinction matters because flagging every type array kept the very common nullable
+// shape ["string","null"] off the raw-bytes fast path, for a rewrite that reproduces the
+// same two entries -- and the decode/re-encode round trip that came with it reformatted
+// unrelated numeric literals elsewhere in the schema (1.50 arriving as 1.5).
+//
+// It mirrors extractTypesFromValue, which silently drops non-string entries: if any are
+// present the normalizer's output cannot equal the input, so that forces a rewrite too.
+func geminiTypeArrayNeedsRewrite(value gjson.Result) bool {
+	stringEntries, nonNull, foreign := 0, 0, 0
+	value.ForEach(func(_, entry gjson.Result) bool {
+		if entry.Type != gjson.String {
+			foreign++
+			return true
+		}
+		stringEntries++
+		if entry.String() != "null" {
+			nonNull++
+		}
+		return true
+	})
+
+	if foreign > 0 {
+		// Dropped by extractTypesFromValue, so the rewritten array differs from the input.
+		return true
+	}
+	if stringEntries <= 1 {
+		// normalizeSchemaForGemini's entire type block is guarded by len(types) > 1.
+		return false
+	}
+	if nonNull > 1 {
+		return true // multiple non-null types are rebuilt as anyOf
+	}
+	if nonNull == 0 {
+		return true // an all-null array collapses to the "null" scalar
+	}
+	// One non-null type beside null is rewritten to exactly two entries, so it is the
+	// identity only when the input already had exactly those two.
+	return stringEntries != 2
+}
+
+func resultNeedsGeminiNormalization(result gjson.Result) bool {
+	needs := false
+	switch {
+	case result.IsObject():
+		result.ForEach(func(key, value gjson.Result) bool {
+			if key.String() == "type" && value.IsArray() && geminiTypeArrayNeedsRewrite(value) {
+				needs = true
+				return false
+			}
+			if resultNeedsGeminiNormalization(value) {
+				needs = true
+				return false
+			}
+			return true
+		})
+	case result.IsArray():
+		result.ForEach(func(_, value gjson.Result) bool {
+			if resultNeedsGeminiNormalization(value) {
+				needs = true
+				return false
+			}
+			return true
+		})
+	}
+	return needs
+}
+
+func ptrEqual[T comparable](a, b *T) bool {
+	return a == b || (a != nil && b != nil && *a == *b)
 }

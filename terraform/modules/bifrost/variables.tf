@@ -31,6 +31,12 @@ variable "config_json_file" {
   default     = null
 }
 
+variable "schema_url" {
+  description = "Schema location written to config.json $schema. Override for isolated deployments that mirror the Bifrost schema internally. Accepts an HTTP(S) URL, file:// URL, or filesystem path. When null, an existing $schema in config_json/config_json_file is preserved, otherwise the public Bifrost schema URL is injected."
+  type        = string
+  default     = null
+}
+
 # --- Config: individual sections (each mirrors a top-level property from config.schema.json) ---
 variable "encryption_key" {
   description = "Encryption key for sensitive data. Accepts any string; a secure 32-byte AES-256 key will be derived using Argon2id KDF."
@@ -136,6 +142,18 @@ variable "websocket" {
   description = "WebSocket gateway configuration (max_connections_per_user, transcript_buffer_size, pool)."
   type        = any
   default     = null
+}
+
+variable "server" {
+  description = "HTTP server configuration (read_buffer_size, base_path, body_buffer_pool_limit_bytes, ...). Set base_path (e.g. \"/bifrost\") together with ingress_path to serve Bifrost under a URL prefix."
+  type        = any
+  default     = null
+}
+
+variable "ingress_path" {
+  description = "Path prefix the Kubernetes ingress routes to Bifrost (EKS, GKE, AKS, generic Kubernetes). Keep \"/\" to own the whole host; set it to the same value as server.base_path (e.g. \"/bifrost\") to serve under a prefix. Bifrost accepts requests with or without the prefix, so probes stay on /health."
+  type        = string
+  default     = "/"
 }
 
 # --- Image ---

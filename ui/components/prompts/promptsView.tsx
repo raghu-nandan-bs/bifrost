@@ -1,7 +1,9 @@
 import FullPageLoader from "@/components/fullPageLoader";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
+import { useIsMobile } from "@/hooks/use-mobile";
 import { AlertCircle, Loader2 } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { PromptSidebar } from "./fragments/sidebar";
 import { PlaygroundPanel } from "./fragments/playgroundPanel";
 import { SettingsPanel } from "./fragments/settingsPanel";
@@ -12,6 +14,8 @@ import PromptsViewHeader from "./components/promptsViewHeader";
 import { usePromptContext } from "./context";
 
 export default function PromptsView() {
+	const { t } = useTranslation("config");
+	const isMobile = useIsMobile();
 	const { folders, prompts, foldersLoading, promptsLoading, foldersError, promptsError, isLoadingPlayground, selectedPromptId } =
 		usePromptContext();
 
@@ -24,7 +28,7 @@ export default function PromptsView() {
 			<div className="no-padding-parent no-border-parent p-4">
 				<Alert variant="destructive">
 					<AlertCircle className="h-4 w-4" />
-					<AlertDescription>Failed to load prompt repository</AlertDescription>
+					<AlertDescription>{t("promptRepo.loadFailed")}</AlertDescription>
 				</Alert>
 			</div>
 		);
@@ -32,15 +36,51 @@ export default function PromptsView() {
 
 	if (folders.length === 0 && prompts.length === 0) {
 		return (
-			<div className="no-padding-parent no-border-parent flex h-[calc(100dvh_-_18px)] w-full items-center">
+			<div className="no-padding-parent no-border-parent flex h-[calc(var(--app-content-viewport)_-_var(--app-bottom-padding))] w-full items-center">
 				<PromptSheets />
 				<PromptsEmptyState />
 			</div>
 		);
 	}
 
+	if (isMobile) {
+		return (
+			<div className="no-padding-parent no-border-parent bg-background flex h-[calc(var(--app-content-viewport)_-_var(--app-bottom-padding))] w-full flex-col gap-2 overflow-auto">
+				<DeleteFolderDialog />
+				<DeletePromptDialog />
+				<PromptSheets />
+				<div className="bg-card max-h-[40dvh] shrink-0 overflow-auto rounded-md">
+					<PromptSidebar />
+				</div>
+				<div className="bg-card min-h-0 flex-1 overflow-auto rounded-md">
+					{selectedPromptId ? (
+						<div className="flex min-h-full flex-col">
+							<PromptsViewHeader />
+							{isLoadingPlayground ? (
+								<div className="flex flex-1 items-center justify-center">
+									<Loader2 className="text-muted-foreground h-5 w-5 animate-spin" />
+								</div>
+							) : (
+								<div className="flex flex-col">
+									<div className="min-h-[50dvh]">
+										<PlaygroundPanel />
+									</div>
+									<div className="border-t">
+										<SettingsPanel />
+									</div>
+								</div>
+							)}
+						</div>
+					) : (
+						<EmptyState />
+					)}
+				</div>
+			</div>
+		);
+	}
+
 	return (
-		<div className="no-padding-parent no-border-parent bg-background h-[calc(100dvh_-_16px)] w-full">
+		<div className="no-padding-parent no-border-parent bg-background h-[calc(var(--app-content-viewport)_-_var(--app-bottom-padding))] w-full">
 			<DeleteFolderDialog />
 			<DeletePromptDialog />
 			<PromptSheets />

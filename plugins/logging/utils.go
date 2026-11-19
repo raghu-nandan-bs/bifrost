@@ -3,11 +3,14 @@ package logging
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
+	"github.com/bytedance/sonic"
 	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/logstore"
@@ -61,6 +64,12 @@ type LogManager interface {
 	// GetProviderLatencyHistogram returns time-bucketed latency percentiles with provider breakdown for the given filters
 	GetProviderLatencyHistogram(ctx context.Context, filters *logstore.SearchFilters, bucketSizeSeconds int64) (*logstore.ProviderLatencyHistogramResult, error)
 
+	// GetThroughputHistogram returns time-bucketed token-generation throughput (tokens/sec) for the given filters
+	GetThroughputHistogram(ctx context.Context, filters *logstore.SearchFilters, bucketSizeSeconds int64) (*logstore.ThroughputHistogramResult, error)
+
+	// GetProviderThroughputHistogram returns time-bucketed tokens/sec with provider breakdown for the given filters
+	GetProviderThroughputHistogram(ctx context.Context, filters *logstore.SearchFilters, bucketSizeSeconds int64) (*logstore.ProviderThroughputHistogramResult, error)
+
 	// GetModelRankings returns models ranked by usage with trend comparison
 	GetModelRankings(ctx context.Context, filters *logstore.SearchFilters) (*logstore.ModelRankingResult, error)
 
@@ -91,6 +100,14 @@ type LogManager interface {
 	// GetAvailableStopReasons returns all unique stop reason values from logs
 	GetAvailableStopReasons(ctx context.Context, limit int, query string) ([]string, error)
 
+	// GetAvailableToolCallNames returns all unique function names that responses called
+	GetAvailableToolCallNames(ctx context.Context, limit int, query string) ([]string, error)
+
+	// GetAvailableUserAgents returns all unique raw User-Agent strings from logs
+	GetAvailableUserAgents(ctx context.Context, limit int, query string) ([]string, error)
+	// GetAvailableApps returns all unique backend-detected app labels from logs
+	GetAvailableApps(ctx context.Context, limit int, query string) ([]string, error)
+
 	// GetAvailableTeams returns all unique team ID-Name pairs from logs
 	GetAvailableTeams(ctx context.Context, limit int, query string) ([]KeyPair, error)
 
@@ -102,6 +119,9 @@ type LogManager interface {
 
 	// GetAvailableBusinessUnits returns all unique business unit ID-Name pairs from logs
 	GetAvailableBusinessUnits(ctx context.Context, limit int, query string) ([]KeyPair, error)
+
+	// GetAvailableProjects returns all unique project ID-Name pairs from logs
+	GetAvailableProjects(ctx context.Context, limit int, query string) ([]KeyPair, error)
 
 	// GetAvailableMetadataKeys returns distinct metadata keys and their values from recent logs
 	GetAvailableMetadataKeys(ctx context.Context, limit int, query string) (map[string][]string, error)
@@ -123,6 +143,16 @@ type LogManager interface {
 
 	// RecalculateCosts recomputes missing costs for logs matching the filters
 	RecalculateCosts(ctx context.Context, filters *logstore.SearchFilters, limit int) (*RecalculateCostResult, error)
+	// RecalculateCostsWithProgress recomputes missing costs and emits batch progress updates
+	RecalculateCostsWithProgress(ctx context.Context, filters *logstore.SearchFilters, limit int, progress func(RecalculateCostProgress)) (*RecalculateCostResult, error)
+	// BuildCostRecalcJobMeta counts the in-scope rows and returns the initial
+	// metadata JSON for a background cost-recalculation job. The caller must have
+	// already resolved any period into filters.StartTime/EndTime.
+	BuildCostRecalcJobMeta(ctx context.Context, filters logstore.SearchFilters, missingCostOnly bool) (string, error)
+	// RunCostRecalcJob executes one background cost-recalculation job, resuming
+	// from the cursor in metaJSON and checkpointing after each batch. It returns
+	// the final metadata JSON to persist.
+	RunCostRecalcJob(ctx context.Context, metaJSON string, checkpoint func(string) error) (string, error)
 
 	// MCP Tool Log methods
 	// GetMCPToolLog retrieves a single MCP tool log entry by ID.
@@ -140,11 +170,34 @@ type LogManager interface {
 	// GetAvailableServerLabels returns all unique server labels from MCP tool logs
 	GetAvailableServerLabels(ctx context.Context, limit int, query string) ([]string, error)
 
+	// GetAvailableMCPUserAgents returns all unique raw User-Agent strings from MCP tool logs
+	GetAvailableMCPUserAgents(ctx context.Context, limit int, query string) ([]string, error)
+	// GetAvailableMCPApps returns all unique backend-detected app labels from MCP tool logs
+	GetAvailableMCPApps(ctx context.Context, limit int, query string) ([]string, error)
+
 	// GetAvailableMCPVirtualKeys returns all unique virtual key ID-Name pairs from MCP tool logs
 	GetAvailableMCPVirtualKeys(ctx context.Context, limit int, query string) ([]KeyPair, error)
 
+	// GetAvailableMCPUsers returns the users ID-Name pairs from MCP tool logs
+	GetAvailableMCPUsers(ctx context.Context, limit int, query string) ([]KeyPair, error)
+
+	// GetAvailableMCPTeams returns the teams ID-Name pairs from MCP tool logs
+	GetAvailableMCPTeams(ctx context.Context, limit int, query string) ([]KeyPair, error)
+
+	// GetAvailableMCPCustomers returns the customers ID-Name pairs from MCP tool logs
+	GetAvailableMCPCustomers(ctx context.Context, limit int, query string) ([]KeyPair, error)
+
+	// GetAvailableMCPBusinessUnits returns the business units ID-Name pairs from MCP tool logs
+	GetAvailableMCPBusinessUnits(ctx context.Context, limit int, query string) ([]KeyPair, error)
+
+	// GetAvailableMCPProjects returns the projects ID-Name pairs from MCP tool logs
+	GetAvailableMCPProjects(ctx context.Context, limit int, query string) ([]KeyPair, error)
+
 	// GetMCPHistogram returns time-bucketed MCP tool call volume
 	GetMCPHistogram(ctx context.Context, filters logstore.MCPToolLogSearchFilters, bucketSizeSeconds int64) (*logstore.MCPHistogramResult, error)
+
+	// GetMCPLatencyHistogram returns time-bucketed latency percentiles of finished MCP tool calls
+	GetMCPLatencyHistogram(ctx context.Context, filters logstore.MCPToolLogSearchFilters, bucketSizeSeconds int64) (*logstore.LatencyHistogramResult, error)
 
 	// GetMCPCostHistogram returns time-bucketed MCP cost data
 	GetMCPCostHistogram(ctx context.Context, filters logstore.MCPToolLogSearchFilters, bucketSizeSeconds int64) (*logstore.MCPCostHistogramResult, error)
@@ -154,6 +207,11 @@ type LogManager interface {
 
 	// DeleteMCPToolLogs deletes multiple MCP tool log entries by their IDs
 	DeleteMCPToolLogs(ctx context.Context, ids []string) error
+
+	ListUserAgentMappings(ctx context.Context) ([]logstore.UserAgentMapping, error)
+	CreateUserAgentMapping(ctx context.Context, mapping *logstore.UserAgentMapping) (*logstore.UserAgentMapping, error)
+	UpdateUserAgentMapping(ctx context.Context, id string, mapping *logstore.UserAgentMapping) (*logstore.UserAgentMapping, error)
+	DeleteUserAgentMapping(ctx context.Context, id string) error
 }
 
 // PluginLogManager implements LogManager interface wrapping the plugin
@@ -163,6 +221,16 @@ type PluginLogManager struct {
 
 func (p *PluginLogManager) GetLog(ctx context.Context, id string) (*logstore.Log, error) {
 	return p.plugin.GetLog(ctx, id)
+}
+
+// LogStore returns the store the plugin writes to, for readers that need a
+// surface the manager does not adapt, such as Warp's topic tables. Nil when
+// the plugin has none.
+func (p *PluginLogManager) LogStore() logstore.LogStore {
+	if p == nil || p.plugin == nil {
+		return nil
+	}
+	return p.plugin.store
 }
 
 func (p *PluginLogManager) Search(ctx context.Context, filters *logstore.SearchFilters, pagination *logstore.PaginationOptions) (*logstore.SearchResult, error) {
@@ -252,6 +320,20 @@ func (p *PluginLogManager) GetProviderLatencyHistogram(ctx context.Context, filt
 	return p.plugin.GetProviderLatencyHistogram(ctx, *filters, bucketSizeSeconds)
 }
 
+func (p *PluginLogManager) GetThroughputHistogram(ctx context.Context, filters *logstore.SearchFilters, bucketSizeSeconds int64) (*logstore.ThroughputHistogramResult, error) {
+	if filters == nil {
+		return nil, fmt.Errorf("filters cannot be nil")
+	}
+	return p.plugin.GetThroughputHistogram(ctx, *filters, bucketSizeSeconds)
+}
+
+func (p *PluginLogManager) GetProviderThroughputHistogram(ctx context.Context, filters *logstore.SearchFilters, bucketSizeSeconds int64) (*logstore.ProviderThroughputHistogramResult, error) {
+	if filters == nil {
+		return nil, fmt.Errorf("filters cannot be nil")
+	}
+	return p.plugin.GetProviderThroughputHistogram(ctx, *filters, bucketSizeSeconds)
+}
+
 func (p *PluginLogManager) GetModelRankings(ctx context.Context, filters *logstore.SearchFilters) (*logstore.ModelRankingResult, error) {
 	if filters == nil {
 		return nil, fmt.Errorf("filters cannot be nil")
@@ -268,6 +350,12 @@ func (p *PluginLogManager) GetDimensionRankings(ctx context.Context, filters *lo
 
 func (p *PluginLogManager) GetDroppedRequests(ctx context.Context) int64 {
 	return p.plugin.droppedRequests.Load()
+}
+
+// GetDroppedDuringMaintenance returns how many of the dropped requests were
+// dropped while the writer was paused for another node's logstore migration.
+func (p *PluginLogManager) GetDroppedDuringMaintenance(ctx context.Context) int64 {
+	return p.plugin.droppedDuringMaintenance.Load()
 }
 
 // GetAvailableModels returns all unique models from logs
@@ -299,6 +387,20 @@ func (p *PluginLogManager) GetAvailableStopReasons(ctx context.Context, limit in
 	return p.plugin.GetAvailableStopReasons(ctx, limit, query)
 }
 
+func (p *PluginLogManager) GetAvailableToolCallNames(ctx context.Context, limit int, query string) ([]string, error) {
+	return p.plugin.GetAvailableToolCallNames(ctx, limit, query)
+}
+
+// GetAvailableUserAgents returns distinct raw User-Agent strings from logs for the logs "App" filter.
+func (p *PluginLogManager) GetAvailableUserAgents(ctx context.Context, limit int, query string) ([]string, error) {
+	return p.plugin.GetAvailableUserAgents(ctx, limit, query)
+}
+
+// GetAvailableApps returns distinct backend-detected app labels from logs for the logs "App" filter.
+func (p *PluginLogManager) GetAvailableApps(ctx context.Context, limit int, query string) ([]string, error) {
+	return p.plugin.GetAvailableApps(ctx, limit, query)
+}
+
 func (p *PluginLogManager) GetAvailableTeams(ctx context.Context, limit int, query string) ([]KeyPair, error) {
 	return p.plugin.GetAvailableTeams(ctx, limit, query)
 }
@@ -313,6 +415,10 @@ func (p *PluginLogManager) GetAvailableUsers(ctx context.Context, limit int, que
 
 func (p *PluginLogManager) GetAvailableBusinessUnits(ctx context.Context, limit int, query string) ([]KeyPair, error) {
 	return p.plugin.GetAvailableBusinessUnits(ctx, limit, query)
+}
+
+func (p *PluginLogManager) GetAvailableProjects(ctx context.Context, limit int, query string) ([]KeyPair, error) {
+	return p.plugin.GetAvailableProjects(ctx, limit, query)
 }
 
 // GetDimensionCostHistogram returns time-bucketed cost data grouped by the specified dimension.
@@ -351,7 +457,13 @@ func (p *PluginLogManager) DeleteLog(ctx context.Context, id string) error {
 	if p.plugin == nil || p.plugin.store == nil {
 		return fmt.Errorf("log store not initialized")
 	}
-	return p.plugin.store.DeleteLog(ctx, id)
+	// A partial delete removed the log, so subscribers still hear of it.
+	err := p.plugin.store.DeleteLog(ctx, id)
+	if err != nil && !errors.Is(err, logstore.ErrPartialLogDelete) {
+		return err
+	}
+	p.plugin.notifyLogDeleteCallbacks(ctx, []string{id})
+	return err
 }
 
 // DeleteLogs deletes multiple logs from the log store
@@ -359,7 +471,13 @@ func (p *PluginLogManager) DeleteLogs(ctx context.Context, ids []string) error {
 	if p.plugin == nil || p.plugin.store == nil {
 		return fmt.Errorf("log store not initialized")
 	}
-	return p.plugin.store.DeleteLogs(ctx, ids)
+	// A partial delete removed the logs, so subscribers still hear of it.
+	err := p.plugin.store.DeleteLogs(ctx, ids)
+	if err != nil && !errors.Is(err, logstore.ErrPartialLogDelete) {
+		return err
+	}
+	p.plugin.notifyLogDeleteCallbacks(ctx, ids)
+	return err
 }
 
 func (p *PluginLogManager) RecalculateCosts(ctx context.Context, filters *logstore.SearchFilters, limit int) (*RecalculateCostResult, error) {
@@ -367,6 +485,27 @@ func (p *PluginLogManager) RecalculateCosts(ctx context.Context, filters *logsto
 		return nil, fmt.Errorf("filters cannot be nil")
 	}
 	return p.plugin.RecalculateCosts(ctx, *filters, limit)
+}
+
+func (p *PluginLogManager) RecalculateCostsWithProgress(ctx context.Context, filters *logstore.SearchFilters, limit int, progress func(RecalculateCostProgress)) (*RecalculateCostResult, error) {
+	if filters == nil {
+		return nil, fmt.Errorf("filters cannot be nil")
+	}
+	return p.plugin.RecalculateCostsWithProgress(ctx, *filters, limit, progress)
+}
+
+func (p *PluginLogManager) BuildCostRecalcJobMeta(ctx context.Context, filters logstore.SearchFilters, missingCostOnly bool) (string, error) {
+	if p.plugin == nil {
+		return "", fmt.Errorf("logging plugin not initialized")
+	}
+	return p.plugin.BuildCostRecalcJobMeta(ctx, filters, missingCostOnly)
+}
+
+func (p *PluginLogManager) RunCostRecalcJob(ctx context.Context, metaJSON string, checkpoint func(string) error) (string, error) {
+	if p.plugin == nil {
+		return metaJSON, fmt.Errorf("logging plugin not initialized")
+	}
+	return p.plugin.RunCostRecalcJob(ctx, metaJSON, checkpoint)
 }
 
 // GetMCPToolLog retrieves a single MCP tool log entry by ID.
@@ -411,11 +550,62 @@ func (p *PluginLogManager) GetAvailableServerLabels(ctx context.Context, limit i
 	return p.plugin.store.GetAvailableServerLabels(ctx, limit, query)
 }
 
+// GetAvailableMCPUserAgents returns distinct raw User-Agent strings from MCP tool logs for the MCP "App" filter.
+func (p *PluginLogManager) GetAvailableMCPUserAgents(ctx context.Context, limit int, query string) ([]string, error) {
+	if p == nil || p.plugin == nil || p.plugin.store == nil {
+		return []string{}, nil
+	}
+	return p.plugin.store.GetAvailableMCPUserAgents(ctx, limit, query)
+}
+
+// GetAvailableMCPApps returns distinct backend-detected app labels from MCP tool logs for the MCP "App" filter.
+func (p *PluginLogManager) GetAvailableMCPApps(ctx context.Context, limit int, query string) ([]string, error) {
+	if p == nil || p.plugin == nil || p.plugin.store == nil {
+		return []string{}, nil
+	}
+	return p.plugin.store.GetAvailableMCPApps(ctx, limit, query)
+}
+
 func (p *PluginLogManager) GetAvailableMCPVirtualKeys(ctx context.Context, limit int, query string) ([]KeyPair, error) {
 	if p == nil || p.plugin == nil {
 		return []KeyPair{}, nil
 	}
 	return p.plugin.GetAvailableMCPVirtualKeys(ctx, limit, query)
+}
+
+func (p *PluginLogManager) GetAvailableMCPUsers(ctx context.Context, limit int, query string) ([]KeyPair, error) {
+	if p == nil || p.plugin == nil {
+		return []KeyPair{}, nil
+	}
+	return p.plugin.GetAvailableMCPUsers(ctx, limit, query)
+}
+
+func (p *PluginLogManager) GetAvailableMCPTeams(ctx context.Context, limit int, query string) ([]KeyPair, error) {
+	if p == nil || p.plugin == nil {
+		return []KeyPair{}, nil
+	}
+	return p.plugin.GetAvailableMCPTeams(ctx, limit, query)
+}
+
+func (p *PluginLogManager) GetAvailableMCPCustomers(ctx context.Context, limit int, query string) ([]KeyPair, error) {
+	if p == nil || p.plugin == nil {
+		return []KeyPair{}, nil
+	}
+	return p.plugin.GetAvailableMCPCustomers(ctx, limit, query)
+}
+
+func (p *PluginLogManager) GetAvailableMCPBusinessUnits(ctx context.Context, limit int, query string) ([]KeyPair, error) {
+	if p == nil || p.plugin == nil {
+		return []KeyPair{}, nil
+	}
+	return p.plugin.GetAvailableMCPBusinessUnits(ctx, limit, query)
+}
+
+func (p *PluginLogManager) GetAvailableMCPProjects(ctx context.Context, limit int, query string) ([]KeyPair, error) {
+	if p == nil || p.plugin == nil {
+		return []KeyPair{}, nil
+	}
+	return p.plugin.GetAvailableMCPProjects(ctx, limit, query)
 }
 
 // GetMCPHistogram returns time-bucketed MCP tool call volume
@@ -424,6 +614,14 @@ func (p *PluginLogManager) GetMCPHistogram(ctx context.Context, filters logstore
 		return &logstore.MCPHistogramResult{}, nil
 	}
 	return p.plugin.store.GetMCPHistogram(ctx, filters, bucketSizeSeconds)
+}
+
+// GetMCPLatencyHistogram returns time-bucketed latency percentiles of finished MCP tool calls
+func (p *PluginLogManager) GetMCPLatencyHistogram(ctx context.Context, filters logstore.MCPToolLogSearchFilters, bucketSizeSeconds int64) (*logstore.LatencyHistogramResult, error) {
+	if p.plugin == nil || p.plugin.store == nil {
+		return &logstore.LatencyHistogramResult{}, nil
+	}
+	return p.plugin.store.GetMCPLatencyHistogram(ctx, filters, bucketSizeSeconds)
 }
 
 // GetMCPCostHistogram returns time-bucketed MCP cost data
@@ -448,6 +646,38 @@ func (p *PluginLogManager) DeleteMCPToolLogs(ctx context.Context, ids []string) 
 		return fmt.Errorf("log store not initialized")
 	}
 	return p.plugin.store.DeleteMCPToolLogs(ctx, ids)
+}
+
+// ListUserAgentMappings returns all custom User-Agent mappings.
+func (p *PluginLogManager) ListUserAgentMappings(ctx context.Context) ([]logstore.UserAgentMapping, error) {
+	return p.plugin.ListUserAgentMappings(ctx)
+}
+
+// CreateUserAgentMapping creates a custom User-Agent mapping through the logging plugin.
+func (p *PluginLogManager) CreateUserAgentMapping(ctx context.Context, mapping *logstore.UserAgentMapping) (*logstore.UserAgentMapping, error) {
+	if mapping == nil {
+		return nil, fmt.Errorf("%w: mapping cannot be nil", ErrInvalidUserAgentMapping)
+	}
+	return p.plugin.CreateUserAgentMapping(ctx, mapping)
+}
+
+// UpdateUserAgentMapping updates a custom User-Agent mapping through the logging plugin.
+func (p *PluginLogManager) UpdateUserAgentMapping(ctx context.Context, id string, mapping *logstore.UserAgentMapping) (*logstore.UserAgentMapping, error) {
+	if strings.TrimSpace(id) == "" {
+		return nil, fmt.Errorf("%w: id cannot be empty", ErrInvalidUserAgentMapping)
+	}
+	if mapping == nil {
+		return nil, fmt.Errorf("%w: mapping cannot be nil", ErrInvalidUserAgentMapping)
+	}
+	return p.plugin.UpdateUserAgentMapping(ctx, id, mapping)
+}
+
+// DeleteUserAgentMapping deletes a custom User-Agent mapping through the logging plugin.
+func (p *PluginLogManager) DeleteUserAgentMapping(ctx context.Context, id string) error {
+	if strings.TrimSpace(id) == "" {
+		return fmt.Errorf("%w: id cannot be empty", ErrInvalidUserAgentMapping)
+	}
+	return p.plugin.DeleteUserAgentMapping(ctx, id)
 }
 
 // GetPluginLogManager returns a LogManager interface for this plugin
@@ -490,6 +720,27 @@ func retryOnNotFound(ctx context.Context, operation func() error) error {
 	return lastErr
 }
 
+// textRequestParamsAndTools returns the logged params and tools of a text completion, chat or
+// Responses request: the request's own params, plus its tools in chat shape (Responses tools are
+// converted with ToChatTool). It returns nil for every other request kind. The request for the
+// type must be set with non-nil Params, as every converter guarantees. PreLLMHook and passthrough log
+// parsing both use it, so a parsed passthrough row records the same fields as a typed request.
+func textRequestParamsAndTools(request *schemas.BifrostRequest) (interface{}, []schemas.ChatTool) {
+	switch request.RequestType {
+	case schemas.TextCompletionRequest, schemas.TextCompletionStreamRequest:
+		return request.TextCompletionRequest.Params, nil
+	case schemas.ChatCompletionRequest, schemas.ChatCompletionStreamRequest:
+		return request.ChatRequest.Params, request.ChatRequest.Params.Tools
+	case schemas.ResponsesRequest, schemas.ResponsesStreamRequest, schemas.WebSocketResponsesRequest:
+		var tools []schemas.ChatTool
+		for _, tool := range request.ResponsesRequest.Params.Tools {
+			tools = append(tools, *tool.ToChatTool())
+		}
+		return request.ResponsesRequest.Params, tools
+	}
+	return nil, nil
+}
+
 // extractInputHistory extracts input history from request input
 func (p *LoggerPlugin) extractInputHistory(request *schemas.BifrostRequest) ([]schemas.ChatMessage, []schemas.ResponsesMessage) {
 	if request.ChatRequest != nil {
@@ -524,35 +775,8 @@ func (p *LoggerPlugin) extractInputHistory(request *schemas.BifrostRequest) ([]s
 			},
 		}, []schemas.ResponsesMessage{}
 	}
-	if request.EmbeddingRequest != nil {
-		// Large payload passthrough can intentionally leave Input nil to avoid
-		// materializing giant request bodies. Logging should degrade gracefully.
-		if request.EmbeddingRequest.Input == nil {
-			return []schemas.ChatMessage{}, []schemas.ResponsesMessage{}
-		}
-		texts := request.EmbeddingRequest.Input.Texts
-
-		if len(texts) == 0 && request.EmbeddingRequest.Input.Text != nil {
-			texts = []string{*request.EmbeddingRequest.Input.Text}
-		}
-
-		contentBlocks := make([]schemas.ChatContentBlock, len(texts))
-		for i, text := range texts {
-			// Create a per-iteration copy to avoid reusing the same memory address
-			t := text
-			contentBlocks[i] = schemas.ChatContentBlock{
-				Type: schemas.ChatContentBlockTypeText,
-				Text: &t,
-			}
-		}
-		return []schemas.ChatMessage{
-			{
-				Role: schemas.ChatMessageRoleUser,
-				Content: &schemas.ChatMessageContent{
-					ContentBlocks: contentBlocks,
-				},
-			},
-		}, []schemas.ResponsesMessage{}
+	if request.DecisionRequest != nil {
+		return decisionInputLog(request.DecisionRequest.Input), []schemas.ResponsesMessage{}
 	}
 	if request.RerankRequest != nil {
 		query := request.RerankRequest.Query
@@ -568,7 +792,177 @@ func (p *LoggerPlugin) extractInputHistory(request *schemas.BifrostRequest) ([]s
 	if request.CountTokensRequest != nil && len(request.CountTokensRequest.Input) > 0 {
 		return []schemas.ChatMessage{}, request.CountTokensRequest.Input
 	}
+	if request.CompactionRequest != nil && len(request.CompactionRequest.Input) > 0 {
+		return []schemas.ChatMessage{}, request.CompactionRequest.Input
+	}
 	return []schemas.ChatMessage{}, []schemas.ResponsesMessage{}
+}
+
+// extractEmbeddingInput returns the request's input items, preserving all part types
+// (text, image, audio, file, video) and any per-item params. Returns nil when Input is
+// empty (large-payload passthrough).
+func extractEmbeddingInput(request *schemas.BifrostRequest) []schemas.EmbeddingInputItem {
+	if request.EmbeddingRequest == nil || len(request.EmbeddingRequest.Input) == 0 {
+		return nil
+	}
+	return request.EmbeddingRequest.Input
+}
+
+// redactEmbeddingMediaData returns a copy of items with inline Data fields stripped from
+// all media parts. Only called when the total data size exceeds the large-payload
+// threshold. URL-based parts and per-item params are preserved.
+func redactEmbeddingMediaData(items []schemas.EmbeddingInputItem) []schemas.EmbeddingInputItem {
+	stripped := make([]schemas.EmbeddingInputItem, len(items))
+	for i, item := range items {
+		parts := make(schemas.EmbeddingContent, len(item.Content))
+		for j, part := range item.Content {
+			for _, media := range []**schemas.EmbeddingMediaPart{&part.Image, &part.Audio, &part.File, &part.Video} {
+				if *media != nil {
+					cp := **media
+					cp.Data = nil
+					*media = &cp
+				}
+			}
+			parts[j] = part
+		}
+		stripped[i] = schemas.EmbeddingInputItem{Content: parts, Params: item.Params}
+	}
+	return stripped
+}
+
+// decisionInputLog renders a decision input as chat messages for the log.
+// Text and a structured input (as JSON, the way a state was always logged)
+// are one user message; messages are logged the way chat requests are, so the
+// logs UI shows their text and inline images the same way. A tool call or
+// output is logged as its JSON (see decisionToolItemLog). A part of a type the
+// schema does not model is kept as its type name, and a message without a
+// role is the user's.
+func decisionInputLog(input schemas.DecisionInput) []schemas.ChatMessage {
+	if input.Messages == nil {
+		var text string
+		if input.Text != nil {
+			text = *input.Text
+		} else if raw, err := sonic.Marshal(input.Structured); err == nil {
+			text = string(raw)
+		}
+		return []schemas.ChatMessage{{
+			Role:    schemas.ChatMessageRoleUser,
+			Content: &schemas.ChatMessageContent{ContentStr: &text},
+		}}
+	}
+	messages := make([]schemas.ChatMessage, 0, len(input.Messages))
+	for _, message := range input.Messages {
+		if message.Type != nil && *message.Type != schemas.DecisionInputItemTypeMessage {
+			messages = append(messages, decisionToolItemLog(message))
+			continue
+		}
+		role := schemas.ChatMessageRole(message.Role)
+		if role == "" {
+			role = schemas.ChatMessageRoleUser
+		}
+		if message.Content.Text != nil {
+			messages = append(messages, schemas.ChatMessage{
+				Role:    role,
+				Content: &schemas.ChatMessageContent{ContentStr: message.Content.Text},
+			})
+			continue
+		}
+		blocks := make([]schemas.ChatContentBlock, 0, len(message.Content.Parts))
+		for _, part := range message.Content.Parts {
+			switch {
+			case (part.Type == schemas.DecisionInputPartTypeText || part.Type == schemas.DecisionInputPartTypeOutputText) && part.Text != nil:
+				blocks = append(blocks, schemas.ChatContentBlock{Type: schemas.ChatContentBlockTypeText, Text: schemas.Ptr(decisionPartText(part.Text))})
+			case part.Type == schemas.DecisionInputPartTypeRefusal && part.Refusal != nil:
+				blocks = append(blocks, schemas.ChatContentBlock{Type: schemas.ChatContentBlockTypeText, Text: part.Refusal})
+			case part.Type == schemas.DecisionInputPartTypeJSON && part.Data.Structured != nil:
+				blocks = append(blocks, schemas.ChatContentBlock{Type: schemas.ChatContentBlockTypeText, Text: schemas.Ptr(decisionPartText(&schemas.DecisionText{Structured: part.Data.Structured}))})
+			case part.IsAsset() && part.Data.File != nil:
+				// An image sent by reference carries its file, not a URL: log it as an
+				// image the same way. Its ID is already in the text that references it.
+				blocks = append(blocks, schemas.ChatContentBlock{
+					Type:           schemas.ChatContentBlockTypeImage,
+					ImageURLStruct: &schemas.ChatInputImage{URL: decisionAssetDataURL(part.Data.File)},
+				})
+			case part.Type == schemas.DecisionInputPartTypeImage && part.ImageURL != nil:
+				blocks = append(blocks, schemas.ChatContentBlock{
+					Type:           schemas.ChatContentBlockTypeImage,
+					ImageURLStruct: &schemas.ChatInputImage{URL: *part.ImageURL, Detail: part.Detail},
+				})
+			case part.Type == schemas.DecisionInputPartTypeFile:
+				blocks = append(blocks, schemas.ChatContentBlock{Type: schemas.ChatContentBlockTypeFile, File: decisionFileLog(part)})
+			default:
+				blocks = append(blocks, schemas.ChatContentBlock{Type: schemas.ChatContentBlockTypeText, Text: schemas.Ptr("[" + part.Type + "]")})
+			}
+		}
+		messages = append(messages, schemas.ChatMessage{
+			Role:    role,
+			Content: &schemas.ChatMessageContent{ContentBlocks: blocks},
+		})
+	}
+	return messages
+}
+
+// decisionFileLog logs an input_file part as a chat request's file is logged:
+// its bytes as base64 file data (a multipart part's bytes too, by its part name),
+// or its URL, with its media type, so the log view shows audio, video, and PDFs
+// the way it shows files sent to any other provider.
+func decisionFileLog(part schemas.DecisionInputPart) *schemas.ChatInputFile {
+	file := &schemas.ChatInputFile{FileURL: part.URL, Filename: part.Name, FileType: part.MimeType}
+	if part.Data.File != nil {
+		file.FileData = schemas.Ptr(base64.StdEncoding.EncodeToString(part.Data.File))
+	}
+	return file
+}
+
+// decisionToolItemLog logs a tool call as the assistant's message and a tool
+// output as a tool message answering its call, each with the item's JSON as
+// its text, so the call ID, name, input, and output are all kept.
+func decisionToolItemLog(item schemas.DecisionInputMessage) schemas.ChatMessage {
+	raw, _ := sonic.Marshal(item)
+	text := string(raw)
+	if *item.Type == schemas.DecisionInputItemTypeFunctionCallOutput || *item.Type == schemas.DecisionInputItemTypeCustomToolCallOutput {
+		return schemas.ChatMessage{
+			Role:            schemas.ChatMessageRoleTool,
+			Content:         &schemas.ChatMessageContent{ContentStr: &text},
+			ChatToolMessage: &schemas.ChatToolMessage{ToolCallID: item.CallID},
+		}
+	}
+	return schemas.ChatMessage{Role: schemas.ChatMessageRoleAssistant, Content: &schemas.ChatMessageContent{ContentStr: &text}}
+}
+
+// decisionAssetDataURL renders an asset's file as a data URL the logs UI shows as
+// an image, with the media type read from the bytes.
+func decisionAssetDataURL(data []byte) string {
+	mediaType, _, _ := strings.Cut(http.DetectContentType(data), ";")
+	return "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(data)
+}
+
+// decisionPartText renders a text part for the log: its string, or a structured
+// value as JSON, the way a structured input is logged.
+func decisionPartText(text *schemas.DecisionText) string {
+	if text.Text != nil {
+		return *text.Text
+	}
+	raw, err := sonic.Marshal(text.Structured)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+// embeddingMediaDataSize totals the inline media bytes across every item.
+func embeddingMediaDataSize(items []schemas.EmbeddingInputItem) int64 {
+	var total int64
+	for _, item := range items {
+		for _, part := range item.Content {
+			for _, media := range []*schemas.EmbeddingMediaPart{part.Image, part.Audio, part.File, part.Video} {
+				if media != nil && media.Data != nil {
+					total += int64(len(*media.Data))
+				}
+			}
+		}
+	}
+	return total
 }
 
 func extractRealtimeInputHistory(input []schemas.ResponsesMessage) []schemas.ChatMessage {
@@ -595,6 +989,8 @@ func extractRealtimeInputHistory(input []schemas.ResponsesMessage) []schemas.Cha
 		case schemas.ResponsesMessageTypeFunctionCallOutput,
 			schemas.ResponsesMessageTypeCustomToolCallOutput,
 			schemas.ResponsesMessageTypeLocalShellCallOutput,
+			schemas.ResponsesMessageTypeShellCallOutput,
+			schemas.ResponsesMessageTypeApplyPatchCallOutput,
 			schemas.ResponsesMessageTypeComputerCallOutput:
 			content := extractRealtimeToolOutputContent(item.ResponsesToolMessage)
 			if content == "" {
@@ -653,6 +1049,8 @@ func extractRealtimeToolOutputContent(toolMessage *schemas.ResponsesToolMessage)
 	switch {
 	case toolMessage.Output.ResponsesToolCallOutputStr != nil:
 		return strings.TrimSpace(*toolMessage.Output.ResponsesToolCallOutputStr)
+	case len(toolMessage.Output.ResponsesShellCallOutput) > 0:
+		return strings.TrimSpace(schemas.ShellCallOutputText(toolMessage.Output.ResponsesShellCallOutput))
 	case len(toolMessage.Output.ResponsesFunctionToolCallOutputBlocks) > 0:
 		content := &schemas.ResponsesMessageContent{ContentBlocks: toolMessage.Output.ResponsesFunctionToolCallOutputBlocks}
 		return extractRealtimeResponsesContent(content)
@@ -675,7 +1073,7 @@ func convertToProcessedStreamResponse(result *schemas.StreamAccumulatorResult, r
 		streamType = streaming.StreamTypeText
 	case schemas.ChatCompletionStreamRequest:
 		streamType = streaming.StreamTypeChat
-	case schemas.ResponsesStreamRequest, schemas.WebSocketResponsesRequest:
+	case schemas.ResponsesStreamRequest, schemas.ResponsesRetrieveStreamRequest, schemas.WebSocketResponsesRequest:
 		streamType = streaming.StreamTypeResponses
 	case schemas.SpeechStreamRequest:
 		streamType = streaming.StreamTypeAudio
@@ -701,7 +1099,9 @@ func convertToProcessedStreamResponse(result *schemas.StreamAccumulatorResult, r
 		OutputMessages:        result.OutputMessages,
 		ErrorDetails:          result.ErrorDetails,
 		TokenUsage:            result.TokenUsage,
+		ServiceTier:           result.ServiceTier,
 		CacheDebug:            result.CacheDebug,
+		GuardrailDebug:        result.GuardrailDebug,
 		Cost:                  result.Cost,
 		AudioOutput:           result.AudioOutput,
 		TranscriptionOutput:   result.TranscriptionOutput,
@@ -709,6 +1109,7 @@ func convertToProcessedStreamResponse(result *schemas.StreamAccumulatorResult, r
 		PassthroughOutput:     result.PassthroughOutput,
 		FinishReason:          result.FinishReason,
 		RawResponse:           result.RawResponse,
+		RawResponseFormat:     result.RawResponseFormat,
 	}
 
 	// Handle tool calls if present
@@ -761,8 +1162,68 @@ func mergeRealtimeMetadata(metadata map[string]interface{}, ctx *schemas.Bifrost
 	return metadata
 }
 
+// mergeLoadBalancerMetadata folds the enterprise load balancer's per-attempt routing decision into a
+// log row's metadata. Only keys carrying schemas.LoadBalancerMetadataPrefix are taken, so the load
+// balancer cannot write into the caller's namespace. Nor can a caller write into its: captureLoggingHeaders
+// drops every prefixed key a header or dimension produced, so each prefixed key on a row came from the
+// load balancer, including on a row it never stamped. The map is read at PostLLMHook time because key
+// selection, which stamps the key-level decision, runs after PreLLMHook.
+func mergeLoadBalancerMetadata(metadata map[string]interface{}, ctx *schemas.BifrostContext) map[string]interface{} {
+	if ctx == nil {
+		return metadata
+	}
+	attempt, ok := ctx.Value(schemas.BifrostContextKeyLoadBalancerAttempt).(map[string]string)
+	if !ok || len(attempt) == 0 {
+		return metadata
+	}
+	for key, value := range attempt {
+		if !strings.HasPrefix(key, schemas.LoadBalancerMetadataPrefix) {
+			continue
+		}
+		if metadata == nil {
+			metadata = make(map[string]interface{}, len(attempt))
+		}
+		metadata[key] = value
+	}
+	return metadata
+}
+
+// virtualKeyMetadataContextKey is the context key under which the governance plugin publishes the
+// resolved virtual key's metadata (governance.VirtualKeyMetadataContextKey). This module cannot
+// import the governance plugin, and the key is kept out of core so both plugins build against
+// published core; the string must stay identical to governance's.
+const virtualKeyMetadataContextKey schemas.BifrostContextKey = "bifrost-governance-virtual-key-metadata"
+
+// mergeVirtualKeyMetadata snapshots the resolved virtual key's metadata onto a log row's metadata,
+// so spend stays filterable by it (cost center, owner, ...) even after the key's metadata changes.
+// It is applied after every request-supplied source (logging headers, x-bf-lh-* and x-bf-dim-*), so
+// on a key collision the virtual key's value wins: attribution an operator set on the key cannot be
+// spoofed by a caller sending a header of the same name. Keys under schemas.LoadBalancerMetadataPrefix
+// are skipped, as for headers; config validation already refuses them.
+func mergeVirtualKeyMetadata(metadata map[string]interface{}, ctx *schemas.BifrostContext) map[string]interface{} {
+	if ctx == nil {
+		return metadata
+	}
+	vkMetadata, ok := ctx.Value(virtualKeyMetadataContextKey).(map[string]string)
+	if !ok || len(vkMetadata) == 0 {
+		return metadata
+	}
+	for key, value := range vkMetadata {
+		if strings.HasPrefix(key, schemas.LoadBalancerMetadataPrefix) {
+			continue
+		}
+		if metadata == nil {
+			metadata = make(map[string]interface{}, len(vkMetadata))
+		}
+		metadata[key] = value
+	}
+	return metadata
+}
+
 // formatRoutingEngineLogs formats routing engine logs into a human-readable string.
-// Format: [timestamp] [engine] - message
+// Format: [timestamp] [engine] [level] - message
+// The level token lets the log detail view filter and badge each line by severity.
+// An entry recorded without a level is written as info so every line keeps the same shape.
 // Parameters:
 //   - logs: Slice of routing engine log entries
 //
@@ -774,7 +1235,22 @@ func formatRoutingEngineLogs(logs []schemas.RoutingEngineLogEntry) string {
 	}
 	var sb strings.Builder
 	for _, log := range logs {
-		sb.WriteString(fmt.Sprintf("[%d] [%s] - %s\n", log.Timestamp, log.Engine, log.Message))
+		level := log.Level
+		if level == "" {
+			level = schemas.LogLevelInfo
+		}
+		sb.WriteString(fmt.Sprintf("[%d] [%s] [%s] - %s\n", log.Timestamp, log.Engine, level, log.Message))
 	}
 	return sb.String()
+}
+
+func stringSlicePtr(values []string) *string {
+	if len(values) == 0 {
+		return nil
+	}
+	out, err := sonic.MarshalString(values)
+	if err != nil {
+		return nil
+	}
+	return &out
 }

@@ -482,6 +482,39 @@ func ModifyExpectationsForProvider(expectations ResponseExpectations, provider s
 		expectations.ShouldHaveUsageStats = true
 		expectations.ShouldHaveLatency = true
 
+	case schemas.DeepSeek:
+		expectations.ShouldHaveUsageStats = true
+		expectations.ShouldHaveLatency = true
+
+	case schemas.Wafer:
+		expectations.ShouldHaveUsageStats = true
+		expectations.ShouldHaveLatency = true
+
+	case schemas.MiniMax:
+		expectations.ShouldHaveUsageStats = true
+		expectations.ShouldHaveLatency = true
+
+	case schemas.BytePlus:
+		expectations.ShouldHaveUsageStats = true
+		expectations.ShouldHaveLatency = true
+
+	case schemas.Baseten:
+		expectations.ShouldHaveUsageStats = true
+		expectations.ShouldHaveLatency = true
+
+	case schemas.Kimchi:
+		expectations.ShouldHaveUsageStats = true
+		expectations.ShouldHaveLatency = true
+
+	case schemas.Databricks:
+		// Both Databricks surfaces return the OpenAI-shaped usage object.
+		expectations.ShouldHaveUsageStats = true
+		expectations.ShouldHaveLatency = true
+
+	case schemas.Cloudflare:
+		expectations.ShouldHaveUsageStats = true
+		expectations.ShouldHaveLatency = true
+
 	case schemas.OpenRouter:
 		// OpenRouter proxies to multiple providers; returns OpenAI-compatible fields
 		expectations.ShouldHaveUsageStats = true
@@ -530,6 +563,12 @@ func ModifyExpectationsForProvider(expectations ResponseExpectations, provider s
 
 	case schemas.Runway:
 		// Runway is primarily video/image generation
+		expectations.ShouldHaveUsageStats = false
+		expectations.ShouldHaveTimestamps = false
+		expectations.ShouldHaveLatency = true
+
+	case schemas.Runware:
+		// Runware is image generation only
 		expectations.ShouldHaveUsageStats = false
 		expectations.ShouldHaveTimestamps = false
 		expectations.ShouldHaveLatency = true

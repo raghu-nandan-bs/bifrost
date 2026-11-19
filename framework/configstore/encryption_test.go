@@ -25,7 +25,7 @@ func init() {
 
 // setupEncryptionTestStore creates an in-memory SQLite database with all tables
 // migrated and returns an RDBConfigStore for testing the startup encryption pass.
-func setupEncryptionTestStore(t *testing.T) (*RDBConfigStore, *gorm.DB) {
+func setupEncryptionTestStore(t testing.TB) (*RDBConfigStore, *gorm.DB) {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
@@ -40,7 +40,7 @@ func setupEncryptionTestStore(t *testing.T) (*RDBConfigStore, *gorm.DB) {
 		&tables.TableVirtualKey{},
 		&tables.SessionsTable{},
 		&tables.TableOauthConfig{},
-		&tables.TableOauthToken{},
+		&tables.TableMCPOauthToken{},
 		&tables.TableVectorStoreConfig{},
 		&tables.TableBudget{},
 		&tables.TableRateLimit{},
@@ -52,6 +52,7 @@ func setupEncryptionTestStore(t *testing.T) (*RDBConfigStore, *gorm.DB) {
 		&tables.TableVirtualKeyMCPConfig{},
 		&tables.TableModel{},
 		&tables.TempToken{},
+		&tables.TableRelay{},
 	)
 	require.NoError(t, err)
 
@@ -98,14 +99,14 @@ func TestEncryptPlaintextRows_EncryptsAllTables(t *testing.T) {
 		"session-plaintext-token", future, now, now)
 
 	insertPlaintextRow(t, db,
-		`INSERT INTO oauth_tokens (id, access_token, refresh_token, token_type, encryption_status, expires_at, created_at, updated_at)
-		 VALUES (?, ?, ?, 'Bearer', 'plain_text', ?, ?, ?)`,
+		`INSERT INTO mcp_oauth_tokens (id, auth_mode, access_token, refresh_token, token_type, encryption_status, expires_at, created_at, updated_at)
+		 VALUES (?, 'shared', ?, ?, 'Bearer', 'plain_text', ?, ?, ?)`,
 		"tok-1", "plaintext-access-token", "plaintext-refresh-token", future, now, now)
 
 	insertPlaintextRow(t, db,
-		`INSERT INTO oauth_configs (id, client_secret, code_verifier, redirect_uri, state, status, encryption_status, created_at, updated_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?, 'pending', 'plain_text', ?, ?, ?)`,
-		"cfg-1", "plaintext-client-secret", "plaintext-verifier", "https://example.com/cb", "csrf-state", now, now, future)
+		`INSERT INTO oauth_configs (id, client_secret, redirect_uri, status, encryption_status, created_at, updated_at)
+		 VALUES (?, ?, ?, 'pending', 'plain_text', ?, ?)`,
+		"cfg-1", "plaintext-client-secret", "https://example.com/cb", now, now)
 
 	insertPlaintextRow(t, db,
 		`INSERT INTO config_mcp_clients (client_id, name, connection_type, connection_string, headers_json, encryption_status, created_at, updated_at)
@@ -123,8 +124,8 @@ func TestEncryptPlaintextRows_EncryptsAllTables(t *testing.T) {
 		true, "redis", `{"host":"redis.example.com","password":"secret"}`, now, now)
 
 	insertPlaintextRow(t, db,
-		`INSERT INTO config_plugins (name, enabled, version, config_json, encryption_status, created_at, updated_at)
-		 VALUES (?, ?, 1, ?, 'plain_text', ?, ?)`,
+		`INSERT INTO config_plugins (name, enabled, config_json, encryption_status, created_at, updated_at)
+		 VALUES (?, ?, ?, 'plain_text', ?, ?)`,
 		"test-plugin", true, `{"api_key":"plugin-secret"}`, now, now)
 
 	// Run the startup encryption pass
@@ -148,7 +149,7 @@ func TestEncryptPlaintextRows_EncryptsAllTables(t *testing.T) {
 	assert.NotEqual(t, "session-plaintext-token", sessionRow["token"])
 
 	var tokRow map[string]any
-	db.Table("oauth_tokens").Where("id = ?", "tok-1").Take(&tokRow)
+	db.Table("mcp_oauth_tokens").Where("id = ?", "tok-1").Take(&tokRow)
 	assert.Equal(t, "encrypted", tokRow["encryption_status"])
 	assert.NotEqual(t, "plaintext-access-token", tokRow["access_token"])
 
@@ -184,7 +185,7 @@ func TestEncryptPlaintextRows_SkipsAlreadyEncrypted(t *testing.T) {
 		ProviderID: 1,
 		Provider:   "openai",
 		KeyID:      "enc-key-1",
-		Value:      *schemas.NewEnvVar("sk-secret"),
+		Value:      *schemas.NewSecretVar("sk-secret"),
 	}
 	require.NoError(t, db.Create(key).Error)
 
@@ -300,15 +301,15 @@ func TestEncryptPlaintextOAuthTokens(t *testing.T) {
 	future := time.Now().Add(time.Hour).UTC().Format("2006-01-02 15:04:05")
 
 	insertPlaintextRow(t, db,
-		`INSERT INTO oauth_tokens (id, access_token, refresh_token, token_type, encryption_status, expires_at, created_at, updated_at)
-		 VALUES (?, ?, ?, 'Bearer', 'plain_text', ?, ?, ?)`,
+		`INSERT INTO mcp_oauth_tokens (id, auth_mode, access_token, refresh_token, token_type, encryption_status, expires_at, created_at, updated_at)
+		 VALUES (?, 'shared', ?, ?, 'Bearer', 'plain_text', ?, ?, ?)`,
 		"tok-batch-1", "access-1", "refresh-1", future, now, now)
 
 	count, err := store.encryptPlaintextOAuthTokens(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
 
-	var found tables.TableOauthToken
+	var found tables.TableMCPOauthToken
 	require.NoError(t, db.First(&found, "id = ?", "tok-batch-1").Error)
 	assert.Equal(t, "access-1", found.AccessToken)
 	assert.Equal(t, "refresh-1", found.RefreshToken)
@@ -320,8 +321,8 @@ func TestEncryptPlaintextPlugins(t *testing.T) {
 	now := time.Now().UTC().Format("2006-01-02 15:04:05")
 
 	insertPlaintextRow(t, db,
-		`INSERT INTO config_plugins (name, enabled, version, config_json, encryption_status, created_at, updated_at)
-		 VALUES (?, ?, 1, ?, 'plain_text', ?, ?)`,
+		`INSERT INTO config_plugins (name, enabled, config_json, encryption_status, created_at, updated_at)
+		 VALUES (?, ?, ?, 'plain_text', ?, ?)`,
 		"batch-plugin", true, `{"secret":"value"}`, now, now)
 
 	count, err := store.encryptPlaintextPlugins(ctx)
@@ -341,8 +342,8 @@ func TestEncryptPlaintextPlugins_SkipsEmptyConfig(t *testing.T) {
 
 	// Insert plugin with empty config — should NOT be picked up by the query
 	insertPlaintextRow(t, db,
-		`INSERT INTO config_plugins (name, enabled, version, config_json, encryption_status, created_at, updated_at)
-		 VALUES (?, ?, 1, '{}', 'plain_text', ?, ?)`,
+		`INSERT INTO config_plugins (name, enabled, config_json, encryption_status, created_at, updated_at)
+		 VALUES (?, ?, '{}', 'plain_text', ?, ?)`,
 		"empty-config-plugin", true, now, now)
 
 	count, err := store.encryptPlaintextPlugins(ctx)
@@ -428,19 +429,49 @@ func TestEncryptPlaintextVirtualKeys_EncryptsAndDecryptsCorrectly(t *testing.T) 
 	// GORM hooks should decrypt on read
 	var found tables.TableVirtualKey
 	require.NoError(t, db.Where("id = ?", "vk-batch-1").First(&found).Error)
-	assert.Equal(t, "vk-batch-secret", found.Value)
+	assert.Equal(t, "vk-batch-secret", found.Value.GetValue())
+}
+
+func TestVirtualKeyPreviousValue_EncryptsAndDecryptsCorrectly(t *testing.T) {
+	_, db := setupEncryptionTestStore(t)
+	now := time.Now().UTC()
+	exp := now.Add(10 * time.Minute)
+
+	vk := &tables.TableVirtualKey{
+		ID:                     "vk-prev-enc",
+		Name:                   "prev-enc-vk",
+		Value:                  *schemas.NewSecretVar("vk-current-secret"),
+		IsActive:               schemas.Ptr(true),
+		PreviousValue:          *schemas.NewSecretVar("vk-previous-secret"),
+		PreviousValueExpiresAt: &exp,
+		RotatedAt:              &now,
+	}
+	require.NoError(t, db.Create(vk).Error)
+
+	// Raw DB must hold the previous value encrypted, with its hash computed.
+	var raw map[string]any
+	db.Table("governance_virtual_keys").Where("id = ?", "vk-prev-enc").Take(&raw)
+	assert.Equal(t, "encrypted", raw["encryption_status"])
+	assert.NotEqual(t, "vk-previous-secret", raw["previous_value"])
+	assert.NotEmpty(t, raw["previous_value_hash"])
+
+	// GORM hooks should decrypt both values on read.
+	var found tables.TableVirtualKey
+	require.NoError(t, db.Where("id = ?", "vk-prev-enc").First(&found).Error)
+	assert.Equal(t, "vk-current-secret", found.Value.GetValue())
+	assert.Equal(t, "vk-previous-secret", found.PreviousValue.GetValue())
+	assert.True(t, found.HasActivePreviousValue(now))
 }
 
 func TestEncryptPlaintextOAuthConfigs_EncryptsAndDecryptsCorrectly(t *testing.T) {
 	store, db := setupEncryptionTestStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC().Format("2006-01-02 15:04:05")
-	future := time.Now().Add(time.Hour).UTC().Format("2006-01-02 15:04:05")
 
 	insertPlaintextRow(t, db,
-		`INSERT INTO oauth_configs (id, client_secret, code_verifier, redirect_uri, state, status, encryption_status, created_at, updated_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?, 'pending', 'plain_text', ?, ?, ?)`,
-		"cfg-batch-1", "batch-client-secret", "batch-verifier", "https://example.com/cb", "csrf", now, now, future)
+		`INSERT INTO oauth_configs (id, client_secret, redirect_uri, status, encryption_status, created_at, updated_at)
+		 VALUES (?, ?, ?, 'pending', 'plain_text', ?, ?)`,
+		"cfg-batch-1", "batch-client-secret", "https://example.com/cb", now, now)
 
 	count, err := store.encryptPlaintextOAuthConfigs(ctx)
 	require.NoError(t, err)
@@ -451,13 +482,11 @@ func TestEncryptPlaintextOAuthConfigs_EncryptsAndDecryptsCorrectly(t *testing.T)
 	db.Table("oauth_configs").Where("id = ?", "cfg-batch-1").Take(&raw)
 	assert.Equal(t, "encrypted", raw["encryption_status"])
 	assert.NotEqual(t, "batch-client-secret", raw["client_secret"])
-	assert.NotEqual(t, "batch-verifier", raw["code_verifier"])
 
 	// GORM hooks should decrypt on read
 	var found tables.TableOauthConfig
 	require.NoError(t, db.Where("id = ?", "cfg-batch-1").First(&found).Error)
 	assert.Equal(t, "batch-client-secret", found.ClientSecret.GetValue())
-	assert.Equal(t, "batch-verifier", found.CodeVerifier)
 }
 
 func TestEncryptPlaintextMCPClients_EncryptsAndDecryptsCorrectly(t *testing.T) {
@@ -775,7 +804,7 @@ func TestEncryptPlaintextKeys_BedrockFields_EncryptsAndDecryptsCorrectly(t *test
 	assert.Equal(t, "us-west-2", found.BedrockKeyConfig.Region.GetValue())
 	require.NotNil(t, found.BedrockKeyConfig.ARN)
 	assert.Equal(t, "arn:aws:iam::123456789:role/bedrock", found.BedrockKeyConfig.ARN.GetValue())
-	assert.Equal(t, "profile-claude", found.Aliases["claude-3"])
+	assert.Equal(t, "profile-claude", found.Aliases["claude-3"].ModelID)
 	require.NotNil(t, found.BedrockKeyConfig.BatchS3Config)
 	require.Len(t, found.BedrockKeyConfig.BatchS3Config.Buckets, 1)
 	assert.Equal(t, "my-bucket", found.BedrockKeyConfig.BatchS3Config.Buckets[0].BucketName)
@@ -851,25 +880,29 @@ func TestBeforeSave_DoesNotMutateSharedProviderConfigs(t *testing.T) {
 	// save it to DB, and verify the original config structs are not mutated by BeforeSave
 	// (encryption uses value-copies so shared pointers are never corrupted).
 	azureCfg := &schemas.AzureKeyConfig{
-		Endpoint: *schemas.NewEnvVar("https://myresource.openai.azure.com"),
-		ClientID: schemas.NewEnvVar("my-azure-client-id"),
-		TenantID: schemas.NewEnvVar("my-azure-tenant-id"),
+		Endpoint:              *schemas.NewSecretVar("https://myresource.openai.azure.com"),
+		ClientID:              schemas.NewSecretVar("my-azure-client-id"),
+		TenantID:              schemas.NewSecretVar("my-azure-tenant-id"),
+		UseSpeechEndpoints:    true,
+		UseVoiceLiveEndpoints: true,
 	}
-	azureCfg.ClientSecret = schemas.NewEnvVar("azure-client-secret")
+	azureCfg.ClientSecret = schemas.NewSecretVar("azure-client-secret")
 
 	vertexCfg := &schemas.VertexKeyConfig{
-		ProjectID:       *schemas.NewEnvVar("my-project"),
-		ProjectNumber:   *schemas.NewEnvVar("123456789"),
-		Region:          *schemas.NewEnvVar("us-central1"),
-		AuthCredentials: *schemas.NewEnvVar("vertex-creds"),
+		ProjectID:         *schemas.NewSecretVar("my-project"),
+		ProjectNumber:     *schemas.NewSecretVar("123456789"),
+		Region:            *schemas.NewSecretVar("us-central1"),
+		AuthCredentials:   *schemas.NewSecretVar("vertex-creds"),
+		ForceSingleRegion: true,
+		UseSessionRouting: true,
 	}
 
 	bedrockCfg := &schemas.BedrockKeyConfig{
-		AccessKey:    *schemas.NewEnvVar("AKIAEXAMPLE"),
-		SecretKey:    *schemas.NewEnvVar("secret-key"),
-		SessionToken: schemas.NewEnvVar("session-tok"),
-		Region:       schemas.NewEnvVar("us-east-1"),
-		ARN:          schemas.NewEnvVar("arn:aws:iam::123456789:role/test"),
+		AccessKey:    *schemas.NewSecretVar("AKIAEXAMPLE"),
+		SecretKey:    *schemas.NewSecretVar("secret-key"),
+		SessionToken: schemas.NewSecretVar("session-tok"),
+		Region:       schemas.NewSecretVar("us-east-1"),
+		ARN:          schemas.NewSecretVar("arn:aws:iam::123456789:role/test"),
 	}
 
 	// Save a key using the shared config pointers (mimics UpdateProvidersConfig)
@@ -878,7 +911,7 @@ func TestBeforeSave_DoesNotMutateSharedProviderConfigs(t *testing.T) {
 		ProviderID:       1,
 		Provider:         "azure",
 		KeyID:            "sp-1",
-		Value:            *schemas.NewEnvVar("sk-test-value"),
+		Value:            *schemas.NewSecretVar("sk-test-value"),
 		AzureKeyConfig:   azureCfg,
 		VertexKeyConfig:  vertexCfg,
 		BedrockKeyConfig: bedrockCfg,
@@ -908,6 +941,8 @@ func TestBeforeSave_DoesNotMutateSharedProviderConfigs(t *testing.T) {
 		"BeforeSave must not mutate shared VertexKeyConfig.ProjectNumber")
 	assert.Equal(t, "us-central1", vertexCfg.Region.GetValue(),
 		"BeforeSave must not mutate shared VertexKeyConfig.Region")
+	assert.True(t, vertexCfg.ForceSingleRegion,
+		"BeforeSave must not mutate shared VertexKeyConfig.ForceSingleRegion")
 
 	// Bedrock: encrypted fields
 	assert.Equal(t, "AKIAEXAMPLE", bedrockCfg.AccessKey.GetValue(),
@@ -930,11 +965,19 @@ func TestBeforeSave_DoesNotMutateSharedProviderConfigs(t *testing.T) {
 	assert.Equal(t, "azure-client-secret", found.AzureKeyConfig.ClientSecret.GetValue())
 	assert.Equal(t, "my-azure-client-id", found.AzureKeyConfig.ClientID.GetValue())
 	assert.Equal(t, "my-azure-tenant-id", found.AzureKeyConfig.TenantID.GetValue())
+	assert.True(t, found.AzureKeyConfig.UseSpeechEndpoints,
+		"UseSpeechEndpoints must survive the save/reload round-trip")
+	assert.True(t, found.AzureKeyConfig.UseVoiceLiveEndpoints,
+		"UseVoiceLiveEndpoints must survive the save/reload round-trip")
 	require.NotNil(t, found.VertexKeyConfig)
 	assert.Equal(t, "vertex-creds", found.VertexKeyConfig.AuthCredentials.GetValue())
 	assert.Equal(t, "my-project", found.VertexKeyConfig.ProjectID.GetValue())
 	assert.Equal(t, "123456789", found.VertexKeyConfig.ProjectNumber.GetValue())
 	assert.Equal(t, "us-central1", found.VertexKeyConfig.Region.GetValue())
+	assert.True(t, found.VertexKeyConfig.ForceSingleRegion,
+		"ForceSingleRegion must survive the save/reload round-trip")
+	assert.True(t, found.VertexKeyConfig.UseSessionRouting,
+		"UseSessionRouting must survive the save/reload round-trip")
 	require.NotNil(t, found.BedrockKeyConfig)
 	assert.Equal(t, "AKIAEXAMPLE", found.BedrockKeyConfig.AccessKey.GetValue())
 	assert.Equal(t, "secret-key", found.BedrockKeyConfig.SecretKey.GetValue())
@@ -944,13 +987,13 @@ func TestBeforeSave_DoesNotMutateSharedProviderConfigs(t *testing.T) {
 }
 
 // ============================================================================
-// EnvVar-backed fields must not be encrypted (encryption is a no-op for FromEnv)
+// SecretVar-backed fields must not be encrypted (encryption is a no-op for FromEnv)
 // ============================================================================
 
-func TestBeforeSave_EnvVarBackedFields_NotEncrypted(t *testing.T) {
+func TestBeforeSave_SecretVarBackedFields_NotEncrypted(t *testing.T) {
 	_, db := setupEncryptionTestStore(t)
 
-	// Set environment variables that the EnvVars will resolve to
+	// Set environment variables that the SecretVars will resolve to
 	t.Setenv("TEST_AZURE_KEY", "sk-azure-from-env")
 	t.Setenv("TEST_AZURE_ENDPOINT", "https://env-resource.openai.azure.com")
 	t.Setenv("TEST_AZURE_SECRET", "env-azure-client-secret")
@@ -965,39 +1008,39 @@ func TestBeforeSave_EnvVarBackedFields_NotEncrypted(t *testing.T) {
 	t.Setenv("TEST_BEDROCK_REGION", "env-us-east-1")
 	t.Setenv("TEST_BEDROCK_ARN", "arn:aws:iam::env:role/test")
 
-	// Create EnvVars backed by environment variables
+	// Create SecretVars backed by environment variables
 	azureCfg := &schemas.AzureKeyConfig{
-		Endpoint:     *schemas.NewEnvVar("env.TEST_AZURE_ENDPOINT"),
-		ClientID:     schemas.NewEnvVar("env.TEST_AZURE_CLIENT_ID"),
-		ClientSecret: schemas.NewEnvVar("env.TEST_AZURE_SECRET"),
-		TenantID:     schemas.NewEnvVar("env.TEST_AZURE_TENANT_ID"),
+		Endpoint:     *schemas.NewSecretVar("env.TEST_AZURE_ENDPOINT"),
+		ClientID:     schemas.NewSecretVar("env.TEST_AZURE_CLIENT_ID"),
+		ClientSecret: schemas.NewSecretVar("env.TEST_AZURE_SECRET"),
+		TenantID:     schemas.NewSecretVar("env.TEST_AZURE_TENANT_ID"),
 	}
 	vertexCfg := &schemas.VertexKeyConfig{
-		ProjectID:       *schemas.NewEnvVar("env.TEST_VERTEX_PROJECT"),
-		Region:          *schemas.NewEnvVar("env.TEST_VERTEX_REGION"),
-		AuthCredentials: *schemas.NewEnvVar("env.TEST_VERTEX_CREDS"),
+		ProjectID:       *schemas.NewSecretVar("env.TEST_VERTEX_PROJECT"),
+		Region:          *schemas.NewSecretVar("env.TEST_VERTEX_REGION"),
+		AuthCredentials: *schemas.NewSecretVar("env.TEST_VERTEX_CREDS"),
 	}
 	bedrockCfg := &schemas.BedrockKeyConfig{
-		AccessKey:    *schemas.NewEnvVar("env.TEST_BEDROCK_ACCESS"),
-		SecretKey:    *schemas.NewEnvVar("env.TEST_BEDROCK_SECRET"),
-		SessionToken: schemas.NewEnvVar("env.TEST_BEDROCK_SESSION"),
-		Region:       schemas.NewEnvVar("env.TEST_BEDROCK_REGION"),
-		ARN:          schemas.NewEnvVar("env.TEST_BEDROCK_ARN"),
+		AccessKey:    *schemas.NewSecretVar("env.TEST_BEDROCK_ACCESS"),
+		SecretKey:    *schemas.NewSecretVar("env.TEST_BEDROCK_SECRET"),
+		SessionToken: schemas.NewSecretVar("env.TEST_BEDROCK_SESSION"),
+		Region:       schemas.NewSecretVar("env.TEST_BEDROCK_REGION"),
+		ARN:          schemas.NewSecretVar("env.TEST_BEDROCK_ARN"),
 	}
 
-	// Verify the EnvVars resolved correctly and are marked as FromEnv
-	require.True(t, azureCfg.Endpoint.IsFromEnv())
+	// Verify the SecretVars resolved correctly and are marked as FromEnv
+	require.True(t, azureCfg.Endpoint.IsFromSecret())
 	require.Equal(t, "https://env-resource.openai.azure.com", azureCfg.Endpoint.GetValue())
-	require.True(t, azureCfg.ClientSecret.IsFromEnv())
-	require.True(t, vertexCfg.AuthCredentials.IsFromEnv())
-	require.True(t, bedrockCfg.AccessKey.IsFromEnv())
+	require.True(t, azureCfg.ClientSecret.IsFromSecret())
+	require.True(t, vertexCfg.AuthCredentials.IsFromSecret())
+	require.True(t, bedrockCfg.AccessKey.IsFromSecret())
 
 	key := &tables.TableKey{
 		Name:             "env-backed-key",
 		ProviderID:       1,
 		Provider:         "azure",
 		KeyID:            "env-1",
-		Value:            *schemas.NewEnvVar("env.TEST_AZURE_KEY"),
+		Value:            *schemas.NewSecretVar("env.TEST_AZURE_KEY"),
 		AzureKeyConfig:   azureCfg,
 		VertexKeyConfig:  vertexCfg,
 		BedrockKeyConfig: bedrockCfg,
@@ -1005,7 +1048,7 @@ func TestBeforeSave_EnvVarBackedFields_NotEncrypted(t *testing.T) {
 	require.NoError(t, db.Create(key).Error)
 
 	// Raw DB should store the env var references, NOT encrypted ciphertext.
-	// EnvVar.Value() returns the env var name (e.g. "env.TEST_AZURE_KEY") when FromEnv=true.
+	// SecretVar.Value() returns the env var name (e.g. "env.TEST_AZURE_KEY") when FromEnv=true.
 	var raw map[string]any
 	db.Table("config_keys").Where("name = ?", "env-backed-key").Take(&raw)
 	assert.Equal(t, "encrypted", raw["encryption_status"])
@@ -1016,56 +1059,56 @@ func TestBeforeSave_EnvVarBackedFields_NotEncrypted(t *testing.T) {
 
 	// The shared config structs must NOT be mutated
 	assert.Equal(t, "https://env-resource.openai.azure.com", azureCfg.Endpoint.GetValue())
-	assert.True(t, azureCfg.Endpoint.IsFromEnv())
+	assert.True(t, azureCfg.Endpoint.IsFromSecret())
 	assert.Equal(t, "env-azure-client-secret", azureCfg.ClientSecret.GetValue())
-	assert.True(t, azureCfg.ClientSecret.IsFromEnv())
+	assert.True(t, azureCfg.ClientSecret.IsFromSecret())
 	assert.Equal(t, "env-vertex-creds-json", vertexCfg.AuthCredentials.GetValue())
-	assert.True(t, vertexCfg.AuthCredentials.IsFromEnv())
+	assert.True(t, vertexCfg.AuthCredentials.IsFromSecret())
 	assert.Equal(t, "env-AKIA-ACCESS", bedrockCfg.AccessKey.GetValue())
-	assert.True(t, bedrockCfg.AccessKey.IsFromEnv())
+	assert.True(t, bedrockCfg.AccessKey.IsFromSecret())
 	assert.Equal(t, "env-bedrock-secret", bedrockCfg.SecretKey.GetValue())
-	assert.True(t, bedrockCfg.SecretKey.IsFromEnv())
+	assert.True(t, bedrockCfg.SecretKey.IsFromSecret())
 	assert.Equal(t, "env-bedrock-session", bedrockCfg.SessionToken.GetValue())
-	assert.True(t, bedrockCfg.SessionToken.IsFromEnv())
+	assert.True(t, bedrockCfg.SessionToken.IsFromSecret())
 
-	// GORM round-trip: AfterFind should reconstruct env-backed EnvVars correctly
+	// GORM round-trip: AfterFind should reconstruct env-backed SecretVars correctly
 	var found tables.TableKey
 	require.NoError(t, db.Where("name = ?", "env-backed-key").First(&found).Error)
 	assert.Equal(t, "sk-azure-from-env", found.Value.GetValue())
-	assert.True(t, found.Value.IsFromEnv())
+	assert.True(t, found.Value.IsFromSecret())
 
 	require.NotNil(t, found.AzureKeyConfig)
 	assert.Equal(t, "https://env-resource.openai.azure.com", found.AzureKeyConfig.Endpoint.GetValue())
-	assert.True(t, found.AzureKeyConfig.Endpoint.IsFromEnv())
+	assert.True(t, found.AzureKeyConfig.Endpoint.IsFromSecret())
 	assert.Equal(t, "env-azure-client-secret", found.AzureKeyConfig.ClientSecret.GetValue())
-	assert.True(t, found.AzureKeyConfig.ClientSecret.IsFromEnv())
+	assert.True(t, found.AzureKeyConfig.ClientSecret.IsFromSecret())
 	assert.Equal(t, "env-azure-client-id", found.AzureKeyConfig.ClientID.GetValue())
-	assert.True(t, found.AzureKeyConfig.ClientID.IsFromEnv())
+	assert.True(t, found.AzureKeyConfig.ClientID.IsFromSecret())
 	assert.Equal(t, "env-azure-tenant-id", found.AzureKeyConfig.TenantID.GetValue())
-	assert.True(t, found.AzureKeyConfig.TenantID.IsFromEnv())
+	assert.True(t, found.AzureKeyConfig.TenantID.IsFromSecret())
 
 	require.NotNil(t, found.VertexKeyConfig)
 	assert.Equal(t, "env-vertex-project", found.VertexKeyConfig.ProjectID.GetValue())
-	assert.True(t, found.VertexKeyConfig.ProjectID.IsFromEnv())
+	assert.True(t, found.VertexKeyConfig.ProjectID.IsFromSecret())
 	assert.Equal(t, "env-us-central1", found.VertexKeyConfig.Region.GetValue())
-	assert.True(t, found.VertexKeyConfig.Region.IsFromEnv())
+	assert.True(t, found.VertexKeyConfig.Region.IsFromSecret())
 	assert.Equal(t, "env-vertex-creds-json", found.VertexKeyConfig.AuthCredentials.GetValue())
-	assert.True(t, found.VertexKeyConfig.AuthCredentials.IsFromEnv())
+	assert.True(t, found.VertexKeyConfig.AuthCredentials.IsFromSecret())
 
 	require.NotNil(t, found.BedrockKeyConfig)
 	assert.Equal(t, "env-AKIA-ACCESS", found.BedrockKeyConfig.AccessKey.GetValue())
-	assert.True(t, found.BedrockKeyConfig.AccessKey.IsFromEnv())
+	assert.True(t, found.BedrockKeyConfig.AccessKey.IsFromSecret())
 	assert.Equal(t, "env-bedrock-secret", found.BedrockKeyConfig.SecretKey.GetValue())
-	assert.True(t, found.BedrockKeyConfig.SecretKey.IsFromEnv())
+	assert.True(t, found.BedrockKeyConfig.SecretKey.IsFromSecret())
 	assert.Equal(t, "env-bedrock-session", found.BedrockKeyConfig.SessionToken.GetValue())
-	assert.True(t, found.BedrockKeyConfig.SessionToken.IsFromEnv())
+	assert.True(t, found.BedrockKeyConfig.SessionToken.IsFromSecret())
 	assert.Equal(t, "env-us-east-1", found.BedrockKeyConfig.Region.GetValue())
-	assert.True(t, found.BedrockKeyConfig.Region.IsFromEnv())
+	assert.True(t, found.BedrockKeyConfig.Region.IsFromSecret())
 	assert.Equal(t, "arn:aws:iam::env:role/test", found.BedrockKeyConfig.ARN.GetValue())
-	assert.True(t, found.BedrockKeyConfig.ARN.IsFromEnv())
+	assert.True(t, found.BedrockKeyConfig.ARN.IsFromSecret())
 }
 
-func TestEncryptPlaintextKeys_EnvVarBackedFields_SurviveStartupPass(t *testing.T) {
+func TestEncryptPlaintextKeys_SecretVarBackedFields_SurviveStartupPass(t *testing.T) {
 	store, db := setupEncryptionTestStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC().Format("2006-01-02 15:04:05")
@@ -1101,16 +1144,16 @@ func TestEncryptPlaintextKeys_EnvVarBackedFields_SurviveStartupPass(t *testing.T
 	var found tables.TableKey
 	require.NoError(t, db.Where("name = ?", "env-startup-key").First(&found).Error)
 	assert.Equal(t, "sk-startup-env-key", found.Value.GetValue())
-	assert.True(t, found.Value.IsFromEnv())
+	assert.True(t, found.Value.IsFromSecret())
 	require.NotNil(t, found.AzureKeyConfig)
 	assert.Equal(t, "https://startup.openai.azure.com", found.AzureKeyConfig.Endpoint.GetValue())
-	assert.True(t, found.AzureKeyConfig.Endpoint.IsFromEnv())
+	assert.True(t, found.AzureKeyConfig.Endpoint.IsFromSecret())
 	require.NotNil(t, found.VertexKeyConfig)
 	assert.Equal(t, "startup-vertex-creds", found.VertexKeyConfig.AuthCredentials.GetValue())
-	assert.True(t, found.VertexKeyConfig.AuthCredentials.IsFromEnv())
+	assert.True(t, found.VertexKeyConfig.AuthCredentials.IsFromSecret())
 	require.NotNil(t, found.BedrockKeyConfig)
 	assert.Equal(t, "AKIA-STARTUP", found.BedrockKeyConfig.AccessKey.GetValue())
-	assert.True(t, found.BedrockKeyConfig.AccessKey.IsFromEnv())
+	assert.True(t, found.BedrockKeyConfig.AccessKey.IsFromSecret())
 }
 
 // ============================================================================
@@ -1181,7 +1224,7 @@ func TestEncryptPlaintextRows_EncryptionDisabled_GORMHooksStorePlaintext(t *test
 		ProviderID: 1,
 		Provider:   "openai",
 		KeyID:      "hne-1",
-		Value:      *schemas.NewEnvVar("sk-stays-plain-via-hook"),
+		Value:      *schemas.NewSecretVar("sk-stays-plain-via-hook"),
 	}
 	require.NoError(t, db.Create(key).Error)
 
@@ -1210,19 +1253,18 @@ func TestEncryptPlaintextRows_EmptyDatabase(t *testing.T) {
 }
 
 // ============================================================================
-// OAuthConfigs skip when both secrets are empty
+// OAuthConfigs skip when client_secret is empty
 // ============================================================================
 
-func TestEncryptPlaintextOAuthConfigs_SkipsBothEmptySecrets(t *testing.T) {
+func TestEncryptPlaintextOAuthConfigs_SkipsEmptySecret(t *testing.T) {
 	store, db := setupEncryptionTestStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC().Format("2006-01-02 15:04:05")
-	future := time.Now().Add(time.Hour).UTC().Format("2006-01-02 15:04:05")
 
 	insertPlaintextRow(t, db,
-		`INSERT INTO oauth_configs (id, client_secret, code_verifier, redirect_uri, state, status, encryption_status, created_at, updated_at, expires_at)
-		 VALUES (?, '', '', ?, ?, 'pending', 'plain_text', ?, ?, ?)`,
-		"cfg-empty-secrets", "https://example.com/cb", "csrf-state", now, now, future)
+		`INSERT INTO oauth_configs (id, client_secret, redirect_uri, status, encryption_status, created_at, updated_at)
+		 VALUES (?, '', ?, 'pending', 'plain_text', ?, ?)`,
+		"cfg-empty-secrets", "https://example.com/cb", now, now)
 
 	count, err := store.encryptPlaintextOAuthConfigs(ctx)
 	require.NoError(t, err)
@@ -1282,7 +1324,7 @@ func TestEncryptPlaintextVirtualKeys_HashComputedDuringStartup(t *testing.T) {
 // MCP client env var connection string survives startup pass
 // ============================================================================
 
-func TestEncryptPlaintextMCPClients_EnvVarConnectionStringSurvivesStartup(t *testing.T) {
+func TestEncryptPlaintextMCPClients_SecretVarConnectionStringSurvivesStartup(t *testing.T) {
 	store, db := setupEncryptionTestStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC().Format("2006-01-02 15:04:05")
@@ -1306,7 +1348,7 @@ func TestEncryptPlaintextMCPClients_EnvVarConnectionStringSurvivesStartup(t *tes
 	var found tables.TableMCPClient
 	require.NoError(t, db.Where("client_id = ?", "mcp-env-startup").First(&found).Error)
 	assert.Equal(t, "https://mcp-env.example.com/sse", found.ConnectionString.GetValue())
-	assert.True(t, found.ConnectionString.IsFromEnv())
+	assert.True(t, found.ConnectionString.IsFromSecret())
 }
 
 // ============================================================================
@@ -1342,7 +1384,7 @@ func TestEncryptPlaintextRows_SkipsAlreadyEncryptedVirtualKeys(t *testing.T) {
 	vk := &tables.TableVirtualKey{
 		ID:       "vk-already-enc",
 		Name:     "already-encrypted-vk",
-		Value:    "vk-secret-already",
+		Value:    *schemas.NewSecretVar("vk-secret-already"),
 		IsActive: bifrost.Ptr(true),
 	}
 	require.NoError(t, db.Create(vk).Error)
@@ -1370,8 +1412,8 @@ func TestEncryptPlaintextOAuthTokens_EmptyRefreshToken(t *testing.T) {
 	future := time.Now().Add(time.Hour).UTC().Format("2006-01-02 15:04:05")
 
 	insertPlaintextRow(t, db,
-		`INSERT INTO oauth_tokens (id, access_token, refresh_token, token_type, encryption_status, expires_at, created_at, updated_at)
-		 VALUES (?, ?, '', 'Bearer', 'plain_text', ?, ?, ?)`,
+		`INSERT INTO mcp_oauth_tokens (id, auth_mode, access_token, refresh_token, token_type, encryption_status, expires_at, created_at, updated_at)
+		 VALUES (?, 'shared', ?, '', 'Bearer', 'plain_text', ?, ?, ?)`,
 		"tok-no-refresh", "access-only-startup", future, now, now)
 
 	count, err := store.encryptPlaintextOAuthTokens(ctx)
@@ -1379,11 +1421,300 @@ func TestEncryptPlaintextOAuthTokens_EmptyRefreshToken(t *testing.T) {
 	assert.Equal(t, 1, count)
 
 	var raw map[string]any
-	db.Table("oauth_tokens").Where("id = ?", "tok-no-refresh").Take(&raw)
+	db.Table("mcp_oauth_tokens").Where("id = ?", "tok-no-refresh").Take(&raw)
 	assert.Equal(t, "encrypted", raw["encryption_status"])
 
-	var found tables.TableOauthToken
+	var found tables.TableMCPOauthToken
 	require.NoError(t, db.First(&found, "id = ?", "tok-no-refresh").Error)
 	assert.Equal(t, "access-only-startup", found.AccessToken)
 	assert.Equal(t, "", found.RefreshToken)
+}
+
+// TestEncryptPlaintextKeys_VertexAWSWorkloadIdentity_EncryptsAndDecryptsCorrectly pins the
+// vertex_aws_workload_identity_json column: a plaintext row is encrypted by the startup pass
+// (the role ARN must not be readable at rest) and the GORM hooks rebuild the nested block.
+func TestEncryptPlaintextKeys_VertexAWSWorkloadIdentity_EncryptsAndDecryptsCorrectly(t *testing.T) {
+	store, db := setupEncryptionTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+
+	wifJSON := `{"audience":"//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/eks/providers/aws","service_account_email":"vertex@my-project.iam.gserviceaccount.com","token_lifetime_seconds":1800,"aws_region":"us-east-1","aws_role_arn":"arn:aws:iam::123456789012:role/VertexHop"}`
+	insertPlaintextRow(t, db,
+		`INSERT INTO config_keys (name, provider_id, provider, key_id, value, vertex_project_id, vertex_region, vertex_aws_workload_identity_json, encryption_status, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'plain_text', ?, ?)`,
+		"vertex-wif-key", 1, "vertex", "vx-wif", "",
+		"my-gcp-project", "us-central1", wifJSON, now, now)
+
+	count, err := store.encryptPlaintextKeys(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+
+	var raw map[string]any
+	db.Table("config_keys").Where("name = ?", "vertex-wif-key").Take(&raw)
+	assert.Equal(t, "encrypted", raw["encryption_status"])
+	assert.NotContains(t, fmt.Sprintf("%v", raw["vertex_aws_workload_identity_json"]), "VertexHop")
+
+	var found tables.TableKey
+	require.NoError(t, db.Where("name = ?", "vertex-wif-key").First(&found).Error)
+	require.NotNil(t, found.VertexKeyConfig)
+	wif := found.VertexKeyConfig.AWSWorkloadIdentity
+	require.NotNil(t, wif)
+	assert.Equal(t, "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/eks/providers/aws", wif.Audience.GetValue())
+	assert.Equal(t, "vertex@my-project.iam.gserviceaccount.com", wif.ServiceAccountEmail.GetValue())
+	assert.Equal(t, 1800, wif.TokenLifetimeSeconds)
+	assert.Equal(t, "us-east-1", wif.AWSRegion.GetValue())
+	assert.Equal(t, "arn:aws:iam::123456789012:role/VertexHop", wif.AWSRoleARN.GetValue())
+}
+
+// TestVertexAWSWorkloadIdentity_GORMRoundTrip saves a key through the hooks (BeforeSave serializes
+// and encrypts, AfterFind decrypts and rebuilds) and checks env. references survive the trip and a
+// key without the block leaves the column NULL.
+func TestVertexAWSWorkloadIdentity_GORMRoundTrip(t *testing.T) {
+	_, db := setupEncryptionTestStore(t)
+	t.Setenv("TEST_WIF_AUDIENCE", "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/eks/providers/aws")
+
+	withWIF := tables.TableKey{
+		Name: "vertex-wif", ProviderID: 1, Provider: "vertex", KeyID: "vx-wif-1",
+		VertexKeyConfig: &schemas.VertexKeyConfig{
+			ProjectID: *schemas.NewSecretVar("my-gcp-project"),
+			Region:    *schemas.NewSecretVar("us-central1"),
+			AWSWorkloadIdentity: &schemas.VertexAWSWorkloadIdentityConfig{
+				Audience:   *schemas.NewSecretVar("env.TEST_WIF_AUDIENCE"),
+				AWSRoleARN: schemas.NewSecretVar("arn:aws:iam::123456789012:role/VertexHop"),
+			},
+		},
+	}
+	withoutWIF := tables.TableKey{
+		Name: "vertex-adc", ProviderID: 1, Provider: "vertex", KeyID: "vx-adc-1",
+		VertexKeyConfig: &schemas.VertexKeyConfig{
+			ProjectID: *schemas.NewSecretVar("my-gcp-project"),
+			Region:    *schemas.NewSecretVar("us-central1"),
+		},
+	}
+	require.NoError(t, db.Create(&withWIF).Error)
+	require.NoError(t, db.Create(&withoutWIF).Error)
+
+	var raw map[string]any
+	db.Table("config_keys").Where("name = ?", "vertex-wif").Take(&raw)
+	assert.NotContains(t, fmt.Sprintf("%v", raw["vertex_aws_workload_identity_json"]), "VertexHop", "stored encrypted")
+	db.Table("config_keys").Where("name = ?", "vertex-adc").Take(&raw)
+	assert.Nil(t, raw["vertex_aws_workload_identity_json"], "keys without federation keep the column NULL")
+
+	var found tables.TableKey
+	require.NoError(t, db.Where("name = ?", "vertex-wif").First(&found).Error)
+	require.NotNil(t, found.VertexKeyConfig)
+	require.NotNil(t, found.VertexKeyConfig.AWSWorkloadIdentity)
+	wif := found.VertexKeyConfig.AWSWorkloadIdentity
+	assert.True(t, wif.Audience.IsFromEnv(), "env reference must survive persistence")
+	assert.Equal(t, "env.TEST_WIF_AUDIENCE", wif.Audience.GetRawRef())
+	assert.Equal(t, "arn:aws:iam::123456789012:role/VertexHop", wif.AWSRoleARN.GetValue())
+
+	// A fresh receiver: First() on a populated struct also filters by its primary key.
+	var adc tables.TableKey
+	require.NoError(t, db.Where("name = ?", "vertex-adc").First(&adc).Error)
+	require.NotNil(t, adc.VertexKeyConfig)
+	assert.Nil(t, adc.VertexKeyConfig.AWSWorkloadIdentity)
+}
+
+// TestMigrationAddVertexAWSWorkloadIdentityColumn verifies the upgrade path: a config_keys table
+// provisioned before this release gains the column, and replaying the migration is a no-op.
+func TestMigrationAddVertexAWSWorkloadIdentityColumn(t *testing.T) {
+	_, db := setupEncryptionTestStore(t)
+	ctx := context.Background()
+	require.NoError(t, db.Migrator().DropColumn(&tables.TableKey{}, "vertex_aws_workload_identity_json"))
+	require.False(t, db.Migrator().HasColumn(&tables.TableKey{}, "vertex_aws_workload_identity_json"),
+		"precondition: the column must be absent before the migration runs")
+
+	require.NoError(t, migrationAddVertexAWSWorkloadIdentityColumn(ctx, db, testMigrationLogger))
+	assert.True(t, db.Migrator().HasColumn(&tables.TableKey{}, "vertex_aws_workload_identity_json"))
+
+	require.NoError(t, migrationAddVertexAWSWorkloadIdentityColumn(ctx, db, testMigrationLogger))
+	assert.True(t, db.Migrator().HasColumn(&tables.TableKey{}, "vertex_aws_workload_identity_json"))
+}
+
+// TestMigrationAddVertexAWSWorkloadIdentityColumn_RollbackRefuses pins the down path: the column holds
+// operator-entered federation configuration, so a rollback must refuse instead of dropping it (the same
+// contract as the other non-rollbackable operator-settings columns), leaving the schema and data intact.
+func TestMigrationAddVertexAWSWorkloadIdentityColumn_RollbackRefuses(t *testing.T) {
+	_, db := setupEncryptionTestStore(t)
+	ctx := context.Background()
+	require.True(t, db.Migrator().HasColumn(&tables.TableKey{}, "vertex_aws_workload_identity_json"))
+
+	seed := tables.TableKey{
+		Name: "vertex-wif", ProviderID: 1, Provider: "vertex", KeyID: "vx-wif-rollback",
+		VertexKeyConfig: &schemas.VertexKeyConfig{
+			ProjectID: *schemas.NewSecretVar("my-gcp-project"),
+			Region:    *schemas.NewSecretVar("us-central1"),
+			AWSWorkloadIdentity: &schemas.VertexAWSWorkloadIdentityConfig{
+				Audience: *schemas.NewSecretVar("//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/eks/providers/aws"),
+			},
+		},
+	}
+	require.NoError(t, db.Create(&seed).Error)
+
+	err := rollbackVertexAWSWorkloadIdentityColumn(ctx, db, testMigrationLogger)
+	require.Error(t, err, "rollback must refuse: dropping the column destroys stored federation configuration")
+	assert.Contains(t, err.Error(), "non-rollbackable")
+	assert.True(t, db.Migrator().HasColumn(&tables.TableKey{}, "vertex_aws_workload_identity_json"),
+		"a refused rollback must leave the column intact")
+
+	var found tables.TableKey
+	require.NoError(t, db.Where("name = ?", "vertex-wif").First(&found).Error)
+	require.NotNil(t, found.VertexKeyConfig)
+	require.NotNil(t, found.VertexKeyConfig.AWSWorkloadIdentity, "the stored federation config must survive the refused rollback")
+}
+
+// ============================================================================
+// Plaintext lookup fallbacks only match rows that are still plaintext
+// ============================================================================
+
+// Once a session is encrypted, only its plaintext token resolves it, through the hash. The
+// value stored in the token column is ciphertext and must not act as the token, for reads or
+// deletes. The legacy plaintext fallback keeps serving rows that are still plaintext.
+func TestGetSession_StoredCiphertextDoesNotResolve(t *testing.T) {
+	store, db := setupEncryptionTestStore(t)
+	ctx := context.Background()
+
+	session := &tables.SessionsTable{Token: "session-plain-token", ExpiresAt: time.Now().Add(time.Hour)}
+	require.NoError(t, db.Create(session).Error)
+	var raw map[string]any
+	db.Table("sessions").Where("id = ?", session.ID).Take(&raw)
+	ciphertext, _ := raw["token"].(string)
+	require.NotEmpty(t, ciphertext)
+	require.NotEqual(t, "session-plain-token", ciphertext, "the row stores ciphertext")
+
+	found, err := store.GetSession(ctx, "session-plain-token")
+	require.NoError(t, err)
+	require.NotNil(t, found, "the plaintext token resolves the session")
+	assert.Equal(t, "session-plain-token", found.Token)
+
+	found, err = store.GetSession(ctx, ciphertext)
+	require.NoError(t, err)
+	assert.Nil(t, found, "the at-rest ciphertext must not resolve the session")
+
+	require.NoError(t, store.DeleteSession(ctx, ciphertext))
+	var remaining int64
+	db.Table("sessions").Where("id = ?", session.ID).Count(&remaining)
+	assert.Equal(t, int64(1), remaining, "deleting by ciphertext removes nothing")
+
+	// A row still stored in plaintext is marked plain_text, or was written before the status
+	// column existed and carries NULL or an empty status. All three resolve by token and delete
+	// by token.
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+	later := time.Now().UTC().Add(time.Hour).Format("2006-01-02 15:04:05")
+	for label, status := range legacyPlaintextStatuses {
+		token := "legacy-session-token-" + label
+		insertPlaintextRow(t, db,
+			`INSERT INTO sessions (token, expires_at, created_at, updated_at, encryption_status) VALUES (?, ?, ?, ?, ?)`,
+			token, later, now, now, status)
+		found, err = store.GetSession(ctx, token)
+		require.NoError(t, err)
+		require.NotNil(t, found, "a row still stored in plaintext (status %s) resolves by token", label)
+		assert.Equal(t, token, found.Token)
+
+		require.NoError(t, store.DeleteSession(ctx, token))
+		found, err = store.GetSession(ctx, token)
+		require.NoError(t, err)
+		assert.Nil(t, found, "the plaintext row (status %s) is deleted by its token", label)
+	}
+}
+
+// legacyPlaintextStatuses are the encryption_status values of a row whose sensitive columns are
+// still plaintext: marked so, or written before the column existed (NULL or empty).
+var legacyPlaintextStatuses = map[string]any{"plain_text": "plain_text", "null": nil, "empty": ""}
+
+// The same holds for virtual keys: the stored ciphertext of a key value is not the key.
+func TestFindVirtualKeyByValue_StoredCiphertextDoesNotResolve(t *testing.T) {
+	store, db := setupEncryptionTestStore(t)
+
+	vk := &tables.TableVirtualKey{ID: "vk-cipher", Name: "cipher-vk", Value: *schemas.NewSecretVar("vk-plain-secret"), IsActive: bifrost.Ptr(true)}
+	require.NoError(t, db.Create(vk).Error)
+	var raw map[string]any
+	db.Table("governance_virtual_keys").Where("id = ?", "vk-cipher").Take(&raw)
+	ciphertext, _ := raw["value"].(string)
+	require.NotEmpty(t, ciphertext)
+	require.NotEqual(t, "vk-plain-secret", ciphertext)
+
+	found, err := store.findVirtualKeyByValue(db, "vk-plain-secret")
+	require.NoError(t, err)
+	assert.Equal(t, "vk-cipher", found.ID)
+
+	_, err = store.findVirtualKeyByValue(db, ciphertext)
+	assert.ErrorIs(t, err, ErrNotFound, "the at-rest ciphertext must not resolve the key")
+
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+	for label, status := range legacyPlaintextStatuses {
+		id := "vk-legacy-" + label
+		insertPlaintextRow(t, db,
+			`INSERT INTO governance_virtual_keys (id, name, value, is_active, encryption_status, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			id, "legacy-vk-"+label, id+"-secret", true, status, now, now)
+		found, err = store.findVirtualKeyByValue(db, id+"-secret")
+		require.NoError(t, err)
+		assert.Equal(t, id, found.ID, "a row still stored in plaintext (status %s) resolves by value", label)
+	}
+}
+
+// BenchmarkCredentialLookupFallback measures the credential lookups on the auth path against an
+// encrypted SQLite store: a virtual key found by its hash (the common case), a value that matches
+// nothing and falls back to the legacy plaintext lookup, and a session token that does the same.
+func BenchmarkCredentialLookupFallback(b *testing.B) {
+	store, db := setupEncryptionTestStore(b)
+	vk := &tables.TableVirtualKey{ID: "vk-bench", Name: "bench-vk", Value: *schemas.NewSecretVar("vk-bench-secret"), IsActive: bifrost.Ptr(true)}
+	if err := db.Create(vk).Error; err != nil {
+		b.Fatal(err)
+	}
+	ctx := context.Background()
+	b.Run("virtual_key_hit", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, err := store.findVirtualKeyByValue(db, "vk-bench-secret"); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("virtual_key_miss", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_, _ = store.findVirtualKeyByValue(db, "vk-unknown-secret")
+		}
+	})
+	b.Run("session_miss", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_, _ = store.GetSession(ctx, "unknown-session-token")
+		}
+	})
+}
+
+func TestEncryptPlaintextRelays(t *testing.T) {
+	store, db := setupEncryptionTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+
+	// A row written before encryption was enabled: plaintext credential and header.
+	insertPlaintextRow(t, db,
+		`INSERT INTO config_relays (name, config_json, credential_value, extra_headers_json, encryption_status, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, 'plain_text', ?, ?)`,
+		"tavily", `{"base_url":"https://search.example.com","auth":{"type":"bearer"}}`, "tvly-plain", `{"X-Tenant":{"value":"acme"}}`, now, now)
+
+	count, err := store.encryptPlaintextRelays(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+
+	var raw tables.TableRelay
+	require.NoError(t, db.Session(&gorm.Session{SkipHooks: true}).First(&raw, "name = ?", "tavily").Error)
+	assert.Equal(t, encryptionStatusEncrypted, raw.EncryptionStatus)
+	assert.NotEqual(t, "tvly-plain", raw.CredentialValue.Val)
+	assert.NotContains(t, raw.ExtraHeadersJSON, "acme")
+
+	cfg, err := store.GetRelay(ctx, "tavily")
+	require.NoError(t, err)
+	assert.Equal(t, "tvly-plain", cfg.Credential.Value.GetValue(), "the encrypted row still decrypts")
+	tenant := cfg.ExtraHeaders["X-Tenant"]
+	assert.Equal(t, "acme", tenant.GetValue())
+
+	count, err = store.encryptPlaintextRelays(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, count, "an encrypted row is not processed again")
 }

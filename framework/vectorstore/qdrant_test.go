@@ -29,10 +29,10 @@ type QdrantTestSetup struct {
 }
 
 func NewQdrantTestSetup(t *testing.T) *QdrantTestSetup {
-	host := schemas.NewEnvVar(getEnvWithDefault("QDRANT_HOST", QdrantTestDefaultHost))
-	port := schemas.NewEnvVar(getEnvWithDefault("QDRANT_PORT", QdrantTestDefaultPort))
-	apiKey := schemas.NewEnvVar(os.Getenv("QDRANT_API_KEY"))
-	useTLS := schemas.NewEnvVar(os.Getenv("QDRANT_USE_TLS"))
+	host := schemas.NewSecretVar(getEnvWithDefault("QDRANT_HOST", QdrantTestDefaultHost))
+	port := schemas.NewSecretVar(getEnvWithDefault("QDRANT_PORT", QdrantTestDefaultPort))
+	apiKey := schemas.NewSecretVar(os.Getenv("QDRANT_API_KEY"))
+	useTLS := schemas.NewSecretVar(os.Getenv("QDRANT_USE_TLS"))
 
 	config := QdrantConfig{
 		Host:   *host,
@@ -152,15 +152,15 @@ func TestQdrantConfig_Validation(t *testing.T) {
 		{
 			name: "valid config",
 			config: QdrantConfig{
-				Host: *schemas.NewEnvVar("localhost"),
-				Port: *schemas.NewEnvVar("6334"),
+				Host: *schemas.NewSecretVar("localhost"),
+				Port: *schemas.NewSecretVar("6334"),
 			},
 			expectError: false,
 		},
 		{
 			name: "missing host",
 			config: QdrantConfig{
-				Port: *schemas.NewEnvVar("6334"),
+				Port: *schemas.NewSecretVar("6334"),
 			},
 			expectError: true,
 			errorMsg:    "qdrant host is required",
@@ -168,25 +168,25 @@ func TestQdrantConfig_Validation(t *testing.T) {
 		{
 			name: "missing port uses default",
 			config: QdrantConfig{
-				Host: *schemas.NewEnvVar("localhost"),
+				Host: *schemas.NewSecretVar("localhost"),
 			},
 			expectError: false, // Port defaults to 6334 via CoerceInt fallback
 		},
 		{
 			name: "with api key",
 			config: QdrantConfig{
-				Host:   *schemas.NewEnvVar("cluster.qdrant.io"),
-				Port:   *schemas.NewEnvVar("6334"),
-				APIKey: *schemas.NewEnvVar("test-key"),
+				Host:   *schemas.NewSecretVar("cluster.qdrant.io"),
+				Port:   *schemas.NewSecretVar("6334"),
+				APIKey: *schemas.NewSecretVar("test-key"),
 			},
 			expectError: false,
 		},
 		{
 			name: "with tls",
 			config: QdrantConfig{
-				Host:   *schemas.NewEnvVar("localhost"),
-				Port:   *schemas.NewEnvVar("6334"),
-				UseTLS: *schemas.NewEnvVar("true"),
+				Host:   *schemas.NewSecretVar("localhost"),
+				Port:   *schemas.NewSecretVar("6334"),
+				UseTLS: *schemas.NewSecretVar("true"),
 			},
 			expectError: false,
 		},
@@ -417,9 +417,9 @@ func TestVectorStoreFactory_Qdrant(t *testing.T) {
 
 	logger := bifrost.NewDefaultLogger(schemas.LogLevelInfo)
 
-	host := schemas.NewEnvVar(getEnvWithDefault("QDRANT_HOST", QdrantTestDefaultHost))
-	port := schemas.NewEnvVar(getEnvWithDefault("QDRANT_PORT", QdrantTestDefaultPort))
-	apiKey := schemas.NewEnvVar(os.Getenv("QDRANT_API_KEY"))
+	host := schemas.NewSecretVar(getEnvWithDefault("QDRANT_HOST", QdrantTestDefaultHost))
+	port := schemas.NewSecretVar(getEnvWithDefault("QDRANT_PORT", QdrantTestDefaultPort))
+	apiKey := schemas.NewSecretVar(os.Getenv("QDRANT_API_KEY"))
 
 	config := &Config{
 		Enabled: true,
@@ -503,4 +503,85 @@ func TestQdrantStore_ErrorHandling(t *testing.T) {
 	err = setup.Store.Delete(setup.ctx, QdrantTestCollection, "not-a-uuid")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid id format")
+}
+
+// TestQdrantStore_CreateNamespaceRejectsDimensionChange pins the guard every store shares and the
+// sentinel callers use to tell a configuration mistake apart from a store failure.
+func TestQdrantStore_CreateNamespaceRejectsDimensionChange(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration tests in short mode")
+	}
+
+	setup := NewQdrantTestSetup(t)
+	defer setup.Cleanup(t)
+
+	collection := "TestDimGuard"
+	props := map[string]VectorStoreProperties{"type": {DataType: VectorStorePropertyTypeString}}
+	_ = setup.Store.DeleteNamespace(setup.ctx, collection)
+	defer func() { _ = setup.Store.DeleteNamespace(setup.ctx, collection) }()
+
+	require.NoError(t, setup.Store.CreateNamespace(setup.ctx, collection, 512, props))
+	require.NoError(t, setup.Store.CreateNamespace(setup.ctx, collection, 512, props))
+
+	err := setup.Store.CreateNamespace(setup.ctx, collection, 1024, props)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrDimensionMismatch)
+	assert.Contains(t, err.Error(), "already exists with dimension 512 but config requires 1024")
+}
+
+// TestQdrantStore_GetNearestScoresCosineSimilarity pins GetNearest's threshold and score to cosine
+// similarity, the scale every store uses.
+func TestQdrantStore_GetNearestScoresCosineSimilarity(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration tests in short mode")
+	}
+
+	setup := NewQdrantTestSetup(t)
+	defer setup.Cleanup(t)
+
+	collection := "TestCosineScore"
+	props := map[string]VectorStoreProperties{"label": {DataType: VectorStorePropertyTypeString}}
+	_ = setup.Store.DeleteNamespace(setup.ctx, collection)
+	defer func() { _ = setup.Store.DeleteNamespace(setup.ctx, collection) }()
+	require.NoError(t, setup.Store.CreateNamespace(setup.ctx, collection, 2, props))
+
+	require.NoError(t, setup.Store.Add(setup.ctx, collection, generateUUID(), unitVectorAtCosine(2, 0.9), map[string]interface{}{"label": "close"}))
+	require.NoError(t, setup.Store.Add(setup.ctx, collection, generateUUID(), unitVectorAtCosine(2, 0.7), map[string]interface{}{"label": "far"}))
+
+	results, err := setup.Store.GetNearest(setup.ctx, collection, unitVectorAtCosine(2, 1), nil, []string{"label"}, 0.8, 10)
+	require.NoError(t, err)
+	require.Len(t, results, 1, "only the vector at cosine 0.9 clears a 0.8 threshold")
+	assert.Equal(t, "close", results[0].Properties["label"])
+	require.NotNil(t, results[0].Score)
+	assert.InDelta(t, 0.9, *results[0].Score, 1e-3)
+}
+
+// TestQdrantStore_DeleteMissingIDSucceeds pins deleting an id that was never written as a no-op,
+// the contract every store shares so clearing an unknown cache entry is not a server error.
+func TestQdrantStore_DeleteMissingIDSucceeds(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration tests in short mode")
+	}
+
+	setup := NewQdrantTestSetup(t)
+	defer setup.Cleanup(t)
+
+	props := map[string]VectorStoreProperties{"type": {DataType: VectorStorePropertyTypeString}}
+	require.NoError(t, setup.Store.CreateNamespace(setup.ctx, QdrantTestCollection, QdrantTestDimension, props))
+	assert.NoError(t, setup.Store.Delete(setup.ctx, QdrantTestCollection, generateUUID()))
+}
+
+// TestQdrantStore_DeleteFromMissingCollectionSucceeds pins deleting from a collection that does not
+// exist as a no-op, as it is on every other store: the caller wanted the point absent, and it is.
+func TestQdrantStore_DeleteFromMissingCollectionSucceeds(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration tests in short mode")
+	}
+
+	setup := NewQdrantTestSetup(t)
+	defer setup.Cleanup(t)
+
+	collection := "TestDeleteFromMissingCollection"
+	_ = setup.Store.DeleteNamespace(setup.ctx, collection)
+	assert.NoError(t, setup.Store.Delete(setup.ctx, collection, generateUUID()))
 }

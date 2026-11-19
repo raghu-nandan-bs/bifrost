@@ -6,7 +6,6 @@ import (
 	"mime/multipart"
 	"net/http"
 
-	"github.com/maximhq/bifrost/core/providers/utils"
 	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	"github.com/maximhq/bifrost/core/schemas"
 )
@@ -65,6 +64,111 @@ func ToOpenAIVideoGenerationRequest(bifrostReq *schemas.BifrostVideoGenerationRe
 	return req, nil
 }
 
+// ToOpenAIVideoEditRequest converts a Bifrost video edit request to OpenAI format. OpenAI takes the
+// source video either as an uploaded file or as the ID of a completed video; a URL has no
+// equivalent on their API, so it is rejected rather than silently dropped — it is the sole input.
+func ToOpenAIVideoEditRequest(bifrostReq *schemas.BifrostVideoEditRequest) (*OpenAIVideoEditRequest, error) {
+	if bifrostReq == nil || bifrostReq.Input == nil || bifrostReq.Input.Prompt == "" {
+		return nil, fmt.Errorf("bifrost request, input, or prompt is nil/empty")
+	}
+
+	req := &OpenAIVideoEditRequest{
+		Model:  bifrostReq.Model,
+		Prompt: bifrostReq.Input.Prompt,
+	}
+
+	source := bifrostReq.Input.Video
+	switch {
+	case len(source.Video) > 0:
+		req.Video.Bytes = source.Video
+	case source.ID != "":
+		req.Video.ID = providerUtils.StripVideoIDProviderSuffix(source.ID, schemas.OpenAI)
+	case source.URL != "":
+		return nil, fmt.Errorf("openai video edit accepts an uploaded video or a video id, not a url")
+	default:
+		return nil, fmt.Errorf("source video is required")
+	}
+
+	if bifrostReq.Params != nil {
+		req.ExtraParams = bifrostReq.Params.ExtraParams
+	}
+
+	return req, nil
+}
+
+// ToBifrostVideoEditRequest converts an inbound OpenAI-format video edit request to Bifrost format.
+func ToBifrostVideoEditRequest(openaiReq *OpenAIVideoEditRequest) *schemas.BifrostVideoEditRequest {
+	if openaiReq == nil {
+		return nil
+	}
+
+	provider, model := schemas.ParseModelString(openaiReq.Model, "")
+	// A "provider/model" string wins; otherwise fall back to whatever the transport resolved, which
+	// is the only routing signal when the caller sends no model at all.
+	if provider == "" {
+		provider = openaiReq.Provider
+	}
+
+	return &schemas.BifrostVideoEditRequest{
+		Provider: provider,
+		Model:    model,
+		Input: &schemas.VideoEditInput{
+			Prompt: openaiReq.Prompt,
+			Video: schemas.VideoInput{
+				ID:    openaiReq.Video.ID,
+				Video: openaiReq.Video.Bytes,
+			},
+		},
+		Fallbacks: schemas.ParseFallbacks(openaiReq.Fallbacks),
+	}
+}
+
+// parseVideoEditFormDataBodyFromRequest writes an uploaded-file video edit to a multipart form.
+func parseVideoEditFormDataBodyFromRequest(writer *multipart.Writer, openaiReq *OpenAIVideoEditRequest) *schemas.BifrostError {
+	if err := writer.WriteField("prompt", openaiReq.Prompt); err != nil {
+		return providerUtils.NewBifrostOperationError("failed to write prompt field", err)
+	}
+
+	if openaiReq.Model != "" {
+		if err := writer.WriteField("model", openaiReq.Model); err != nil {
+			return providerUtils.NewBifrostOperationError("failed to write model field", err)
+		}
+	}
+
+	mimeType := http.DetectContentType(openaiReq.Video.Bytes)
+	if !validOpenAIVideoEditMimeTypes[mimeType] {
+		mimeType = "video/mp4"
+	}
+	part, err := writer.CreatePart(map[string][]string{
+		"Content-Disposition": {fmt.Sprintf(`form-data; name="video"; filename="video%s"`, openAIVideoEditExtensions[mimeType])},
+		"Content-Type":        {mimeType},
+	})
+	if err != nil {
+		return providerUtils.NewBifrostOperationError("failed to create form part for video", err)
+	}
+	if _, err := part.Write(openaiReq.Video.Bytes); err != nil {
+		return providerUtils.NewBifrostOperationError("failed to write video file data", err)
+	}
+
+	if err := writer.Close(); err != nil {
+		return providerUtils.NewBifrostOperationError("failed to close multipart writer", err)
+	}
+
+	return nil
+}
+
+var validOpenAIVideoEditMimeTypes = map[string]bool{
+	"video/mp4":       true,
+	"video/webm":      true,
+	"video/quicktime": true,
+}
+
+var openAIVideoEditExtensions = map[string]string{
+	"video/mp4":       ".mp4",
+	"video/webm":      ".webm",
+	"video/quicktime": ".mov",
+}
+
 func ToOpenAIVideoRemixRequest(bifrostReq *schemas.BifrostVideoRemixRequest) (*OpenAIVideoRemixRequest, error) {
 	if bifrostReq == nil || bifrostReq.Input == nil || bifrostReq.Input.Prompt == "" {
 		return nil, fmt.Errorf("bifrost request, input, or prompt is nil/empty")
@@ -101,19 +205,11 @@ func (req *OpenAIVideoGenerationRequest) ToBifrostVideoGenerationRequest(ctx *sc
 		return nil
 	}
 
-	defaultProvider := schemas.OpenAI
-
-	// for requests coming from azure sdk without provider prefix, we need to set the default provider to azure
-	if ctx != nil {
-		if isAzureUser, ok := ctx.Value(schemas.BifrostContextKeyIsAzureUserAgent).(bool); ok && isAzureUser {
-			defaultProvider = schemas.Azure
-		}
-	}
-
-	provider, model := schemas.ParseModelString(req.Model, utils.CheckAndSetDefaultProvider(ctx, defaultProvider))
+	provider, model := schemas.ParseModelString(req.Model, "")
 
 	input := &schemas.VideoGenerationInput{
-		Prompt: req.Prompt,
+		Prompt:   req.Prompt,
+		VideoURI: req.VideoURI,
 	}
 	if req.InputReference != nil {
 		input.InputReference = schemas.Ptr(providerUtils.FileBytesToBase64DataURL(req.InputReference))
@@ -132,30 +228,30 @@ func (req *OpenAIVideoGenerationRequest) ToBifrostVideoGenerationRequest(ctx *sc
 func parseVideoGenerationFormDataBodyFromRequest(writer *multipart.Writer, openaiReq *OpenAIVideoGenerationRequest, providerName schemas.ModelProvider) *schemas.BifrostError {
 	// Add prompt field (required)
 	if openaiReq.Prompt == "" {
-		return providerUtils.NewBifrostOperationError("prompt is required",  nil)
+		return providerUtils.NewBifrostOperationError("prompt is required", nil)
 	}
 	if err := writer.WriteField("prompt", openaiReq.Prompt); err != nil {
-		return providerUtils.NewBifrostOperationError("failed to write prompt field",  err)
+		return providerUtils.NewBifrostOperationError("failed to write prompt field", err)
 	}
 
 	// Add optional model field
 	if openaiReq.Model != "" {
 		if err := writer.WriteField("model", openaiReq.Model); err != nil {
-			return providerUtils.NewBifrostOperationError("failed to write model field",  err)
+			return providerUtils.NewBifrostOperationError("failed to write model field", err)
 		}
 	}
 
 	// Add optional seconds field
 	if openaiReq.Seconds != nil {
 		if err := writer.WriteField("seconds", *openaiReq.Seconds); err != nil {
-			return providerUtils.NewBifrostOperationError("failed to write seconds field",  err)
+			return providerUtils.NewBifrostOperationError("failed to write seconds field", err)
 		}
 	}
 
 	// Add optional size field
 	if openaiReq.Size != "" {
 		if err := writer.WriteField("size", openaiReq.Size); err != nil {
-			return providerUtils.NewBifrostOperationError("failed to write size field",  err)
+			return providerUtils.NewBifrostOperationError("failed to write size field", err)
 		}
 	}
 
@@ -196,16 +292,16 @@ func parseVideoGenerationFormDataBodyFromRequest(writer *multipart.Writer, opena
 			"Content-Type":        {mimeType},
 		})
 		if err != nil {
-			return providerUtils.NewBifrostOperationError("failed to create form part for input_reference",  err)
+			return providerUtils.NewBifrostOperationError("failed to create form part for input_reference", err)
 		}
 		if _, err := part.Write(openaiReq.InputReference); err != nil {
-			return providerUtils.NewBifrostOperationError("failed to write input_reference file data",  err)
+			return providerUtils.NewBifrostOperationError("failed to write input_reference file data", err)
 		}
 	}
 
 	// Close the multipart writer
 	if err := writer.Close(); err != nil {
-		return providerUtils.NewBifrostOperationError("failed to close multipart writer",  err)
+		return providerUtils.NewBifrostOperationError("failed to close multipart writer", err)
 	}
 
 	return nil

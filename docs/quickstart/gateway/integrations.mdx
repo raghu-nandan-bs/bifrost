@@ -19,7 +19,7 @@ Integrations are protocol adapters that make Bifrost **100% compatible** with ex
 import openai
 
 client = openai.OpenAI(
-    api_key="your-openai-key"
+    api_key="<YOUR-OPENAI-API-KEY>"
 )
 ```
 
@@ -29,9 +29,13 @@ import openai
 
 client = openai.OpenAI(
     base_url="http://localhost:8080/openai",  # Point to Bifrost
-    api_key="dummy-key"  # Keys handled by Bifrost
+    api_key="<YOUR-BIFROST-VIRTUAL-KEY>"  # Replace with your actual Bifrost virtual key.
 )
 ```
+
+<Note>
+  If Bifrost is served under a path prefix (`server.base_path`), include it in `base_url`, for example `https://example.com/bifrost/openai`. See [Serving under a path prefix](/deployment-guides/how-to/nginx-reverse-proxy#serving-under-a-path-prefix).
+</Note>
 
 **That's it!** Your application now has automatic fallbacks, governance, monitoring, and all Bifrost features.
 

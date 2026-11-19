@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -748,6 +749,8 @@ func TestResponsesTool_MarshalJSON_RoundTrip(t *testing.T) {
 		`{"type":"function","name":"get_weather","description":"Get weather","strict":true}`,
 		`{"type":"function","name":"search_db","description":"Search database","cache_control":{"type":"ephemeral"},"strict":false}`,
 		`{"type":"file_search","vector_store_ids":["vs_1"],"max_num_results":10}`,
+		// Anthropic advisor server tool: model/max_uses/max_tokens/caching must survive the JSON boundary.
+		`{"type":"advisor","name":"advisor","model":"claude-opus-4-8","max_uses":3,"max_tokens":2048,"caching":{"type":"ephemeral","ttl":"5m"}}`,
 	}
 
 	for _, input := range inputs {
@@ -863,8 +866,7 @@ func TestChatTool_MarshalJSON_EnforcesUnion(t *testing.T) {
 	t.Run("custom_type_clears_function_and_server_tool_fields", func(t *testing.T) {
 		tool := ChatTool{
 			Type:   ChatToolTypeCustom,
-			Custom: &ChatToolCustom{Format: &ChatToolCustomFormat{Type: "text"}},
-			Name:   "my_custom",
+			Custom: &ChatToolCustom{Name: "my_custom", Format: &ChatToolCustomFormat{Type: "text"}},
 			// Leaks
 			Function: &ChatToolFunction{Name: "should_be_stripped"},
 			MaxUses:  Ptr(5),
@@ -874,7 +876,7 @@ func TestChatTool_MarshalJSON_EnforcesUnion(t *testing.T) {
 		raw := string(data)
 
 		assert.Contains(t, raw, `"type":"custom"`)
-		assert.Contains(t, raw, `"my_custom"`) // custom tool retains top-level Name
+		assert.Contains(t, raw, `"my_custom"`) // custom tool keeps custom.name
 		assert.Contains(t, raw, `"format"`)    // custom's format field
 		assert.NotContains(t, raw, `"function"`)
 		assert.NotContains(t, raw, `"should_be_stripped"`)
@@ -1113,7 +1115,7 @@ func TestNetworkConfig_TLSFieldsRoundTrip(t *testing.T) {
 		DefaultRequestTimeoutInSeconds: 60,
 		MaxRetries:                     3,
 		InsecureSkipVerify:             true,
-		CACertPEM:                      NewEnvVar("-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----"),
+		CACertPEM:                      NewSecretVar("-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----"),
 	}
 
 	data, err := json.Marshal(nc)
@@ -1133,7 +1135,7 @@ func TestNetworkConfig_TLSFieldsRoundTrip(t *testing.T) {
 // round-trips correctly through JSON marshaling.
 func TestNetworkConfig_StreamIdleTimeoutRoundTrip(t *testing.T) {
 	nc := NetworkConfig{
-		DefaultRequestTimeoutInSeconds: 30,
+		DefaultRequestTimeoutInSeconds: 300,
 		StreamIdleTimeoutInSeconds:     120,
 	}
 
@@ -1146,6 +1148,37 @@ func TestNetworkConfig_StreamIdleTimeoutRoundTrip(t *testing.T) {
 
 	assert.Equal(t, 120, decoded.StreamIdleTimeoutInSeconds, "stream_idle_timeout_in_seconds should round-trip")
 	assert.Contains(t, string(data), `"stream_idle_timeout_in_seconds":120`)
+}
+
+func TestNetworkConfig_HTTP2PingInterval(t *testing.T) {
+	nc := NetworkConfig{EnforceHTTP2: true, HTTP2PingIntervalInSeconds: 45}
+	data, err := json.Marshal(nc)
+	require.NoError(t, err)
+	var decoded NetworkConfig
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	assert.Equal(t, 45, decoded.HTTP2PingIntervalInSeconds, "http2_ping_interval_in_seconds should round-trip")
+	assert.Contains(t, string(data), `"http2_ping_interval_in_seconds":45`)
+
+	// enforce_http2 set + interval unset -> left at zero (pings are opt-in, off by default)
+	cfgDefault := &ProviderConfig{NetworkConfig: NetworkConfig{EnforceHTTP2: true}}
+	cfgDefault.CheckAndSetDefaults()
+	assert.Equal(t, 0, cfgDefault.NetworkConfig.HTTP2PingIntervalInSeconds)
+
+	// explicit interval is preserved
+	cfgExplicit := &ProviderConfig{NetworkConfig: NetworkConfig{EnforceHTTP2: true, HTTP2PingIntervalInSeconds: 5}}
+	cfgExplicit.CheckAndSetDefaults()
+	assert.Equal(t, 5, cfgExplicit.NetworkConfig.HTTP2PingIntervalInSeconds)
+
+	// enforce_http2 off -> left at zero (no ping keepalive)
+	cfgOff := &ProviderConfig{}
+	cfgOff.CheckAndSetDefaults()
+	assert.Equal(t, 0, cfgOff.NetworkConfig.HTTP2PingIntervalInSeconds)
+
+	// a value above the int64-nanosecond ceiling is clamped rather than left to
+	// overflow silently when the Bedrock transport multiplies it by time.Second
+	cfgOverflow := &ProviderConfig{NetworkConfig: NetworkConfig{EnforceHTTP2: true, HTTP2PingIntervalInSeconds: HTTP2PingIntervalUpperBoundSeconds + 1}}
+	cfgOverflow.CheckAndSetDefaults()
+	assert.Equal(t, HTTP2PingIntervalUpperBoundSeconds, cfgOverflow.NetworkConfig.HTTP2PingIntervalInSeconds)
 }
 
 // TestNormalizeResponsesToolType verifies that versioned/provider-specific tool type
@@ -1178,6 +1211,8 @@ func TestNormalizeResponsesToolType(t *testing.T) {
 		{"web_fetch_20260209", ResponsesToolTypeWebFetch},
 		{"web_fetch_20260309", ResponsesToolTypeWebFetch},
 
+		// bare "computer" is OpenAI's own tool (GPT-6 Astra / GPT-5.6) and must not fold into the preview type
+		{ResponsesToolTypeComputer, ResponsesToolTypeComputer},
 		// computer versioned aliases
 		{"computer_20250124", ResponsesToolTypeComputerUsePreview},
 		{"computer_20251124", ResponsesToolTypeComputerUsePreview},
@@ -1189,6 +1224,26 @@ func TestNormalizeResponsesToolType(t *testing.T) {
 
 		// memory versioned aliases
 		{"memory_20250818", ResponsesToolTypeMemory},
+
+		// tool_search variants (issue #5279) — both variants, dated and undated.
+		// The dated forms used to fall through to the default branch, which is
+		// what made Anthropic treat the server-side meta-tool as a client tool.
+		{ResponsesToolTypeToolSearch, ResponsesToolTypeToolSearch},
+		{"tool_search_tool_regex_20251119", ResponsesToolTypeToolSearch},
+		{"tool_search_tool_bm25_20251119", ResponsesToolTypeToolSearch},
+		{"tool_search_tool_regex", ResponsesToolTypeToolSearch},
+		{"tool_search_tool_bm25", ResponsesToolTypeToolSearch},
+
+		// Types that merely share the tool_search prefix are NOT tool-search
+		// variants and must reach unknown-tool handling rather than being
+		// collapsed onto the canonical type. Anthropic documents exactly two
+		// variants -- tool_search_tool_{regex,bm25}_20251119 -- so anything
+		// else under this prefix is a type Bifrost does not yet understand.
+		// Cite: https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool
+		{"tool_search_preview", "tool_search_preview"},
+		{"tool_search_tool_semantic_20260101", "tool_search_tool_semantic_20260101"},
+		// "regex"/"bm25" appearing anywhere in the string is not enough either.
+		{"custom_regex_search", "custom_regex_search"},
 
 		// Unrecognized types pass through unchanged
 		{"totally_unknown", "totally_unknown"},
@@ -1214,6 +1269,9 @@ func TestResponsesTool_UnmarshalJSON_NormalizesVersionedToolTypes(t *testing.T) 
 		wantWebFetch   bool
 		wantComputer   bool
 		wantCodeInterp bool
+		wantAdvisor    bool
+		wantToolSearch bool
+		wantModel      string
 	}{
 		// web_search variants
 		{name: "web_search canonical", input: `{"type":"web_search"}`, wantType: ResponsesToolTypeWebSearch, wantWebSearch: true},
@@ -1240,6 +1298,15 @@ func TestResponsesTool_UnmarshalJSON_NormalizesVersionedToolTypes(t *testing.T) 
 		{name: "code_execution_20250522", input: `{"type":"code_execution_20250522"}`, wantType: ResponsesToolTypeCodeInterpreter, wantCodeInterp: true},
 		{name: "code_execution_20250825", input: `{"type":"code_execution_20250825"}`, wantType: ResponsesToolTypeCodeInterpreter, wantCodeInterp: true},
 
+		// advisor variants → advisor
+		{name: "advisor canonical", input: `{"type":"advisor","name":"advisor","model":"claude-opus-4-8"}`, wantType: ResponsesToolTypeAdvisor, wantAdvisor: true, wantModel: "claude-opus-4-8"},
+		{name: "advisor_20260301", input: `{"type":"advisor_20260301","name":"advisor","model":"claude-opus-4-8"}`, wantType: ResponsesToolTypeAdvisor, wantAdvisor: true, wantModel: "claude-opus-4-8"},
+
+		// tool_search variants → tool_search (issue #5279)
+		{name: "tool_search canonical", input: `{"type":"tool_search"}`, wantType: ResponsesToolTypeToolSearch, wantToolSearch: true},
+		{name: "tool_search_tool_regex_20251119", input: `{"type":"tool_search_tool_regex_20251119","name":"tool_search_tool_regex"}`, wantType: ResponsesToolTypeToolSearch, wantToolSearch: true},
+		{name: "tool_search_tool_bm25_20251119", input: `{"type":"tool_search_tool_bm25_20251119","name":"tool_search_tool_bm25"}`, wantType: ResponsesToolTypeToolSearch, wantToolSearch: true},
+
 		// unrecognized types pass through unchanged
 		{name: "function unchanged", input: `{"type":"function","name":"foo","strict":true}`, wantType: ResponsesToolTypeFunction},
 		{name: "custom unchanged", input: `{"type":"custom","name":"bar"}`, wantType: ResponsesToolTypeCustom},
@@ -1264,8 +1331,145 @@ func TestResponsesTool_UnmarshalJSON_NormalizesVersionedToolTypes(t *testing.T) 
 			if tt.wantCodeInterp {
 				assert.NotNil(t, tool.ResponsesToolCodeInterpreter, "ResponsesToolCodeInterpreter should be populated")
 			}
+			if tt.wantAdvisor {
+				require.NotNil(t, tool.ResponsesToolAdvisor, "ResponsesToolAdvisor should be populated")
+				assert.Equal(t, tt.wantModel, tool.ResponsesToolAdvisor.Model)
+			}
+			if tt.wantToolSearch {
+				assert.NotNil(t, tool.ResponsesToolToolSearch, "ResponsesToolToolSearch should be populated")
+			}
 		})
 	}
+}
+
+// TestChatTool_ServerToolNameRoundTrip is a diagnostic probe for the Bedrock
+// managed-tool harness failures (`tools.0.<type>.name: Field required`). It feeds
+// the exact request shapes the harness sends for Anthropic server tools through the
+// real Unmarshal -> MarshalSorted round-trip and asserts the top-level `name`
+// survives. If this fails, the name is dropped at the schemas layer (sonic /
+// ChatTool.UnmarshalJSON / normalizeShape) and the fix belongs here for all providers.
+func TestChatTool_ServerToolNameRoundTrip(t *testing.T) {
+	cases := []struct {
+		name     string
+		input    string
+		wantType ChatToolType
+		wantName string
+	}{
+		{"bash", `{"type":"bash_20250124","name":"bash"}`, "bash_20250124", "bash"},
+		{"computer", `{"type":"computer_20251124","name":"computer","display_width_px":1280,"display_height_px":800}`, "computer_20251124", "computer"},
+		{"text_editor", `{"type":"text_editor_20250728","name":"str_replace_based_edit_tool"}`, "text_editor_20250728", "str_replace_based_edit_tool"},
+		{"memory", `{"type":"memory_20250818","name":"memory"}`, "memory_20250818", "memory"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var tool ChatTool
+			require.NoError(t, Unmarshal([]byte(tc.input), &tool))
+			assert.Equal(t, tc.wantType, tool.Type, "type should survive unmarshal")
+			assert.Equal(t, tc.wantName, tool.Name, "name should survive unmarshal")
+
+			out, err := MarshalSorted(tool)
+			require.NoError(t, err)
+			assert.Contains(t, string(out), `"name":"`+tc.wantName+`"`, "marshaled tool must carry name; got %s", string(out))
+		})
+	}
+}
+
+// TestDeepCopyChatTool_PreservesServerToolFields locks in the fix for the Bedrock
+// managed-tool harness 400s (`tools.0.<type>.name: Field required`). The compat
+// plugin clones requests via DeepCopyChatTool during its PreHook; the copier used
+// to drop the top-level Name and every Anthropic server-tool variant field, so a
+// {type:"bash_20250124", name:"bash"} tool reached Bedrock with no name. This
+// asserts all server-tool fields survive the copy and that the copy is independent
+// of the original (mutating the copy must not affect the source).
+// The copy keeps an MCP tool's title, icons and output schema, and shares none of their memory.
+func TestDeepCopyChatTool_PreservesMCPMetadata(t *testing.T) {
+	original := ChatTool{
+		Type:     ChatToolTypeFunction,
+		Function: &ChatToolFunction{Name: "chart"},
+		MCP:      &MCPToolMetadata{Title: "Chart", Icons: []mcp.Icon{{Src: "https://example.com/c.png"}}, OutputSchema: json.RawMessage(`{"type":"object"}`)},
+	}
+	copied := DeepCopyChatTool(original)
+	if copied.MCP == nil || copied.MCP.Title != "Chart" || len(copied.MCP.Icons) != 1 || string(copied.MCP.OutputSchema) != `{"type":"object"}` {
+		t.Fatalf("metadata lost in copy: %+v", copied.MCP)
+	}
+	copied.MCP.Icons[0].Src = "changed"
+	copied.MCP.OutputSchema[0] = '['
+	if original.MCP.Icons[0].Src != "https://example.com/c.png" || original.MCP.OutputSchema[0] != '{' {
+		t.Fatal("copy shares memory with the original")
+	}
+}
+
+func TestDeepCopyChatTool_PreservesServerToolFields(t *testing.T) {
+	original := ChatTool{
+		Type:                "computer_20251124",
+		Name:                "computer",
+		DeferLoading:        Ptr(true),
+		AllowedCallers:      []string{"direct", "code_execution_20250825"},
+		EagerInputStreaming: Ptr(true),
+		InputExamples: []ChatToolInputExample{
+			{Input: json.RawMessage(`{"action":"screenshot"}`), Description: Ptr("take a screenshot")},
+		},
+		MaxUses:          Ptr(5),
+		AllowedDomains:   []string{"example.com"},
+		BlockedDomains:   []string{"evil.com"},
+		UserLocation:     &ChatToolUserLocation{Type: Ptr("approximate"), City: Ptr("SF"), Region: Ptr("CA"), Country: Ptr("US"), Timezone: Ptr("America/Los_Angeles")},
+		MaxContentTokens: Ptr(1000),
+		Citations:        &ChatToolCitationsConfig{Enabled: Ptr(true)},
+		UseCache:         Ptr(true),
+		DisplayWidthPx:   Ptr(1280),
+		DisplayHeightPx:  Ptr(800),
+		DisplayNumber:    Ptr(1),
+		EnableZoom:       Ptr(true),
+		MaxCharacters:    Ptr(2000),
+		MCPServerName:    "my-server",
+		DefaultConfig:    &ChatMCPToolsetConfig{Enabled: Ptr(true), DeferLoading: Ptr(false)},
+		Configs:          map[string]*ChatMCPToolsetConfig{"tool_a": {Enabled: Ptr(false)}},
+	}
+
+	c := DeepCopyChatTool(original)
+
+	// Every server-tool field must survive the copy.
+	assert.Equal(t, ChatToolType("computer_20251124"), c.Type)
+	assert.Equal(t, "computer", c.Name)
+	require.NotNil(t, c.DeferLoading)
+	assert.True(t, *c.DeferLoading)
+	assert.Equal(t, []string{"direct", "code_execution_20250825"}, c.AllowedCallers)
+	require.NotNil(t, c.EagerInputStreaming)
+	require.Len(t, c.InputExamples, 1)
+	assert.JSONEq(t, `{"action":"screenshot"}`, string(c.InputExamples[0].Input))
+	require.NotNil(t, c.MaxUses)
+	assert.Equal(t, 5, *c.MaxUses)
+	assert.Equal(t, []string{"example.com"}, c.AllowedDomains)
+	assert.Equal(t, []string{"evil.com"}, c.BlockedDomains)
+	require.NotNil(t, c.UserLocation)
+	require.NotNil(t, c.UserLocation.City)
+	assert.Equal(t, "SF", *c.UserLocation.City)
+	require.NotNil(t, c.Citations)
+	require.NotNil(t, c.Citations.Enabled)
+	require.NotNil(t, c.MaxContentTokens)
+	require.NotNil(t, c.UseCache)
+	require.NotNil(t, c.DisplayWidthPx)
+	assert.Equal(t, 1280, *c.DisplayWidthPx)
+	require.NotNil(t, c.DisplayHeightPx)
+	require.NotNil(t, c.DisplayNumber)
+	require.NotNil(t, c.EnableZoom)
+	require.NotNil(t, c.MaxCharacters)
+	assert.Equal(t, "my-server", c.MCPServerName)
+	require.NotNil(t, c.DefaultConfig)
+	require.NotNil(t, c.DefaultConfig.Enabled)
+	require.NotNil(t, c.Configs["tool_a"])
+	require.NotNil(t, c.Configs["tool_a"].Enabled)
+
+	// The copy must be independent: mutating it must not touch the original.
+	*c.DisplayWidthPx = 9999
+	c.AllowedDomains[0] = "mutated.com"
+	*c.UserLocation.City = "NYC"
+	c.Configs["tool_a"] = nil
+	assert.Equal(t, 1280, *original.DisplayWidthPx, "original DisplayWidthPx must be unchanged")
+	assert.Equal(t, "example.com", original.AllowedDomains[0], "original AllowedDomains must be unchanged")
+	assert.Equal(t, "SF", *original.UserLocation.City, "original UserLocation.City must be unchanged")
+	assert.NotNil(t, original.Configs["tool_a"], "original Configs entry must be unchanged")
 }
 
 // TestSonic_ChatTool_AnnotationsNeverSerialized verifies that MCPToolAnnotations
@@ -1420,4 +1624,659 @@ func TestSonic_ToolFunctionParameters_DeepCopy_KeyOrderIndependent(t *testing.T)
 
 	assert.NotEqual(t, original.keyOrder.keys[0], copied.keyOrder.keys[0], "copy must not share JSONKeyOrder.keys backing array")
 	assert.Equal(t, "$defs", copied.keyOrder.keys[0])
+}
+
+// --- ChatPromptTokensDetails / ResponsesResponseInputTokens cached_tokens ---
+// Per the OpenAI spec, cached_tokens counts prompt tokens read from the cache. Cache
+// writes must not be folded in, or spec consumers price cache writes as cache reads.
+
+func TestSonic_ChatPromptTokensDetails_CachedTokensExcludesWrites(t *testing.T) {
+	// Fresh-cache turn: write only, no read. cached_tokens must stay 0.
+	out, err := Marshal(ChatPromptTokensDetails{CachedWriteTokens: 9106})
+	require.NoError(t, err)
+	var m map[string]any
+	require.NoError(t, json.Unmarshal(out, &m))
+	assert.Equal(t, float64(0), m["cached_tokens"])
+	assert.Equal(t, float64(9106), m["cached_write_tokens"])
+	assert.Equal(t, float64(9106), m["cache_write_tokens"]) // OpenAI SDK reads this name
+
+	// Cache-hit turn with a concurrent write: cached_tokens must equal reads only.
+	out, err = Marshal(ChatPromptTokensDetails{CachedReadTokens: 500, CachedWriteTokens: 100})
+	require.NoError(t, err)
+	m = nil
+	require.NoError(t, json.Unmarshal(out, &m))
+	assert.Equal(t, float64(500), m["cached_tokens"])
+	assert.Equal(t, float64(500), m["cached_read_tokens"])
+	assert.Equal(t, float64(100), m["cached_write_tokens"])
+	assert.Equal(t, float64(100), m["cache_write_tokens"])
+}
+
+func TestSonic_ChatPromptTokensDetails_CachedTokensRoundTrip(t *testing.T) {
+	// Round-trip must preserve the read/write split; the bare cached_tokens fallback
+	// in UnmarshalJSON only applies when the split fields are absent.
+	in := ChatPromptTokensDetails{CachedReadTokens: 500, CachedWriteTokens: 100}
+	out, err := Marshal(in)
+	require.NoError(t, err)
+	var back ChatPromptTokensDetails
+	require.NoError(t, Unmarshal(out, &back))
+	assert.Equal(t, in.CachedReadTokens, back.CachedReadTokens)
+	assert.Equal(t, in.CachedWriteTokens, back.CachedWriteTokens)
+
+	// OpenAI-spec providers send only cached_tokens; it maps to reads.
+	var d ChatPromptTokensDetails
+	require.NoError(t, Unmarshal([]byte(`{"cached_tokens":42}`), &d))
+	assert.Equal(t, 42, d.CachedReadTokens)
+	assert.Equal(t, 0, d.CachedWriteTokens)
+}
+
+func TestSonic_ResponsesResponseInputTokens_CachedTokensExcludesWrites(t *testing.T) {
+	// Fresh-cache turn: write only, no read. cached_tokens must stay 0.
+	out, err := Marshal(ResponsesResponseInputTokens{CachedWriteTokens: 9106})
+	require.NoError(t, err)
+	var m map[string]any
+	require.NoError(t, json.Unmarshal(out, &m))
+	assert.Equal(t, float64(0), m["cached_tokens"])
+	assert.Equal(t, float64(9106), m["cached_write_tokens"])
+	assert.Equal(t, float64(9106), m["cache_write_tokens"]) // OpenAI SDK reads this name
+
+	// Cache-hit turn with a concurrent write: cached_tokens must equal reads only.
+	out, err = Marshal(ResponsesResponseInputTokens{CachedReadTokens: 500, CachedWriteTokens: 100})
+	require.NoError(t, err)
+	m = nil
+	require.NoError(t, json.Unmarshal(out, &m))
+	assert.Equal(t, float64(500), m["cached_tokens"])
+	assert.Equal(t, float64(500), m["cached_read_tokens"])
+	assert.Equal(t, float64(100), m["cached_write_tokens"])
+	assert.Equal(t, float64(100), m["cache_write_tokens"])
+}
+
+func TestSonic_ResponsesResponseInputTokens_CachedTokensRoundTrip(t *testing.T) {
+	in := ResponsesResponseInputTokens{CachedReadTokens: 500, CachedWriteTokens: 100}
+	out, err := Marshal(in)
+	require.NoError(t, err)
+	var back ResponsesResponseInputTokens
+	require.NoError(t, Unmarshal(out, &back))
+	assert.Equal(t, in.CachedReadTokens, back.CachedReadTokens)
+	assert.Equal(t, in.CachedWriteTokens, back.CachedWriteTokens)
+
+	var d ResponsesResponseInputTokens
+	require.NoError(t, Unmarshal([]byte(`{"cached_tokens":42}`), &d))
+	assert.Equal(t, 42, d.CachedReadTokens)
+	assert.Equal(t, 0, d.CachedWriteTokens)
+}
+
+// OpenAI's Responses API reports cache writes under cache_write_tokens (distinct
+// from Bifrost's cached_write_tokens); it must map into CachedWriteTokens.
+func TestSonic_ResponsesResponseInputTokens_OpenAICacheWriteTokensAlias(t *testing.T) {
+	// Fresh-cache Responses turn: OpenAI sends cache_write_tokens with cached_tokens:0.
+	var d ResponsesResponseInputTokens
+	require.NoError(t, Unmarshal([]byte(`{"cached_tokens":0,"cache_write_tokens":28003}`), &d))
+	assert.Equal(t, 28003, d.CachedWriteTokens)
+	assert.Equal(t, 0, d.CachedReadTokens)
+
+	// Bifrost's own cached_write_tokens takes precedence when both are present.
+	var d2 ResponsesResponseInputTokens
+	require.NoError(t, Unmarshal([]byte(`{"cached_write_tokens":100,"cache_write_tokens":28003}`), &d2))
+	assert.Equal(t, 100, d2.CachedWriteTokens)
+}
+
+func TestSonic_ChatPromptTokensDetails_OpenAICacheWriteTokensAlias(t *testing.T) {
+	var d ChatPromptTokensDetails
+	require.NoError(t, Unmarshal([]byte(`{"cached_tokens":0,"cache_write_tokens":28003}`), &d))
+	assert.Equal(t, 28003, d.CachedWriteTokens)
+	assert.Equal(t, 0, d.CachedReadTokens)
+
+	var d2 ChatPromptTokensDetails
+	require.NoError(t, Unmarshal([]byte(`{"cached_write_tokens":100,"cache_write_tokens":28003}`), &d2))
+	assert.Equal(t, 100, d2.CachedWriteTokens)
+}
+
+// --- prompt_cache_options / prompt_cache_breakpoint (OpenAI gpt-5.6+) ---
+
+func TestSonic_PromptCacheOptions_RoundTrip(t *testing.T) {
+	mode := "explicit"
+	ttl := "30m"
+
+	// Responses request params serialize the object to the wire.
+	out, err := Marshal(ResponsesParameters{PromptCacheOptions: &PromptCacheOptions{Mode: &mode, TTL: &ttl}})
+	require.NoError(t, err)
+	var m map[string]any
+	require.NoError(t, json.Unmarshal(out, &m))
+	pco, ok := m["prompt_cache_options"].(map[string]any)
+	require.True(t, ok, "prompt_cache_options must serialize on ResponsesParameters")
+	assert.Equal(t, "explicit", pco["mode"])
+	assert.Equal(t, "30m", pco["ttl"])
+
+	// Chat request params round-trip (through ChatParameters' custom unmarshaler).
+	out, err = Marshal(ChatParameters{PromptCacheOptions: &PromptCacheOptions{Mode: &mode, TTL: &ttl}})
+	require.NoError(t, err)
+	var cp ChatParameters
+	require.NoError(t, Unmarshal(out, &cp))
+	require.NotNil(t, cp.PromptCacheOptions)
+	assert.Equal(t, "explicit", *cp.PromptCacheOptions.Mode)
+	assert.Equal(t, "30m", *cp.PromptCacheOptions.TTL)
+
+	// Response echo: OpenAI returns prompt_cache_options on the response object.
+	var resp BifrostResponsesResponse
+	require.NoError(t, Unmarshal([]byte(`{"prompt_cache_options":{"mode":"implicit","ttl":"30m"}}`), &resp))
+	require.NotNil(t, resp.PromptCacheOptions)
+	assert.Equal(t, "implicit", *resp.PromptCacheOptions.Mode)
+	assert.Equal(t, "30m", *resp.PromptCacheOptions.TTL)
+}
+
+func TestSonic_PromptCacheBreakpoint_RoundTrip(t *testing.T) {
+	mode := "explicit"
+
+	// Responses content block serializes the breakpoint to the wire.
+	out, err := Marshal(ResponsesMessageContentBlock{
+		Type:                  ResponsesInputMessageContentBlockTypeText,
+		PromptCacheBreakpoint: &PromptCacheBreakpoint{Mode: &mode},
+	})
+	require.NoError(t, err)
+	var m map[string]any
+	require.NoError(t, json.Unmarshal(out, &m))
+	bp, ok := m["prompt_cache_breakpoint"].(map[string]any)
+	require.True(t, ok, "prompt_cache_breakpoint must serialize on ResponsesMessageContentBlock")
+	assert.Equal(t, "explicit", bp["mode"])
+
+	// Chat content block round-trips through its custom unmarshaler.
+	out, err = Marshal(ChatContentBlock{
+		Type:                  ChatContentBlockTypeText,
+		PromptCacheBreakpoint: &PromptCacheBreakpoint{Mode: &mode},
+	})
+	require.NoError(t, err)
+	var cb ChatContentBlock
+	require.NoError(t, Unmarshal(out, &cb))
+	require.NotNil(t, cb.PromptCacheBreakpoint)
+	assert.Equal(t, "explicit", *cb.PromptCacheBreakpoint.Mode)
+}
+
+// prompt_cache_breakpoint.ttl ("30m" or "12h", OpenAI gpt-5.6+) must survive both
+// content block types; dropping it silently downgrades a 12h breakpoint to 30m.
+func TestSonic_PromptCacheBreakpoint_TTLRoundTrip(t *testing.T) {
+	var rb ResponsesMessageContentBlock
+	require.NoError(t, Unmarshal([]byte(`{"type":"input_text","text":"x","prompt_cache_breakpoint":{"mode":"explicit","ttl":"12h"}}`), &rb))
+	require.NotNil(t, rb.PromptCacheBreakpoint)
+	require.NotNil(t, rb.PromptCacheBreakpoint.TTL)
+	assert.Equal(t, "12h", *rb.PromptCacheBreakpoint.TTL)
+	out, err := Marshal(rb)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), `"ttl":"12h"`)
+
+	var cb ChatContentBlock
+	require.NoError(t, Unmarshal([]byte(`{"type":"text","text":"x","prompt_cache_breakpoint":{"mode":"explicit","ttl":"12h"}}`), &cb))
+	require.NotNil(t, cb.PromptCacheBreakpoint)
+	require.NotNil(t, cb.PromptCacheBreakpoint.TTL)
+	assert.Equal(t, "12h", *cb.PromptCacheBreakpoint.TTL)
+	out, err = Marshal(cb)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), `"ttl":"12h"`)
+}
+
+// OpenAI gpt-5.6+ Responses usage splits cache writes by lifetime under
+// cache_write_tokens_details; the split must be parsed (12h writes bill at 2.5x
+// input, 30m at 1.25x) and re-emitted in OpenAI's shape for SDK clients.
+func TestSonic_InputTokens_CacheWriteTokensDetailsTTL(t *testing.T) {
+	const wire = `{"cached_tokens":4000,"cache_write_tokens":7000,"cache_write_tokens_details":{"ttl_30m_tokens":3000,"ttl_12h_tokens":4000}}`
+
+	var rd ResponsesResponseInputTokens
+	require.NoError(t, Unmarshal([]byte(wire), &rd))
+	assert.Equal(t, 4000, rd.CachedReadTokens)
+	assert.Equal(t, 7000, rd.CachedWriteTokens)
+	require.NotNil(t, rd.CachedWriteTokenDetails)
+	assert.Equal(t, 3000, rd.CachedWriteTokenDetails.CachedWriteTokens30m)
+	assert.Equal(t, 4000, rd.CachedWriteTokenDetails.CachedWriteTokens12h)
+	out, err := Marshal(rd)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), `"cache_write_tokens_details":{"ttl_30m_tokens":3000,"ttl_12h_tokens":4000}`)
+
+	// Anthropic-sourced 5m/1h writes must not be relabelled as OpenAI lifetimes.
+	out, err = Marshal(ResponsesResponseInputTokens{CachedWriteTokens: 10, CachedWriteTokenDetails: &ChatCachedWriteTokenDetails{CachedWriteTokens5m: 4, CachedWriteTokens1h: 6}})
+	require.NoError(t, err)
+	assert.NotContains(t, string(out), "cache_write_tokens_details")
+
+	// Chat Completions never reports the split, so the chat shape carries only the
+	// native buckets (what pricing reads after Responses usage is converted).
+	cd := ChatPromptTokensDetails{CachedWriteTokens: 7000, CachedWriteTokenDetails: rd.CachedWriteTokenDetails}
+	out, err = Marshal(cd)
+	require.NoError(t, err)
+	assert.NotContains(t, string(out), "cache_write_tokens_details")
+	var back ChatPromptTokensDetails
+	require.NoError(t, Unmarshal(out, &back))
+	require.NotNil(t, back.CachedWriteTokenDetails)
+	assert.Equal(t, 4000, back.CachedWriteTokenDetails.CachedWriteTokens12h)
+
+	// Usage merge (multi-turn agent loops, fallbacks) sums the new buckets.
+	sum := MergeBifrostLLMUsage(&BifrostLLMUsage{PromptTokensDetails: &cd}, &BifrostLLMUsage{PromptTokensDetails: &cd})
+	require.NotNil(t, sum.PromptTokensDetails.CachedWriteTokenDetails)
+	assert.Equal(t, 8000, sum.PromptTokensDetails.CachedWriteTokenDetails.CachedWriteTokens12h)
+	assert.Equal(t, 6000, sum.PromptTokensDetails.CachedWriteTokenDetails.CachedWriteTokens30m)
+}
+
+// All four lifetime buckets render, so they visibly sum to cached_write_tokens.
+func TestSonic_ChatCachedWriteTokenDetails_AllBucketsRendered(t *testing.T) {
+	out, err := Marshal(ChatCachedWriteTokenDetails{CachedWriteTokens12h: 5})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"cached_write_tokens_5m":0,"cached_write_tokens_1h":0,"cached_write_tokens_30m":0,"cached_write_tokens_12h":5}`, string(out))
+}
+
+// A native Responses stream's response.completed event carries the full response
+// object; prompt_cache_options and cache_write_tokens usage must survive parsing.
+func TestSonic_ResponsesStreamCompleted_CapturesPromptCacheAndCacheWrite(t *testing.T) {
+	event := `{
+		"type": "response.completed",
+		"sequence_number": 42,
+		"response": {
+			"id": "resp_1",
+			"object": "response",
+			"prompt_cache_options": {"mode": "implicit", "ttl": "30m"},
+			"usage": {
+				"input_tokens": 2006,
+				"input_tokens_details": {"cached_tokens": 1920, "cache_write_tokens": 80},
+				"output_tokens": 300,
+				"total_tokens": 2306
+			}
+		}
+	}`
+	var stream BifrostResponsesStreamResponse
+	require.NoError(t, Unmarshal([]byte(event), &stream))
+	require.NotNil(t, stream.Response)
+	require.NotNil(t, stream.Response.PromptCacheOptions)
+	assert.Equal(t, "implicit", *stream.Response.PromptCacheOptions.Mode)
+	assert.Equal(t, "30m", *stream.Response.PromptCacheOptions.TTL)
+	require.NotNil(t, stream.Response.Usage)
+	require.NotNil(t, stream.Response.Usage.InputTokensDetails)
+	assert.Equal(t, 80, stream.Response.Usage.InputTokensDetails.CachedWriteTokens)
+	assert.Equal(t, 1920, stream.Response.Usage.InputTokensDetails.CachedReadTokens)
+}
+
+func TestEmbeddingData_EncodingFormatSurvivesRoundTrip(t *testing.T) {
+	// A JSON number array decodes as []float64 on the first attempt, so without the
+	// encoding label an int8 or int32 representation would silently come back as
+	// floats on any store-and-replay path.
+	tests := []struct {
+		name   string
+		data   EmbeddingData
+		assert func(t *testing.T, got EmbeddingData)
+	}{
+		{
+			name: "binary stays int8",
+			data: EmbeddingData{Object: "embedding", Embedding: EmbeddingStruct{EmbeddingInt8Array: []int8{1, 0, -1}}, EncodingFormat: EmbeddingEncodingBinary},
+			assert: func(t *testing.T, got EmbeddingData) {
+				assert.Equal(t, []int8{1, 0, -1}, got.Embedding.EmbeddingInt8Array)
+				assert.Nil(t, got.Embedding.EmbeddingArray)
+			},
+		},
+		{
+			name: "ubinary stays int32",
+			data: EmbeddingData{Object: "embedding", Embedding: EmbeddingStruct{EmbeddingInt32Array: []int32{1, 255}}, EncodingFormat: EmbeddingEncodingUbinary},
+			assert: func(t *testing.T, got EmbeddingData) {
+				assert.Equal(t, []int32{1, 255}, got.Embedding.EmbeddingInt32Array)
+				assert.Nil(t, got.Embedding.EmbeddingArray)
+			},
+		},
+		{
+			name: "float stays float64",
+			data: EmbeddingData{Object: "embedding", Embedding: EmbeddingStruct{EmbeddingArray: []float64{0.25, 0.75}}, EncodingFormat: EmbeddingEncodingFloat},
+			assert: func(t *testing.T, got EmbeddingData) {
+				assert.Equal(t, []float64{0.25, 0.75}, got.Embedding.EmbeddingArray)
+			},
+		},
+		{
+			name: "unlabelled entry is unchanged",
+			data: EmbeddingData{Object: "embedding", Embedding: EmbeddingStruct{EmbeddingArray: []float64{0.25, 0.75}}},
+			assert: func(t *testing.T, got EmbeddingData) {
+				assert.Empty(t, got.EncodingFormat)
+				assert.Equal(t, []float64{0.25, 0.75}, got.Embedding.EmbeddingArray)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			serialized, err := json.Marshal(test.data)
+			require.NoError(t, err)
+
+			var got EmbeddingData
+			require.NoError(t, json.Unmarshal(serialized, &got))
+			assert.Equal(t, test.data.EncodingFormat, got.EncodingFormat)
+			assert.Equal(t, "embedding", got.Object)
+			test.assert(t, got)
+		})
+	}
+}
+
+func TestDeepCopyChatMessagePreservesGuardContent(t *testing.T) {
+	text := "What is the capital of France?"
+	original := ChatMessage{
+		Role: ChatMessageRoleUser,
+		Content: &ChatMessageContent{ContentBlocks: []ChatContentBlock{{
+			Type:         ChatContentBlockTypeText,
+			Text:         &text,
+			GuardContent: &GuardContent{Qualifiers: []string{"query"}},
+		}}},
+	}
+	copied := DeepCopyChatMessage(original)
+	got := copied.Content.ContentBlocks[0].GuardContent
+	if got == nil {
+		t.Fatal("deep copy dropped the guard marker")
+	}
+	if got == original.Content.ContentBlocks[0].GuardContent {
+		t.Error("copy aliases the original guard marker struct")
+	}
+	got.Qualifiers[0] = "grounding_source"
+	if original.Content.ContentBlocks[0].GuardContent.Qualifiers[0] != "query" {
+		t.Error("copy shares the qualifiers backing array with the original")
+	}
+}
+
+// TestDeepCopyChatMessagePreservesCacheAndCitationFields verifies that DeepCopyChatMessage
+// faithfully copies CacheControl, Citations, PromptCacheBreakpoint, and CachePoint without pointer aliasing.
+func TestDeepCopyChatMessagePreservesCacheAndCitationFields(t *testing.T) {
+	text := "hello world"
+	ttl := "1h"
+	scope := "user"
+	enabled := true
+	mode := "explicit"
+	cachePointType := "default"
+	cachePointTTL := "1h"
+
+	original := ChatMessage{
+		Role: ChatMessageRoleUser,
+		Content: &ChatMessageContent{ContentBlocks: []ChatContentBlock{{
+			Type:                  ChatContentBlockTypeText,
+			Text:                  &text,
+			CacheControl:          &CacheControl{Type: CacheControlTypeEphemeral, TTL: &ttl, Scope: &scope},
+			Citations:             &Citations{Enabled: &enabled},
+			PromptCacheBreakpoint: &PromptCacheBreakpoint{Mode: &mode},
+			CachePoint:            &CachePoint{Type: cachePointType, TTL: &cachePointTTL},
+		}}},
+	}
+
+	copied := DeepCopyChatMessage(original)
+	origBlock := original.Content.ContentBlocks[0]
+	copiedBlock := copied.Content.ContentBlocks[0]
+
+	// 1. Verify CacheControl preserved and isolated
+	if copiedBlock.CacheControl == nil {
+		t.Fatal("deep copy dropped CacheControl")
+	}
+	if copiedBlock.CacheControl == origBlock.CacheControl {
+		t.Error("copy aliases original CacheControl struct")
+	}
+	if copiedBlock.CacheControl.Type != origBlock.CacheControl.Type {
+		t.Errorf("CacheControl.Type = %v, want %v", copiedBlock.CacheControl.Type, origBlock.CacheControl.Type)
+	}
+	if copiedBlock.CacheControl.TTL == nil || *copiedBlock.CacheControl.TTL != "1h" {
+		t.Errorf("CacheControl.TTL = %v, want '1h'", copiedBlock.CacheControl.TTL)
+	}
+	if copiedBlock.CacheControl.TTL == origBlock.CacheControl.TTL {
+		t.Error("copy aliases original CacheControl.TTL pointer")
+	}
+	if copiedBlock.CacheControl.Scope == nil || *copiedBlock.CacheControl.Scope != "user" {
+		t.Errorf("CacheControl.Scope = %v, want 'user'", copiedBlock.CacheControl.Scope)
+	}
+	if copiedBlock.CacheControl.Scope == origBlock.CacheControl.Scope {
+		t.Error("copy aliases original CacheControl.Scope pointer")
+	}
+
+	// 2. Verify Citations preserved and isolated
+	if copiedBlock.Citations == nil {
+		t.Fatal("deep copy dropped Citations")
+	}
+	if copiedBlock.Citations == origBlock.Citations {
+		t.Error("copy aliases original Citations struct")
+	}
+	if copiedBlock.Citations.Enabled == nil || *copiedBlock.Citations.Enabled != true {
+		t.Errorf("Citations.Enabled = %v, want true", copiedBlock.Citations.Enabled)
+	}
+	if copiedBlock.Citations.Enabled == origBlock.Citations.Enabled {
+		t.Error("copy aliases original Citations.Enabled pointer")
+	}
+
+	// 3. Verify PromptCacheBreakpoint preserved and isolated
+	if copiedBlock.PromptCacheBreakpoint == nil {
+		t.Fatal("deep copy dropped PromptCacheBreakpoint")
+	}
+	if copiedBlock.PromptCacheBreakpoint == origBlock.PromptCacheBreakpoint {
+		t.Error("copy aliases original PromptCacheBreakpoint struct")
+	}
+	if copiedBlock.PromptCacheBreakpoint.Mode == nil || *copiedBlock.PromptCacheBreakpoint.Mode != "explicit" {
+		t.Errorf("PromptCacheBreakpoint.Mode = %v, want 'explicit'", copiedBlock.PromptCacheBreakpoint.Mode)
+	}
+	if copiedBlock.PromptCacheBreakpoint.Mode == origBlock.PromptCacheBreakpoint.Mode {
+		t.Error("copy aliases original PromptCacheBreakpoint.Mode pointer")
+	}
+
+	// 4. Verify CachePoint preserved and isolated
+	if copiedBlock.CachePoint == nil {
+		t.Fatal("deep copy dropped CachePoint")
+	}
+	if copiedBlock.CachePoint == origBlock.CachePoint {
+		t.Error("copy aliases original CachePoint struct")
+	}
+	if copiedBlock.CachePoint.Type != "default" {
+		t.Errorf("CachePoint.Type = %v, want 'default'", copiedBlock.CachePoint.Type)
+	}
+	if copiedBlock.CachePoint.TTL == nil || *copiedBlock.CachePoint.TTL != "1h" {
+		t.Errorf("CachePoint.TTL = %v, want '1h'", copiedBlock.CachePoint.TTL)
+	}
+	if copiedBlock.CachePoint.TTL == origBlock.CachePoint.TTL {
+		t.Error("copy aliases original CachePoint.TTL pointer")
+	}
+
+	// 5. Test mutation isolation
+	*copiedBlock.CacheControl.TTL = "5m"
+	*copiedBlock.CacheControl.Scope = "global"
+	*copiedBlock.Citations.Enabled = false
+	*copiedBlock.PromptCacheBreakpoint.Mode = "auto"
+	copiedBlock.CachePoint.Type = "custom"
+	*copiedBlock.CachePoint.TTL = "5m"
+
+	if *origBlock.CacheControl.TTL != "1h" || *origBlock.CacheControl.Scope != "user" {
+		t.Error("mutating copied CacheControl affected original")
+	}
+	if *origBlock.Citations.Enabled != true {
+		t.Error("mutating copied Citations affected original")
+	}
+	if *origBlock.PromptCacheBreakpoint.Mode != "explicit" {
+		t.Error("mutating copied PromptCacheBreakpoint affected original")
+	}
+	if origBlock.CachePoint.Type != "default" || *origBlock.CachePoint.TTL != "1h" {
+		t.Error("mutating copied CachePoint affected original")
+	}
+}
+
+// TestDeepCopyChatMessageHandlesNilAndEmptyCacheFields tests deep copying with nil, empty, and isolated metadata fields.
+func TestDeepCopyChatMessageHandlesNilAndEmptyCacheFields(t *testing.T) {
+	// 1. All fields nil
+	text := "plain text"
+	msgNil := ChatMessage{
+		Role: ChatMessageRoleUser,
+		Content: &ChatMessageContent{ContentBlocks: []ChatContentBlock{{
+			Type: ChatContentBlockTypeText,
+			Text: &text,
+		}}},
+	}
+	copiedNil := DeepCopyChatMessage(msgNil)
+	bNil := copiedNil.Content.ContentBlocks[0]
+	if bNil.CacheControl != nil || bNil.Citations != nil || bNil.PromptCacheBreakpoint != nil || bNil.CachePoint != nil {
+		t.Errorf("nil fields became non-nil on copy: cc=%v cit=%v pcb=%v cp=%v",
+			bNil.CacheControl, bNil.Citations, bNil.PromptCacheBreakpoint, bNil.CachePoint)
+	}
+
+	// 2. Empty non-nil structs
+	msgEmpty := ChatMessage{
+		Role: ChatMessageRoleUser,
+		Content: &ChatMessageContent{ContentBlocks: []ChatContentBlock{{
+			Type:                  ChatContentBlockTypeText,
+			Text:                  &text,
+			CacheControl:          &CacheControl{},
+			Citations:             &Citations{},
+			PromptCacheBreakpoint: &PromptCacheBreakpoint{},
+			CachePoint:            &CachePoint{},
+		}}},
+	}
+	copiedEmpty := DeepCopyChatMessage(msgEmpty)
+	bEmpty := copiedEmpty.Content.ContentBlocks[0]
+	if bEmpty.CacheControl == nil || bEmpty.Citations == nil || bEmpty.PromptCacheBreakpoint == nil || bEmpty.CachePoint == nil {
+		t.Errorf("empty struct fields became nil on copy: cc=%v cit=%v pcb=%v cp=%v",
+			bEmpty.CacheControl, bEmpty.Citations, bEmpty.PromptCacheBreakpoint, bEmpty.CachePoint)
+	}
+
+	// 3. Individual isolated fields (table-driven)
+	enabledTrue := true
+	enabledFalse := false
+	ttl := "1h"
+	scope := "global"
+	mode := "explicit"
+
+	tests := []struct {
+		name     string
+		input    ChatContentBlock
+		validate func(t *testing.T, orig, copy ChatContentBlock)
+	}{
+		{
+			name: "CacheControl only",
+			input: ChatContentBlock{
+				Type:         ChatContentBlockTypeText,
+				Text:         &text,
+				CacheControl: &CacheControl{Type: CacheControlTypeEphemeral, TTL: &ttl, Scope: &scope},
+			},
+			validate: func(t *testing.T, orig, copy ChatContentBlock) {
+				if copy.CacheControl == nil {
+					t.Fatal("CacheControl is nil")
+				}
+				if copy.CacheControl == orig.CacheControl {
+					t.Error("CacheControl struct aliased")
+				}
+				if copy.CacheControl.Type != orig.CacheControl.Type || *copy.CacheControl.TTL != *orig.CacheControl.TTL || *copy.CacheControl.Scope != *orig.CacheControl.Scope {
+					t.Errorf("CacheControl value mismatch: got %+v, want %+v", copy.CacheControl, orig.CacheControl)
+				}
+				if copy.Citations != nil || copy.PromptCacheBreakpoint != nil || copy.CachePoint != nil {
+					t.Errorf("other fields non-nil: cit=%v pcb=%v cp=%v", copy.Citations, copy.PromptCacheBreakpoint, copy.CachePoint)
+				}
+			},
+		},
+		{
+			name: "Citations enabled true only",
+			input: ChatContentBlock{
+				Type:      ChatContentBlockTypeText,
+				Text:      &text,
+				Citations: &Citations{Enabled: &enabledTrue},
+			},
+			validate: func(t *testing.T, orig, copy ChatContentBlock) {
+				if copy.Citations == nil {
+					t.Fatal("Citations is nil")
+				}
+				if copy.Citations == orig.Citations {
+					t.Error("Citations struct aliased")
+				}
+				if copy.Citations.Enabled == nil || *copy.Citations.Enabled != true {
+					t.Errorf("Citations.Enabled = %v, want true", copy.Citations.Enabled)
+				}
+				if copy.CacheControl != nil || copy.PromptCacheBreakpoint != nil || copy.CachePoint != nil {
+					t.Errorf("other fields non-nil: cc=%v pcb=%v cp=%v", copy.CacheControl, copy.PromptCacheBreakpoint, copy.CachePoint)
+				}
+			},
+		},
+		{
+			name: "Citations enabled false only",
+			input: ChatContentBlock{
+				Type:      ChatContentBlockTypeText,
+				Text:      &text,
+				Citations: &Citations{Enabled: &enabledFalse},
+			},
+			validate: func(t *testing.T, orig, copy ChatContentBlock) {
+				if copy.Citations == nil {
+					t.Fatal("Citations is nil")
+				}
+				if copy.Citations == orig.Citations {
+					t.Error("Citations struct aliased")
+				}
+				if copy.Citations.Enabled == nil || *copy.Citations.Enabled != false {
+					t.Errorf("Citations.Enabled = %v, want false", copy.Citations.Enabled)
+				}
+				if copy.CacheControl != nil || copy.PromptCacheBreakpoint != nil || copy.CachePoint != nil {
+					t.Errorf("other fields non-nil: cc=%v pcb=%v cp=%v", copy.CacheControl, copy.PromptCacheBreakpoint, copy.CachePoint)
+				}
+			},
+		},
+		{
+			name: "PromptCacheBreakpoint only",
+			input: ChatContentBlock{
+				Type:                  ChatContentBlockTypeText,
+				Text:                  &text,
+				PromptCacheBreakpoint: &PromptCacheBreakpoint{Mode: &mode},
+			},
+			validate: func(t *testing.T, orig, copy ChatContentBlock) {
+				if copy.PromptCacheBreakpoint == nil {
+					t.Fatal("PromptCacheBreakpoint is nil")
+				}
+				if copy.PromptCacheBreakpoint == orig.PromptCacheBreakpoint {
+					t.Error("PromptCacheBreakpoint struct aliased")
+				}
+				if copy.PromptCacheBreakpoint.Mode == nil || *copy.PromptCacheBreakpoint.Mode != "explicit" {
+					t.Errorf("PromptCacheBreakpoint.Mode = %v, want 'explicit'", copy.PromptCacheBreakpoint.Mode)
+				}
+				if copy.CacheControl != nil || copy.Citations != nil || copy.CachePoint != nil {
+					t.Errorf("other fields non-nil: cc=%v cit=%v cp=%v", copy.CacheControl, copy.Citations, copy.CachePoint)
+				}
+			},
+		},
+		{
+			name: "CachePoint only",
+			input: ChatContentBlock{
+				Type:       ChatContentBlockTypeText,
+				Text:       &text,
+				CachePoint: &CachePoint{Type: "default", TTL: &ttl},
+			},
+			validate: func(t *testing.T, orig, copy ChatContentBlock) {
+				if copy.CachePoint == nil {
+					t.Fatal("CachePoint is nil")
+				}
+				if copy.CachePoint == orig.CachePoint {
+					t.Error("CachePoint struct aliased")
+				}
+				if copy.CachePoint.Type != "default" || copy.CachePoint.TTL == nil || *copy.CachePoint.TTL != "1h" {
+					t.Errorf("CachePoint = %+v, want Type='default', TTL='1h'", copy.CachePoint)
+				}
+				if copy.CacheControl != nil || copy.Citations != nil || copy.PromptCacheBreakpoint != nil {
+					t.Errorf("other fields non-nil: cc=%v cit=%v pcb=%v", copy.CacheControl, copy.Citations, copy.PromptCacheBreakpoint)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := ChatMessage{
+				Role:    ChatMessageRoleUser,
+				Content: &ChatMessageContent{ContentBlocks: []ChatContentBlock{tc.input}},
+			}
+			copied := DeepCopyChatMessage(msg)
+			if len(copied.Content.ContentBlocks) != 1 {
+				t.Fatalf("expected 1 content block, got %d", len(copied.Content.ContentBlocks))
+			}
+			tc.validate(t, tc.input, copied.Content.ContentBlocks[0])
+		})
+	}
+}
+
+// TestDeepCopyChatMessagePreservesAzureContext pins that a deep-copied assistant message keeps
+// Azure On Your Data's citation context, and that the copy does not share the original's bytes.
+func TestDeepCopyChatMessagePreservesAzureContext(t *testing.T) {
+	original := ChatMessage{
+		Role:                 ChatMessageRoleAssistant,
+		Content:              &ChatMessageContent{ContentStr: Ptr("Bifrost routes requests [doc1].")},
+		ChatAssistantMessage: &ChatAssistantMessage{Context: json.RawMessage(`{"citations":[{"title":"overview.md"}]}`)},
+	}
+	copied := DeepCopyChatMessage(original)
+	if copied.ChatAssistantMessage == nil || string(copied.ChatAssistantMessage.Context) != string(original.ChatAssistantMessage.Context) {
+		t.Fatalf("context = %v, want %s", copied.ChatAssistantMessage, original.ChatAssistantMessage.Context)
+	}
+	copied.ChatAssistantMessage.Context[0] = '['
+	if original.ChatAssistantMessage.Context[0] != '{' {
+		t.Errorf("the copy shares the original's context bytes")
+	}
 }
