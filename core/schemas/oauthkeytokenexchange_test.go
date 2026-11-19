@@ -28,6 +28,7 @@ func TestOAuthKeyConfigValidateTokenExchange(t *testing.T) {
 	}{
 		{"subject token file is required", func(c *OAuthKeyConfig) { c.SubjectTokenFile = " " }, "subject_token_file is required"},
 		{"subject token file must be absolute", func(c *OAuthKeyConfig) { c.SubjectTokenFile = "token" }, "must be an absolute path"},
+		{"subject token file with a .. component", func(c *OAuthKeyConfig) { c.SubjectTokenFile = "/var/run/secrets/openai/../token" }, "has a .. component"},
 		{"unknown subject token type", func(c *OAuthKeyConfig) { c.SubjectTokenType = "urn:x" }, "subject_token_type must be one of"},
 		{"unknown request encoding", func(c *OAuthKeyConfig) { c.RequestEncoding = "xml" }, "request_encoding must be form or json"},
 		{"token url off the allowlist", func(c *OAuthKeyConfig) { c.TokenURL = *NewSecretVar("https://attacker.example/token") }, TokenExchangeURLsEnv},

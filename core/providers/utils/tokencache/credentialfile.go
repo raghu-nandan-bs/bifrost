@@ -93,27 +93,21 @@ func rootFor(path string) (string, string, bool) {
 	return "", "", false
 }
 
-// AllowedCredentialPath returns the real path of a credential file once it is known to sit
-// under an allowed credential directory. The path is checked before it is resolved, so a
-// refusal says nothing about whether a file exists elsewhere, and again after, so a symlink
-// cannot lead out of the directory; the symlinks Kubernetes rotates a projected token through
-// stay inside its mount. A refusal wraps ErrCredentialPathNotAllowed. Readers should use
-// ReadCredentialFile, which also opens the file without a check-then-open race.
-func AllowedCredentialPath(path string) (string, error) {
+// CheckCredentialPath reports, without touching the file, whether ReadCredentialFile would
+// accept path as written: absolute, with no .. component, and under an allowed credential
+// directory. It is the save-time check, so the operator sees a refusal when the key is saved
+// rather than on its first request, and a file that is not mounted yet still passes. A refusal
+// wraps ErrCredentialPathNotAllowed, except for a relative path. It says nothing about where
+// symlinks lead, so it must never be followed by a plain open: read the file through
+// ReadCredentialFile, which re-checks the real path and opens it without a check-then-open race.
+func CheckCredentialPath(path string) error {
 	if err := checkPath(path); err != nil {
-		return "", err
+		return err
 	}
 	if _, _, ok := rootFor(path); !ok {
-		return "", notAllowed(path)
+		return notAllowed(path)
 	}
-	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return "", err
-	}
-	if _, _, ok := rootFor(resolved); !ok {
-		return "", notAllowed(path)
-	}
-	return resolved, nil
+	return nil
 }
 
 // errEscapesRoot marks an open that os.Root refused because a symlink leads out of the root.

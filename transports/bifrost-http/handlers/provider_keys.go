@@ -20,6 +20,7 @@ import (
 	"github.com/bytedance/sonic"
 	"github.com/google/uuid"
 	bifrost "github.com/maximhq/bifrost/core"
+	"github.com/maximhq/bifrost/core/providers/utils/tokencache"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/transports/v2/bifrost-http/lib"
 	"github.com/tidwall/gjson"
@@ -1066,6 +1067,11 @@ func validateProviderKeyURL(provider schemas.ModelProvider, key schemas.Key) err
 		if !cfg.TokenURL.IsFromSecret() && !isHTTPSOrLoopbackURL(cfg.TokenURL.GetValue()) {
 			return fmt.Errorf("oauth_key_config.token_url must use https (http is allowed for loopback hosts only)")
 		}
+		if cfg.GrantType == schemas.OAuthGrantTokenExchange {
+			if err := tokencache.CheckCredentialPath(strings.TrimSpace(cfg.SubjectTokenFile)); err != nil {
+				return fmt.Errorf("oauth_key_config.subject_token_file %w", err)
+			}
+		}
 		if cfg.GrantType == schemas.OAuthGrantJWTBearer && cfg.PrivateKey != nil && !cfg.PrivateKey.IsFromSecret() {
 			key, ok := parseAsymmetricPEMPrivateKey(cfg.PrivateKey.GetValue())
 			if !ok {
@@ -1085,6 +1091,14 @@ func validateProviderKeyURL(provider schemas.ModelProvider, key schemas.Key) err
 		if strings.TrimSpace(key.Value.GetValue()) == "" {
 			if err := key.AnthropicKeyConfig.WorkloadIdentity.Validate(); err != nil {
 				return err
+			}
+		}
+		// A literal identity token path is held to the reader's directory allowlist here, so the
+		// operator sees a refusal on save; a reference is checked once it resolves, at the read.
+		if src := key.AnthropicKeyConfig.WorkloadIdentity.IdentitySource; src != nil && src.Type == schemas.IdentitySourceFile &&
+			src.Path != nil && !src.Path.IsFromSecret() && strings.TrimSpace(src.Path.GetValue()) != "" {
+			if err := tokencache.CheckCredentialPath(strings.TrimSpace(src.Path.GetValue())); err != nil {
+				return fmt.Errorf("anthropic_key_config.workload_identity.identity_source.path %w", err)
 			}
 		}
 	}

@@ -1066,6 +1066,9 @@ func (s *IdentitySource) Validate(field string) error {
 		if !has(s.Path) || s.Token != nil {
 			return fmt.Errorf("%s of type file needs path and no token", field)
 		}
+		if hasDotDotComponent(s.Path.GetValue()) {
+			return fmt.Errorf("%s.path has a .. component; name the identity token file without one", field)
+		}
 	case IdentitySourceInline:
 		if !has(s.Token) || s.Path != nil {
 			return fmt.Errorf("%s of type inline needs token and no path", field)
@@ -1074,6 +1077,18 @@ func (s *IdentitySource) Validate(field string) error {
 		return fmt.Errorf("%s.type must be file or inline", field)
 	}
 	return nil
+}
+
+// hasDotDotComponent reports whether path has a .. component. The credential file reader refuses
+// such a path rather than cleaning it (when a is a symlink, a/../token need not name token), so
+// it is refused here too, where the operator saves the key.
+func hasDotDotComponent(path string) bool {
+	for part := range strings.SplitSeq(filepath.ToSlash(path), "/") {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // HasWorkloadIdentity reports whether the key federates its credential instead of carrying one.
@@ -1605,6 +1620,9 @@ func (c *OAuthKeyConfig) Validate() error {
 		}
 		if !filepath.IsAbs(file) {
 			return fmt.Errorf("oauth_key_config.subject_token_file must be an absolute path")
+		}
+		if hasDotDotComponent(file) {
+			return fmt.Errorf("oauth_key_config.subject_token_file has a .. component; name the subject token file without one")
 		}
 		if t := strings.TrimSpace(c.SubjectTokenType); t != "" && !slices.Contains(OAuthSubjectTokenTypes, t) {
 			return fmt.Errorf("oauth_key_config.subject_token_type must be one of %s", strings.Join(OAuthSubjectTokenTypes, ", "))

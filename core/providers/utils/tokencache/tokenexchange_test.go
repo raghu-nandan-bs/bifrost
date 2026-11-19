@@ -465,6 +465,24 @@ func TestReadCredentialFileRefusals(t *testing.T) {
 	assert.Equal(t, "rotated", got)
 }
 
+// TestCheckCredentialPath pins the save-time check: lexical only, so a file that is not mounted
+// yet passes, while a path ReadCredentialFile would refuse for its shape or directory is refused.
+func TestCheckCredentialPath(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(CredentialDirsEnv, dir)
+	require.NoError(t, CheckCredentialPath(filepath.Join(dir, "not-mounted-yet", "token")))
+	require.ErrorIs(t, CheckCredentialPath(filepath.Join(t.TempDir(), "token")), ErrCredentialPathNotAllowed)
+	require.ErrorIs(t, CheckCredentialPath(dir+"/sub/../token"), ErrCredentialPathNotAllowed)
+	require.ErrorIs(t, CheckCredentialPath(dir), ErrCredentialPathNotAllowed, "the directory itself is not a credential file")
+	err := CheckCredentialPath("relative/token")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "absolute path")
+
+	t.Setenv(CredentialDirsEnv, "")
+	require.NoError(t, CheckCredentialPath("/var/run/secrets/openai/token"))
+	require.ErrorIs(t, CheckCredentialPath("/etc/passwd"), ErrCredentialPathNotAllowed)
+}
+
 // TestTokenExchangeMinterChecksEndpoint pins that the exported constructor applies the endpoint
 // allowlist itself, before the subject token file is read.
 func TestTokenExchangeMinterChecksEndpoint(t *testing.T) {
