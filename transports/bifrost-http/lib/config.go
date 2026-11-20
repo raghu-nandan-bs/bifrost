@@ -32,6 +32,7 @@ import (
 	"github.com/maximhq/bifrost/core/mcp"
 	mcputils "github.com/maximhq/bifrost/core/mcp/utils"
 	"github.com/maximhq/bifrost/core/network"
+	"github.com/maximhq/bifrost/core/providers/utils/tokencache"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/core/streamusage"
 	"github.com/maximhq/bifrost/framework"
@@ -2070,7 +2071,35 @@ func loadProviders(ctx context.Context, config *Config, configData *ConfigData) 
 		}
 	}
 	config.Providers = providersInConfigStore
+	warnRefusedCredentialPaths(config.Providers, logger.Warn)
 	return nil
+}
+
+// warnRefusedCredentialPaths warns about each stored key whose credential file the reader would
+// refuse: outside the allowed credential directories, or with a .. component, which earlier
+// versions cleaned and accepted. Such a key fails every request that uses it, so the operator
+// hears of it at startup. Only literal paths are checked, so a secret-backed one is never logged.
+func warnRefusedCredentialPaths(providers map[schemas.ModelProvider]configstore.ProviderConfig, warn func(string, ...any)) {
+	for provider, cfg := range providers {
+		for _, key := range cfg.Keys {
+			check := func(field, path string) {
+				if path = strings.TrimSpace(path); path == "" {
+					return
+				}
+				if err := tokencache.CheckCredentialPath(path); err != nil {
+					warn("key %q of provider %s: %s %v; requests with this key will fail until the path is fixed", key.Name, provider, field, err)
+				}
+			}
+			if c := key.OAuthKeyConfig; c != nil && c.GrantType == schemas.OAuthGrantTokenExchange {
+				check("oauth_key_config.subject_token_file", c.SubjectTokenFile)
+			}
+			if key.AnthropicKeyConfig.HasWorkloadIdentity() {
+				if src := key.AnthropicKeyConfig.WorkloadIdentity.IdentitySource; src != nil && src.Type == schemas.IdentitySourceFile && !src.Path.IsFromSecret() {
+					check("anthropic_key_config.workload_identity.identity_source.path", src.Path.GetValue())
+				}
+			}
+		}
+	}
 }
 
 // syncAuthoritativeProvidersInStore persists providers and deletes DB-only providers and keys.

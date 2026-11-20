@@ -4,6 +4,7 @@ import { FormControl, FormDescription, FormField, FormItem, FormLabel, FormMessa
 import { DefaultAnthropicWorkloadIdentityConfig, DefaultVertexAWSWorkloadIdentityConfig, OAuthSigningAlgorithms } from "@/lib/types/config";
 import { identitySourceType } from "@/lib/types/schemas";
 import { Input } from "@/components/ui/input";
+import { HeadersTable } from "@/components/ui/headersTable";
 import { Label } from "@/components/ui/label";
 import { SecretVarInput } from "@/components/ui/secretVarInput";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -14,9 +15,10 @@ import { TagInput } from "@/components/ui/tagInput";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { isRedacted } from "@/lib/utils/validation";
 import { Info } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Control, UseFormReturn } from "react-hook-form";
 import { Trans, useTranslation } from "react-i18next";
+import { tokenExchangeEncodingUpdate } from "../views/providerKeyForm.utils";
 import { DeploymentsTable } from "./deploymentsTable";
 import { GithubCopilotSignIn } from "./githubCopilotSignIn";
 
@@ -280,6 +282,29 @@ export function ApiKeyFormFragment({ control, providerName, baseProviderType, fo
 		// oauthDefaults re-runs detection after the key form resets itself once the key
 		// resolves, for the same reason as databricksDefaults above.
 	}, [isOpenAICompatible, form, oauthDefaults]);
+
+	// A token exchange key follows its token URL to a default encoding (JSON for OpenAI's endpoint)
+	// until an encoding is chosen: stored on the key, or picked here (tracked in a ref, since a pick
+	// equal to the form default leaves the field clean). Only a token URL or a grant the user edited
+	// moves it, so opening a saved key never changes its encoding, while switching a saved key to
+	// token exchange does.
+	const oauthTokenURL = form.watch("key.oauth_key_config.token_url");
+	const encodingChosen = useRef(false);
+	const storedEncoding = oauthDefaults?.request_encoding;
+	useEffect(() => {
+		if (oauthGrantType !== "token_exchange") return;
+		const encoding = tokenExchangeEncodingUpdate({
+			tokenURL: oauthTokenURL,
+			tokenURLEdited: form.getFieldState("key.oauth_key_config.token_url").isDirty,
+			grantEdited: form.getFieldState("key.oauth_key_config.grant_type").isDirty,
+			current: form.getValues("key.oauth_key_config.request_encoding"),
+			stored: storedEncoding,
+			userChose: encodingChosen.current,
+		});
+		if (encoding) {
+			form.setValue("key.oauth_key_config.request_encoding", encoding);
+		}
+	}, [oauthGrantType, oauthTokenURL, storedEncoding, form]);
 
 	const anthropicDefaults = form.formState.defaultValues?.key?.anthropic_key_config;
 	useEffect(() => {
@@ -1408,6 +1433,7 @@ export function ApiKeyFormFragment({ control, providerName, baseProviderType, fo
 											<SelectContent>
 												<SelectItem value="client_credentials">{t("providers.keys.oauthGrantClientCredentials")}</SelectItem>
 												<SelectItem value="jwt_bearer">{t("providers.keys.oauthGrantJwtBearer")}</SelectItem>
+												<SelectItem value="token_exchange">{t("providers.keys.oauthGrantTokenExchange")}</SelectItem>
 											</SelectContent>
 										</Select>
 										<FormMessage />
@@ -1484,6 +1510,79 @@ export function ApiKeyFormFragment({ control, providerName, baseProviderType, fo
 													<SelectContent>
 														<SelectItem value="header">{t("providers.keys.oauthPlacementHeader")}</SelectItem>
 														<SelectItem value="body">{t("providers.keys.oauthPlacementBody")}</SelectItem>
+													</SelectContent>
+												</Select>
+												<FormMessage />
+											</FormItem>
+										)}
+									/>
+								</>
+							)}
+							{oauthGrantType === "token_exchange" && (
+								<>
+									<FormField
+										control={control}
+										name="key.oauth_key_config.subject_token_file"
+										render={({ field }) => (
+											<FormItem>
+												<FormLabel>{t("providers.keys.oauthSubjectTokenFile")}</FormLabel>
+												<FormDescription>{t("providers.keys.oauthSubjectTokenFileHelp")}</FormDescription>
+												<FormControl>
+													<Input
+														data-testid="key-input-oauth-subject-token-file"
+														placeholder="/var/run/secrets/identity/token"
+														{...field}
+														value={field.value ?? ""}
+													/>
+												</FormControl>
+												<FormMessage />
+											</FormItem>
+										)}
+									/>
+									<FormField
+										control={control}
+										name="key.oauth_key_config.subject_token_type"
+										render={({ field }) => (
+											<FormItem>
+												<FormLabel>{t("providers.keys.oauthSubjectTokenType")}</FormLabel>
+												<Select value={field.value ?? "urn:ietf:params:oauth:token-type:jwt"} onValueChange={field.onChange}>
+													<FormControl>
+														<SelectTrigger className="w-full" data-testid="key-select-oauth-subject-token-type">
+															<SelectValue placeholder="JWT" />
+														</SelectTrigger>
+													</FormControl>
+													<SelectContent>
+														<SelectItem value="urn:ietf:params:oauth:token-type:jwt">JWT</SelectItem>
+														<SelectItem value="urn:ietf:params:oauth:token-type:id_token">
+															{t("providers.keys.oauthSubjectTokenTypeIdToken")}
+														</SelectItem>
+													</SelectContent>
+												</Select>
+												<FormMessage />
+											</FormItem>
+										)}
+									/>
+									<FormField
+										control={control}
+										name="key.oauth_key_config.request_encoding"
+										render={({ field }) => (
+											<FormItem>
+												<FormLabel>{t("providers.keys.oauthRequestEncoding")}</FormLabel>
+												<Select
+													value={field.value ?? "form"}
+													onValueChange={(value) => {
+														encodingChosen.current = true;
+														field.onChange(value);
+													}}
+												>
+													<FormControl>
+														<SelectTrigger className="w-full" data-testid="key-select-oauth-request-encoding">
+															<SelectValue placeholder={t("providers.keys.oauthRequestEncodingForm")} />
+														</SelectTrigger>
+													</FormControl>
+													<SelectContent>
+														<SelectItem value="form">{t("providers.keys.oauthRequestEncodingForm")}</SelectItem>
+														<SelectItem value="json">JSON</SelectItem>
 													</SelectContent>
 												</Select>
 												<FormMessage />
@@ -1651,7 +1750,7 @@ export function ApiKeyFormFragment({ control, providerName, baseProviderType, fo
 									</FormItem>
 								)}
 							/>
-							{oauthGrantType === "client_credentials" && (
+							{(oauthGrantType === "client_credentials" || oauthGrantType === "token_exchange") && (
 								<FormField
 									control={control}
 									name="key.oauth_key_config.audience"
@@ -1660,7 +1759,11 @@ export function ApiKeyFormFragment({ control, providerName, baseProviderType, fo
 											<FormLabel>
 												{t("providers.keys.oauthAudience")} {t("providers.optionalParen")}
 											</FormLabel>
-											<FormDescription>{t("providers.keys.oauthAudienceCcHelp")}</FormDescription>
+											<FormDescription>
+												{t(
+													oauthGrantType === "token_exchange" ? "providers.keys.oauthAudienceTeHelp" : "providers.keys.oauthAudienceCcHelp",
+												)}
+											</FormDescription>
 											<FormControl>
 												<Input
 													data-testid="key-input-oauth-cc-audience"
@@ -1674,6 +1777,36 @@ export function ApiKeyFormFragment({ control, providerName, baseProviderType, fo
 									)}
 								/>
 							)}
+							{/* Every grant sends extra_params, so the editor stays visible whichever grant is chosen. */}
+							<FormField
+								control={control}
+								name="key.oauth_key_config.extra_params"
+								render={({ field }) => (
+									<FormItem>
+										<FormLabel>{t("providers.keys.oauthExtraParams")}</FormLabel>
+										<FormDescription>{t("providers.keys.oauthExtraParamsHelp")}</FormDescription>
+										<HeadersTable<string>
+											value={field.value ?? {}}
+											onChange={field.onChange}
+											// A conflict on the empty add row has nothing to save, so only held rows count.
+											onConflictsChange={(conflicts, headers) =>
+												form.setValue(
+													"key.oauth_key_config._extra_params_conflict",
+													[...conflicts.keys()].some((row) => row < Object.keys(headers).length),
+													{ shouldValidate: form.formState.isSubmitted },
+												)
+											}
+											label={t("providers.keys.oauthExtraParams")}
+											// i18n-ignore: a parameter name example, not prose
+											keyPlaceholder="identity_provider_id"
+											valuePlaceholder={t("headersTable.value", { ns: "common" })}
+											testIdPrefix="key-input-oauth-extra-param"
+											keepClearedNames
+										/>
+										<FormMessage />
+									</FormItem>
+								)}
+							/>
 						</>
 					)}
 				</div>

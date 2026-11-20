@@ -180,6 +180,19 @@ func TestAnthropicKeyConfigRedacted(t *testing.T) {
 	}
 }
 
+// A credential path with a .. component is refused when the key is saved rather than at the first
+// request: the reader refuses it, since a/../token need not name token when a is a symlink.
+func TestIdentitySourceValidateRefusesDotDot(t *testing.T) {
+	src := &IdentitySource{Type: IdentitySourceFile, Path: NewSecretVar("/var/run/secrets/anthropic/../token")}
+	if err := src.Validate("identity_source"); err == nil || !strings.Contains(err.Error(), "has a .. component") {
+		t.Fatalf("a path with a .. component must be refused, got %v", err)
+	}
+	src.Path = NewSecretVar("/var/run/secrets/anthropic/..data/token")
+	if err := src.Validate("identity_source"); err != nil {
+		t.Fatalf("a component that only starts with .. is a name, got %v", err)
+	}
+}
+
 func TestKeyAliasesUnmarshalLegacyStringShape(t *testing.T) {
 	in := []byte(`{"best-model": "gpt-4o-deployment"}`)
 	var ka KeyAliases
