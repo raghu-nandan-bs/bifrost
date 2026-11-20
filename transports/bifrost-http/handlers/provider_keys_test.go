@@ -754,6 +754,53 @@ func TestValidateProviderKeyOAuthKeyConfig(t *testing.T) {
 	})
 }
 
+// TestValidateProviderKeyCredentialPaths pins that a credential file the reader would refuse,
+// outside the allowed credential directories or with a .. component, is refused when the key is
+// saved rather than on every request that uses it.
+func TestValidateProviderKeyCredentialPaths(t *testing.T) {
+	t.Setenv("BIFROST_OIDC_ALLOWED_CREDENTIAL_DIRS", "")
+	t.Setenv(schemas.TokenExchangeURLsEnv, "")
+	exchange := func(file string) schemas.Key {
+		return schemas.Key{OAuthKeyConfig: &schemas.OAuthKeyConfig{
+			GrantType: schemas.OAuthGrantTokenExchange, TokenURL: *schemas.NewSecretVar("https://auth.openai.com/oauth/token"),
+			SubjectTokenFile: file,
+		}}
+	}
+	anthropicFile := func(path *schemas.SecretVar, value string) schemas.Key {
+		return schemas.Key{Value: *schemas.NewSecretVar(value), AnthropicKeyConfig: anthropicWIFTestConfig(func(c *schemas.AnthropicWorkloadIdentityConfig) {
+			c.IdentitySource.Path = path
+		})}
+	}
+	tests := []struct {
+		name     string
+		provider schemas.ModelProvider
+		key      schemas.Key
+		wantErr  string
+	}{
+		{"subject token file in an allowed directory", schemas.OpenAI, exchange("/var/run/secrets/openai/token"), ""},
+		{"subject token file outside the allowed directories", schemas.OpenAI, exchange("/etc/openai/token"), "outside the allowed credential directories"},
+		{"subject token file with a .. component", schemas.OpenAI, exchange("/var/run/secrets/openai/../token"), ".. component"},
+		{"identity token file outside the allowed directories", schemas.Anthropic, anthropicFile(schemas.NewSecretVar("/etc/anthropic/token"), ""), "outside the allowed credential directories"},
+		{"identity token file with a .. component", schemas.Anthropic, anthropicFile(schemas.NewSecretVar("/var/run/secrets/anthropic/../token"), ""), ".. component"},
+		{"identity token file outside the allowed directories behind a static value", schemas.Anthropic, anthropicFile(schemas.NewSecretVar("/etc/anthropic/token"), "sk-ant"), "outside the allowed credential directories"},
+		{"an env-backed identity token path is checked when it resolves", schemas.Anthropic, anthropicFile(schemas.NewSecretVar("env.WIF_TEST_UNSET_TOKEN_PATH"), ""), ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateProviderKeyURL(tt.provider, tt.key)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("got %v, want an error containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 // anthropicWIFTestConfig is a complete workload identity block reading its token from a file.
 func anthropicWIFTestConfig(mutate func(*schemas.AnthropicWorkloadIdentityConfig)) *schemas.AnthropicKeyConfig {
 	wif := &schemas.AnthropicWorkloadIdentityConfig{
@@ -822,6 +869,20 @@ func TestValidateProviderKeyAnthropicWorkloadIdentity(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("an oauth subject_token_file is guarded like a dial target", func(t *testing.T) {
+		key := schemas.Key{OAuthKeyConfig: &schemas.OAuthKeyConfig{
+			GrantType: schemas.OAuthGrantTokenExchange, TokenURL: *schemas.NewSecretVar("https://auth.openai.com/oauth/token"),
+			SubjectTokenFile: "/var/run/secrets/openai/token",
+		}}
+		moved := key
+		movedCfg := *key.OAuthKeyConfig
+		movedCfg.SubjectTokenFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+		moved.OAuthKeyConfig = &movedCfg
+		if got := changedDialTargets(&key, moved); len(got) != 1 || got[0] != "oauth_key_config.subject_token_file" {
+			t.Fatalf("moving only the subject token file must count as a dial target change, got %v", got)
+		}
+	})
 
 	t.Run("the identity source path is guarded like a dial target", func(t *testing.T) {
 		targets := keyDialTargets(schemas.Key{AnthropicKeyConfig: anthropicWIFTestConfig(nil)})

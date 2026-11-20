@@ -27979,3 +27979,42 @@ func TestIgnoreBudgetBusinessUnitIDs(t *testing.T) {
 	ignoreBudgetBusinessUnitIDs(nil, func(string, ...any) { t.Fatal("no warning for a nil config") })
 	ignoreBudgetBusinessUnitIDs(&ConfigData{}, func(string, ...any) { t.Fatal("no warning without governance") })
 }
+
+// TestWarnRefusedCredentialPaths pins the load-time warning for a stored key whose credential
+// file the reader now refuses (outside the allowed directories, or with a .. component, which
+// earlier versions cleaned and accepted), so the operator learns of it at startup rather than
+// from the first failing request. Secret-backed paths are not printed.
+func TestWarnRefusedCredentialPaths(t *testing.T) {
+	t.Setenv("BIFROST_OIDC_ALLOWED_CREDENTIAL_DIRS", "")
+	wif := func(path *schemas.SecretVar) *schemas.AnthropicKeyConfig {
+		return &schemas.AnthropicKeyConfig{WorkloadIdentity: &schemas.AnthropicWorkloadIdentityConfig{
+			IdentitySource: &schemas.IdentitySource{Type: schemas.IdentitySourceFile, Path: path},
+		}}
+	}
+	exchange := func(file string) *schemas.OAuthKeyConfig {
+		return &schemas.OAuthKeyConfig{GrantType: schemas.OAuthGrantTokenExchange, SubjectTokenFile: file}
+	}
+	providers := map[schemas.ModelProvider]configstore.ProviderConfig{
+		schemas.Anthropic: {Keys: []schemas.Key{
+			{Name: "dotdot", AnthropicKeyConfig: wif(schemas.NewSecretVar("/var/run/secrets/anthropic/../token"))},
+			{Name: "fine", AnthropicKeyConfig: wif(schemas.NewSecretVar("/var/run/secrets/anthropic/token"))},
+			{Name: "secret-backed", AnthropicKeyConfig: wif(schemas.NewSecretVar("env.WIF_TEST_UNSET_TOKEN_PATH"))},
+			{Name: "static"},
+		}},
+		schemas.OpenAI: {Keys: []schemas.Key{
+			{Name: "outside", OAuthKeyConfig: exchange("/etc/openai/token")},
+			{Name: "allowed", OAuthKeyConfig: exchange("/run/secrets/openai/token")},
+			{Name: "client-credentials", OAuthKeyConfig: &schemas.OAuthKeyConfig{GrantType: schemas.OAuthGrantClientCredentials}},
+		}},
+	}
+	var warned []string
+	warnRefusedCredentialPaths(providers, func(format string, args ...any) { warned = append(warned, fmt.Sprintf(format, args...)) })
+	slices.Sort(warned)
+	require.Len(t, warned, 2)
+	assert.Contains(t, warned[0], `"dotdot"`)
+	assert.Contains(t, warned[0], "anthropic_key_config.workload_identity.identity_source.path")
+	assert.Contains(t, warned[0], ".. component")
+	assert.Contains(t, warned[1], `"outside"`)
+	assert.Contains(t, warned[1], "oauth_key_config.subject_token_file")
+	assert.Contains(t, warned[1], "outside the allowed credential directories")
+}

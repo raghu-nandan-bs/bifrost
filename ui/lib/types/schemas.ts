@@ -444,10 +444,12 @@ export const oauthKeyConfigComplete = (data: Record<string, unknown> | undefined
 		private_key?: { value?: string; ref?: string };
 		issuer?: string;
 		audience?: string;
+		subject_token_file?: string;
 	};
 	if (!isSecretVarSet(d.token_url)) return false;
 	if (d.grant_type === "client_credentials") return isSecretVarSet(d.client_id) && isSecretVarSet(d.client_secret);
 	if (d.grant_type === "jwt_bearer") return isSecretVarSet(d.private_key) && !!d.issuer?.trim() && !!d.audience?.trim();
+	if (d.grant_type === "token_exchange") return !!d.subject_token_file?.trim();
 	return false;
 };
 
@@ -550,7 +552,7 @@ export const isLiteralHTTPSURL = (v: { value?: string; ref?: string; type?: stri
 export const oauthKeyConfigSchema = z
 	.object({
 		_auth_type: z.enum(["api_key", "oauth"]).optional(),
-		grant_type: z.enum(["client_credentials", "jwt_bearer"]).optional(),
+		grant_type: z.enum(["client_credentials", "jwt_bearer", "token_exchange"]).optional(),
 		token_url: secretVarSchema.optional(),
 		client_id: secretVarSchema.optional(),
 		client_secret: secretVarSchema.optional(),
@@ -566,6 +568,12 @@ export const oauthKeyConfigSchema = z
 		// Range-checked in superRefine, only while JWT bearer is active: the field is hidden on
 		// the other tabs, and a stale value in it must not block saving. 0 means "default".
 		assertion_lifetime_seconds: z.number().int().optional(),
+		subject_token_file: z.string().optional(),
+		subject_token_type: z.enum(["urn:ietf:params:oauth:token-type:jwt", "urn:ietf:params:oauth:token-type:id_token"]).optional(),
+		request_encoding: z.enum(["form", "json"]).optional(),
+		// UI-only: set while the extra parameters table holds a row whose name clashes with
+		// another, so the save is blocked until the user resolves it. Never sent to the API.
+		_extra_params_conflict: z.boolean().optional(),
 	})
 	.superRefine((data, ctx) => {
 		// The API-key tab leaves this block inert; only an OAuth block is checked.
@@ -575,10 +583,17 @@ export const oauthKeyConfigSchema = z
 			isSecretVarSet(data.token_url) ||
 			isSecretVarSet(data.client_id) ||
 			isSecretVarSet(data.client_secret) ||
-			isSecretVarSet(data.private_key);
+			isSecretVarSet(data.private_key) ||
+			!!data.subject_token_file?.trim();
 		if (!started) return;
 		if (!data.grant_type) {
 			ctx.addIssue({ code: "custom", path: ["grant_type"], message: i18n.t("validation.chooseAGrantType") });
+		}
+		// Every grant sends extra_params, so the names are checked whatever the grant.
+		if (data._extra_params_conflict) {
+			ctx.addIssue({ code: "custom", path: ["extra_params"], message: i18n.t("validation.extraParamNamesMustBeUnique") });
+		} else if (Object.keys(data.extra_params ?? {}).some((name) => !name.trim())) {
+			ctx.addIssue({ code: "custom", path: ["extra_params"], message: i18n.t("validation.extraParamNeedsAName") });
 		}
 		if (!isSecretVarSet(data.token_url)) {
 			ctx.addIssue({ code: "custom", path: ["token_url"], message: i18n.t("validation.tokenUrlIsRequired") });
@@ -597,6 +612,21 @@ export const oauthKeyConfigSchema = z
 			}
 			if (!isSecretVarSet(data.client_secret)) {
 				ctx.addIssue({ code: "custom", path: ["client_secret"], message: i18n.t("validation.clientSecretIsRequiredForClientCredentials") });
+			}
+		}
+		if (data.grant_type === "token_exchange") {
+			if (!data.subject_token_file?.trim()) {
+				ctx.addIssue({
+					code: "custom",
+					path: ["subject_token_file"],
+					message: i18n.t("validation.subjectTokenFileIsRequiredForTokenExchange"),
+				});
+			} else if (!data.subject_token_file.trim().startsWith("/")) {
+				ctx.addIssue({
+					code: "custom",
+					path: ["subject_token_file"],
+					message: i18n.t("validation.subjectTokenFileMustBeAnAbsolutePath"),
+				});
 			}
 		}
 		if (data.grant_type === "jwt_bearer") {

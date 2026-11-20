@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
+import { modelProviderKeySchema } from "@/lib/types/schemas";
 
 import {
 	applyAuthMethod,
+	defaultTokenExchangeEncoding,
 	stripAnthropicAuthDiscriminator,
 	stripDatabricksAuthDiscriminator,
 	stripOAuthAuthDiscriminator,
+	tokenExchangeEncodingUpdate,
 } from "./providerKeyForm.utils";
 
 const pair = { client_id: { value: "sp-id" }, client_secret: { value: "sp-secret" } };
@@ -51,6 +54,58 @@ describe("stripOAuthAuthDiscriminator", () => {
 		client_id: { value: "id" },
 		client_secret: { value: "secret" },
 	};
+
+	it.each(["oauth", undefined] as const)("round trips token exchange with auth type %s", (_auth_type) => {
+		const config = {
+			grant_type: "token_exchange" as const,
+			token_url: tokenUrl,
+			subject_token_file: "/var/run/secrets/identity/token",
+			subject_token_type: "urn:ietf:params:oauth:token-type:id_token" as const,
+			request_encoding: "json" as const,
+			extra_params: { identity_provider_id: "idp-1", service_account_id: "svc-1" },
+		};
+		const parsed = modelProviderKeySchema.parse({
+			id: "k1",
+			name: "exchange",
+			models: ["*"],
+			weight: 1,
+			value: { value: "" },
+			oauth_key_config: {
+				...config,
+				_auth_type,
+				...pair,
+				private_key: { value: "pem" },
+				issuer: "i",
+				subject: "s",
+				key_id: "kid",
+				signing_algorithm: "RS256",
+				assertion_lifetime_seconds: 300,
+				auth_style: "header",
+			},
+		});
+		for (const isEdit of [false, true]) {
+			expect(applyAuthMethod(parsed, isEdit).oauth_key_config).toEqual(config);
+		}
+	});
+
+	it.each(["client_credentials", "jwt_bearer"] as const)("drops token exchange fields when switching to %s", (grant_type) => {
+		const out = stripOAuthAuthDiscriminator({
+			_auth_type: "oauth",
+			...cc,
+			grant_type,
+			subject_token_file: "/var/run/secrets/identity/token",
+			subject_token_type: "urn:ietf:params:oauth:token-type:jwt",
+			request_encoding: "form",
+		});
+		expect(out).not.toHaveProperty("subject_token_file");
+		expect(out).not.toHaveProperty("subject_token_type");
+		expect(out).not.toHaveProperty("request_encoding");
+	});
+
+	it("never persists the extra parameter conflict flag", () => {
+		const out = stripOAuthAuthDiscriminator({ _auth_type: "oauth", ...cc, _extra_params_conflict: false });
+		expect(out).not.toHaveProperty("_extra_params_conflict");
+	});
 
 	it("drops the whole block on the API key method", () => {
 		expect(stripOAuthAuthDiscriminator({ _auth_type: "api_key", ...cc })).toBeUndefined();
@@ -306,5 +361,64 @@ describe("applyAuthMethod with anthropic_key_config", () => {
 		expect(
 			stripAnthropicAuthDiscriminator({ workload_identity: { ...ids, identity_source: { type: "inline", path: tokenFile } } }),
 		).toBeUndefined();
+	});
+});
+// The token URL suggests an encoding only while nobody has chosen one: a stored encoding and an
+// explicit pick both stay, even when the pick equals the form default and so is not dirty.
+describe("tokenExchangeEncodingUpdate", () => {
+	const openai = { value: "https://auth.openai.com/oauth/token" };
+	const base = {
+		tokenURL: openai,
+		tokenURLEdited: true,
+		grantEdited: false,
+		current: "form" as const,
+		stored: undefined,
+		userChose: false,
+	};
+
+	it("follows an edited token URL on a key with no stored encoding", () => {
+		expect(tokenExchangeEncodingUpdate(base)).toBe("json");
+		expect(tokenExchangeEncodingUpdate({ ...base, tokenURL: { value: "https://idp.example/token" }, current: "json" })).toBe("form");
+	});
+
+	it("keeps a stored encoding when the token URL of a saved key is edited", () => {
+		expect(tokenExchangeEncodingUpdate({ ...base, stored: "form" })).toBeUndefined();
+	});
+
+	it("keeps an explicit pick, even one equal to the form default", () => {
+		expect(tokenExchangeEncodingUpdate({ ...base, userChose: true })).toBeUndefined();
+	});
+
+	it("leaves the encoding alone until the token URL is edited", () => {
+		expect(tokenExchangeEncodingUpdate({ ...base, tokenURLEdited: false })).toBeUndefined();
+	});
+
+	// A saved key (client_credentials, say) that already points at OpenAI's token URL and only
+	// switches its grant leaves the URL clean. Without this the encoding stays unset, the server
+	// defaults to form, and every exchange with OpenAI's JSON-only endpoint fails.
+	it("follows the token URL when a saved key switches its grant to token exchange", () => {
+		const switched = { ...base, tokenURLEdited: false, grantEdited: true, current: undefined };
+		expect(tokenExchangeEncodingUpdate(switched)).toBe("json");
+		expect(tokenExchangeEncodingUpdate({ ...switched, tokenURL: { value: "https://idp.example/token" } })).toBe("form");
+	});
+
+	it("keeps an explicit pick after the grant switches", () => {
+		expect(tokenExchangeEncodingUpdate({ ...base, tokenURLEdited: false, grantEdited: true, userChose: true })).toBeUndefined();
+	});
+
+	it("reports no change when the encoding already matches", () => {
+		expect(tokenExchangeEncodingUpdate({ ...base, current: "json" })).toBeUndefined();
+	});
+});
+
+describe("defaultTokenExchangeEncoding", () => {
+	it.each([
+		[{ value: "https://auth.openai.com/oauth/token" }, "json"],
+		[{ value: " https://auth.openai.com/oauth/token " }, "json"],
+		[{ value: "https://idp.example.com/oauth2/token" }, "form"],
+		[{ value: "", ref: "env.OPENAI_TOKEN_URL" }, "form"],
+		[undefined, "form"],
+	] as const)("picks the encoding for %j", (tokenURL, want) => {
+		expect(defaultTokenExchangeEncoding(tokenURL)).toBe(want);
 	});
 });

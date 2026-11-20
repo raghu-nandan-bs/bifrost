@@ -526,9 +526,19 @@ func TestReadIdentityTokenErrors(t *testing.T) {
 	require.NotNil(t, bErr)
 	require.Contains(t, bErr.Error.Message, "is empty")
 
+	// An oversized file or a directory is a fault in the key's config, not a mount that may still
+	// appear: fallbacks are blocked, as before the shared credential file reader.
 	_, bErr = readIdentityToken(fileSource(writeIdentityTokenFile(t, strings.Repeat("a", maxIdentityTokenBytes+1))))
 	require.NotNil(t, bErr)
 	require.Contains(t, bErr.Error.Message, "limit")
+	require.NotNil(t, bErr.AllowFallbacks)
+	require.False(t, *bErr.AllowFallbacks)
+
+	_, bErr = readIdentityToken(fileSource(t.TempDir()))
+	require.NotNil(t, bErr)
+	require.Contains(t, bErr.Error.Message, "not a regular file")
+	require.NotNil(t, bErr.AllowFallbacks)
+	require.False(t, *bErr.AllowFallbacks)
 
 	_, bErr = readIdentityToken(inlineSource("  "))
 	require.NotNil(t, bErr)

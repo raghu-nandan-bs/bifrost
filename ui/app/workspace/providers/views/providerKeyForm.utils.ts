@@ -10,7 +10,7 @@ import { z } from "zod";
 
 type DatabricksKeyConfigForm = z.input<typeof databricksKeyConfigSchema>;
 type OAuthKeyConfigForm = z.input<typeof oauthKeyConfigSchema>;
-type OAuthKeyConfigPayload = Omit<OAuthKeyConfigForm, "_auth_type">;
+type OAuthKeyConfigPayload = Omit<OAuthKeyConfigForm, "_auth_type" | "_extra_params_conflict">;
 type DatabricksKeyConfigPayload = Omit<DatabricksKeyConfigForm, "_auth_type">;
 type AnthropicKeyConfigForm = z.input<typeof anthropicKeyConfigSchema>;
 type AnthropicWorkloadIdentityPayload = NonNullable<AnthropicKeyConfigForm["workload_identity"]>;
@@ -36,6 +36,42 @@ export const stripDatabricksAuthDiscriminator = (config: DatabricksKeyConfigForm
 	return rest;
 };
 
+// OpenAITokenExchangeURL is OpenAI's workload identity token endpoint, which takes a JSON body.
+export const OpenAITokenExchangeURL = "https://auth.openai.com/oauth/token";
+
+// defaultTokenExchangeEncoding is the request encoding a token exchange key starts with for a
+// token URL: JSON for OpenAI's endpoint, otherwise the RFC 8693 form encoding. A reference
+// resolves only on the server, so it gets the form default.
+export const defaultTokenExchangeEncoding = (tokenURL: { value?: string; ref?: string } | undefined): "form" | "json" =>
+	tokenURL?.value?.trim() === OpenAITokenExchangeURL ? "json" : "form";
+
+// tokenExchangeEncodingUpdate returns the encoding a token exchange key should switch to after
+// its token URL or its grant changes, or undefined to leave it. The grant counts because a saved
+// key that switches to token exchange while already pointing at OpenAI's token URL leaves the URL
+// clean; without it the encoding stays unset and the server defaults to form. The URL-derived
+// default applies only while nobody has chosen an encoding: not when the stored key carries one
+// (editing a saved key's URL must not reset it), and not after the user picked one, which the
+// caller tracks because a pick equal to the form default leaves the field clean.
+export const tokenExchangeEncodingUpdate = ({
+	tokenURL,
+	tokenURLEdited,
+	grantEdited,
+	current,
+	stored,
+	userChose,
+}: {
+	tokenURL: { value?: string; ref?: string } | undefined;
+	tokenURLEdited: boolean;
+	grantEdited: boolean;
+	current: string | undefined;
+	stored: string | undefined;
+	userChose: boolean;
+}): "form" | "json" | undefined => {
+	if (!(tokenURLEdited || grantEdited) || userChose || stored) return undefined;
+	const encoding = defaultTokenExchangeEncoding(tokenURL);
+	return current === encoding ? undefined : encoding;
+};
+
 // stripOAuthAuthDiscriminator removes the UI-only auth discriminator before the key is sent
 // to the API, and drops the whole block on the API-key path: the form registers it for every
 // openai-based key, and an inert block would be refused by the API as half-configured. A whole
@@ -43,21 +79,27 @@ export const stripDatabricksAuthDiscriminator = (config: DatabricksKeyConfigForm
 // is kept.
 export const stripOAuthAuthDiscriminator = (config: OAuthKeyConfigForm | undefined): OAuthKeyConfigPayload | undefined => {
 	if (!config) return undefined;
-	const { _auth_type, ...rest } = config;
+	const { _auth_type, _extra_params_conflict, ...rest } = config;
 	if (_auth_type === "api_key" || (_auth_type !== "oauth" && !oauthKeyConfigComplete(rest))) {
 		return undefined;
 	}
-	if (rest.grant_type === "client_credentials") {
+	if (rest.grant_type !== "jwt_bearer") {
 		delete rest.private_key;
 		delete rest.issuer;
 		delete rest.subject;
 		delete rest.key_id;
 		delete rest.signing_algorithm;
 		delete rest.assertion_lifetime_seconds;
-	} else if (rest.grant_type === "jwt_bearer") {
+	}
+	if (rest.grant_type !== "client_credentials") {
 		delete rest.client_id;
 		delete rest.client_secret;
 		delete rest.auth_style;
+	}
+	if (rest.grant_type !== "token_exchange") {
+		delete rest.subject_token_file;
+		delete rest.subject_token_type;
+		delete rest.request_encoding;
 	}
 	if (rest.scopes && rest.scopes.length === 0) delete rest.scopes;
 	if (rest.extra_params && Object.keys(rest.extra_params).length === 0) delete rest.extra_params;
