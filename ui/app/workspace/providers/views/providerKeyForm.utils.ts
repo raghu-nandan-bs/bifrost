@@ -46,24 +46,28 @@ export const defaultTokenExchangeEncoding = (tokenURL: { value?: string; ref?: s
 	tokenURL?.value?.trim() === OpenAITokenExchangeURL ? "json" : "form";
 
 // tokenExchangeEncodingUpdate returns the encoding a token exchange key should switch to after
-// its token URL changes, or undefined to leave it. The URL-derived default applies only while
-// nobody has chosen an encoding: not when the stored key carries one (editing a saved key's URL
-// must not reset it), and not after the user picked one, which the caller tracks because a pick
-// equal to the form default leaves the field clean.
+// its token URL or its grant changes, or undefined to leave it. The grant counts because a saved
+// key that switches to token exchange while already pointing at OpenAI's token URL leaves the URL
+// clean; without it the encoding stays unset and the server defaults to form. The URL-derived
+// default applies only while nobody has chosen an encoding: not when the stored key carries one
+// (editing a saved key's URL must not reset it), and not after the user picked one, which the
+// caller tracks because a pick equal to the form default leaves the field clean.
 export const tokenExchangeEncodingUpdate = ({
 	tokenURL,
 	tokenURLEdited,
+	grantEdited,
 	current,
 	stored,
 	userChose,
 }: {
 	tokenURL: { value?: string; ref?: string } | undefined;
 	tokenURLEdited: boolean;
+	grantEdited: boolean;
 	current: string | undefined;
 	stored: string | undefined;
 	userChose: boolean;
 }): "form" | "json" | undefined => {
-	if (!tokenURLEdited || userChose || stored) return undefined;
+	if (!(tokenURLEdited || grantEdited) || userChose || stored) return undefined;
 	const encoding = defaultTokenExchangeEncoding(tokenURL);
 	return current === encoding ? undefined : encoding;
 };

@@ -285,8 +285,9 @@ export function ApiKeyFormFragment({ control, providerName, baseProviderType, fo
 
 	// A token exchange key follows its token URL to a default encoding (JSON for OpenAI's endpoint)
 	// until an encoding is chosen: stored on the key, or picked here (tracked in a ref, since a pick
-	// equal to the form default leaves the field clean). Only a token URL the user edited moves it,
-	// so opening a saved key never changes its encoding.
+	// equal to the form default leaves the field clean). Only a token URL or a grant the user edited
+	// moves it, so opening a saved key never changes its encoding, while switching a saved key to
+	// token exchange does.
 	const oauthTokenURL = form.watch("key.oauth_key_config.token_url");
 	const encodingChosen = useRef(false);
 	const storedEncoding = oauthDefaults?.request_encoding;
@@ -295,6 +296,7 @@ export function ApiKeyFormFragment({ control, providerName, baseProviderType, fo
 		const encoding = tokenExchangeEncodingUpdate({
 			tokenURL: oauthTokenURL,
 			tokenURLEdited: form.getFieldState("key.oauth_key_config.token_url").isDirty,
+			grantEdited: form.getFieldState("key.oauth_key_config.grant_type").isDirty,
 			current: form.getValues("key.oauth_key_config.request_encoding"),
 			stored: storedEncoding,
 			userChose: encodingChosen.current,
